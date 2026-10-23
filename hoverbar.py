@@ -1188,9 +1188,8 @@ class SettingsDialog:
                                                 anchor="nw")
         body.bind("<Configure>", lambda e: self._sync_scroll(body_id))
         self._scroll_cv.bind("<Configure>", lambda e: self._sync_scroll(body_id))
-        for w in (self._scroll_cv, body):
+        for w in (self._scroll_cv, body, self._scrollbar):
             w.bind("<MouseWheel>", self._on_wheel)
-        top.bind("<MouseWheel>", self._on_wheel)
 
         tk.Label(body, text="C O N F I G U R A T I O N", bg=EF_PAPER,
                  fg=EF_INK2, font=_ef_font(EF_UI, 8)).pack(anchor="w")
@@ -1351,6 +1350,11 @@ class SettingsDialog:
         for v in (self.v_op, self.v_fs):
             v.trace_add("write", lambda *_: self._preview())
 
+        # Tk 的 <MouseWheel> 不向上冒泡：鼠标停在标签、滑块、勾选框上时，
+        # 事件只发给那个控件。所以整棵子树都要绑一遍，否则只有在空白处
+        # 滚得动，正文一长出视口就像"卡住"。
+        self._bind_wheel(body)
+
         top.update_idletasks()
         # Canvas 不会把内嵌 body 的尺寸传上去，得自己算：
         # 足够高就全长显示，超过屏幕 86% 就封顶，剩下的靠滚动。
@@ -1388,6 +1392,12 @@ class SettingsDialog:
         y1 = top_y * sh
         y2 = y1 + max(18.0, sh * frac)
         sb.create_rectangle(1, y1, 2, y2, fill=EF_SIGNAL, outline=EF_SIGNAL)
+
+    def _bind_wheel(self, w):
+        """把滚轮事件绑到整棵子树。新增控件时再调一次即可。"""
+        w.bind("<MouseWheel>", self._on_wheel)
+        for c in w.winfo_children():
+            self._bind_wheel(c)
 
     def _on_wheel(self, e):
         cv = self._scroll_cv
