@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -95,7 +96,7 @@ DEFAULTS = {
     "always_on_top": False,   # 默认靠"属主窗口"绑定：只浮在 ZCode 之上，不盖别的程序
     "hide_when_inactive": False,  # 属主绑定已随 ZCode 最小化/切换自动让路
     "show": {"speed": True, "ctx": True, "turn": True,
-             "session": True, "today": True, "tools": True},
+             "session": True, "today": True, "tools": True, "cache": True},
     "labels": True,
     "poll_ms": 1500,
     "panel_opacity": 1.0,     # 设置面板自身透明度；1.0=不透明
@@ -227,8 +228,12 @@ def load_settings() -> dict:
         return cfg
     for k, v in raw.items():
         if k == "show" and isinstance(v, dict):
-            cfg["show"].update({kk: bool(vv) for kk, vv in v.items()
-                                if kk in cfg["show"]})
+            # 只认识 DEFAULTS 里有的键，但方向是「用户值覆盖默认、缺的保留默认」。
+            # 反过来写（只收 cfg 里已存在的键）会让新增的显示项在老配置文件上
+            # 永远补不进来——文件是上一版写的，自然没有这个键。
+            for kk, vv in v.items():
+                if kk in cfg["show"]:
+                    cfg["show"][kk] = bool(vv)
         elif k in cfg:
             cfg[k] = v
     return cfg
@@ -336,6 +341,8 @@ class HoverBar:
         self._hover = None
         self._gear_armed = False
         self._win_rect = None
+        self._tip = None           # 悬停详情浮层（Toplevel），没弹时是 None
+        self._tip_job = None       # 450ms 延迟任务；None 表示没在等
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -359,7 +366,7 @@ class HoverBar:
         self.canvas.bind("<Double-Button-1>", lambda e: self.open_settings())
         self.canvas.bind("<Button-3>", self._menu)
         self.canvas.bind("<Motion>", self._on_motion)
-        self.canvas.bind("<Leave>", lambda e: self._set_hover(None))
+        self.canvas.bind("<Leave>", self._on_leave)
         self.root.bind("<Escape>", lambda e: None)
 
         self.src = SnapshotSource(cfg["poll_ms"])
@@ -474,6 +481,20 @@ class HoverBar:
             if tls.get("errors"):
                 it.append(("t", "✕%d" % tls["errors"], BADGE))
             items.append(it)
+
+        # 缓存率：命中缓存的输入 token 占全部输入的比例。
+        # 分母用 input 本身——input_tokens 的口径已经包含 cache_read，
+        # 再加一次 today.input 会把命中率算成一半。
+        if show.get("cache") and s.get("input"):
+            cin = int(s["input"])
+            if cin > 0:
+                rate = int(s.get("cache_read") or 0) / float(cin) * 100.0
+                col = OK if rate >= 60 else WARM if rate >= 30 else DIM
+                it = []
+                if lab:
+                    it.append(("t", "缓存", LABEL))
+                it.append(("t", "%.0f%%" % rate, col))
+                items.append(it)
 
         if d.get("remote"):
             items.insert(0, [("t", "远端", LABEL)])
@@ -702,6 +723,10 @@ class HoverBar:
         x1, y1, x2, y2 = self._gear_rect()
         return x1 <= x <= x2 and y1 <= y <= y2
 
+    def _on_leave(self, e=None):
+        self._set_hover(None)
+        self._tip_hide()
+
     def _set_hover(self, what):
         if getattr(self, "_hover", None) == what:
             return
@@ -712,8 +737,183 @@ class HoverBar:
     def _on_motion(self, e):
         # 悬停在齿轮上就反白，让它读起来像个按钮；其它地方不折腾，省重绘
         self._set_hover("gear" if self._hit_gear(e.x, e.y) else None)
+        if self._hit_gear(e.x, e.y):
+            self._tip_hide()
+        else:
+            self._tip_maybe(e.x_root, e.y_root)
+
+    # -- 悬停详情 --
+    def _tip_lines(self):
+        """把快照摊成详情行。字段全部来自 zusage 的同一份 payload，
+        远端会话也带同样的结构，所以这一块不用区分本地/远端。"""
+        d = self.data or {}
+        s = d.get("session") or {}
+        lt = d.get("last_turn") or {}
+        last = d.get("last") or {}
+        today = d.get("today") or {}
+        sub = s.get("sub") or d.get("sub") or {}
+        tls = d.get("tools") or {}
+        code = d.get("code") or {}
+        rows = []
+
+        def add(k, v):
+            if v not in (None, "", "-"):
+                rows.append((k, str(v)))
+
+        def pct(a, b):
+            return "%.1f%%" % (a / float(b) * 100.0) if b else "-"
+
+        def clean(txt, n):
+            """标题可能是路径或带换行的多段文本：只留最后一节、压成一行。"""
+            txt = str(txt or "").replace("\r", " ").replace("\n", " ").strip()
+            txt = re.split(r"[\\/]", txt)[-1].strip() or txt
+            return txt[:n]
+
+        add("会话", clean(s.get("title"), 28) or s.get("sid", "")[-8:])
+        add("状态", "生成中" if s.get("active") else "空闲")
+
+        ctx, cw = int(s.get("ctx") or 0), int(d.get("context_window") or 0)
+        if ctx and cw:
+            add("上下文", "%s / %s  %s" % (fmt(ctx), fmt(cw), pct(ctx, cw)))
+
+        if s.get("input"):
+            cin = int(s["input"])
+            add("缓存率", "%s  (读 %s)" % (pct(int(s.get("cache_read") or 0), cin),
+                                          fmt(s.get("cache_read"))))
+
+        if lt.get("total"):
+            seg = "%s  %d次" % (fmt(lt["total"]), lt.get("requests") or 0)
+            if lt.get("duration_ms"):
+                seg += "  " + sec(lt["duration_ms"])
+            add("本轮", seg)
+            if lt.get("input"):
+                add("本轮输入", "%s  缓存 %s" % (fmt(lt["input"]),
+                                                pct(int(lt.get("cache_read") or 0),
+                                                    int(lt["input"]))))
+            if lt.get("output"):
+                add("本轮输出", fmt(lt["output"]))
+
+        if s.get("total"):
+            add("会话累计", "%s  %d轮 %d次" % (fmt(s["total"]), s.get("turns") or 0,
+                                              s.get("requests") or 0))
+        if today.get("total"):
+            add("今日", "%s  %d次" % (fmt(today["total"]), today.get("requests") or 0))
+
+        if last.get("model"):
+            add("最近请求", "%s  %.1f t/s" % (last["model"], last.get("tps") or 0))
+        if last.get("duration_ms"):
+            add("首 token", sec(last.get("ttft_ms")))
+        if s.get("retries"):
+            add("重试", "%d 次" % s["retries"])
+
+        if sub.get("list"):
+            add("子代理", "%d 个  %s" % (len(sub["list"]), fmt(sub.get("total"))))
+            for x in sub["list"][:3]:
+                nm = clean(x.get("task") or x.get("title") or x.get("agent") or "sub", 16)
+                rows.append(("  · " + nm, fmt(x.get("total"))))
+
+        if tls.get("list"):
+            top = sorted(tls["list"], key=lambda r: -r.get("count", 0))[:3]
+            add("工具", "%d 次%s" % (tls.get("total") or 0,
+                                    "  ✕%d" % tls["errors"] if tls.get("errors") else ""))
+            for t in top:
+                rows.append(("  · " + str(t.get("name"))[:16], "%d 次" % t.get("count", 0)))
+
+        if code.get("add") or code.get("del"):
+            add("改动", "+%s / -%s  %s 文件" % (code.get("add") or 0,
+                                               code.get("del") or 0,
+                                               code.get("files") or 0))
+        if d.get("remote"):
+            add("数据源", "远端 · %s" % (d.get("remote_host") or "ssh"))
+        elif d.get("remote_error"):
+            add("远端", str(d["remote_error"])[:40])
+        if d.get("not_local"):
+            add("提示", "该会话不在本地库")
+        return rows
+
+    def _tip_build(self):
+        """详情浮层：无边框 Toplevel + 自绘行，跟条面同一套深色语言。
+        只用 Label，不做滚动——行数由 _tip_lines 限制在十行出头。"""
+        if getattr(self, "_tip", None) is not None:
+            return self._tip
+        rows = self._tip_lines()
+        if not rows:
+            return None
+        t = tk.Toplevel(self.root)
+        t.overrideredirect(True)
+        try:
+            t.attributes("-topmost", True)
+            t.attributes("-alpha", min(1.0, max(0.55, float(self.cfg["opacity"]))))
+        except tk.TclError:
+            pass
+        t.configure(bg=BORDER)
+        inner = tk.Frame(t, bg=BG)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        # 顶部 2px 酸黄：跟条面同一处强调色，读起来是"这条的展开"
+        tk.Frame(inner, bg=EF_SIGNAL, height=2).pack(fill="x")
+        f_k = _ef_font(EF_UI, 8)
+        f_v = _ef_font(EF_UI, 8, bold=True)
+        for k, v in rows:
+            line = tk.Frame(inner, bg=BG)
+            line.pack(fill="x", padx=10, pady=1)
+            tk.Label(line, text=k, bg=BG, fg=EF_INK2, font=f_k,
+                     anchor="w").pack(side="left")
+            tk.Label(line, text=v, bg=BG, fg=EF_INK, font=f_v,
+                     anchor="e").pack(side="right")
+        tk.Frame(inner, bg=BG, height=3).pack(fill="x")
+        t.update_idletasks()
+        self._tip = t
+        return t
+
+    def _tip_maybe(self, xr, yr):
+        """悬停 450ms 才弹，鼠标一路划过条面不会闪一串浮层。"""
+        if getattr(self, "_tip_job", None):
+            return
+        if getattr(self, "_tip", None) is not None:
+            return
+        self._tip_pos = (xr, yr)
+        self._tip_job = self.root.after(450, self._tip_show)
+
+    def _tip_show(self):
+        self._tip_job = None
+        if getattr(self, "_hover", None) == "gear":
+            return
+        t = self._tip_build()
+        if t is None:
+            return
+        # 条面正下方；下面放不下就翻到上方，左右夹在屏幕内
+        bx, by = self.root.winfo_x(), self.root.winfo_y()
+        bw, bh = self.root.winfo_width(), self.root.winfo_height()
+        tw, th = t.winfo_reqwidth(), t.winfo_reqheight()
+        sw, sh = t.winfo_screenwidth(), t.winfo_screenheight()
+        x = min(max(8, bx), max(8, sw - tw - 8))
+        y = by + bh + 6
+        if y + th > sh - 8:
+            y = max(8, by - th - 6)
+        t.geometry("+%d+%d" % (x, y))
+        try:
+            t.deiconify()
+        except tk.TclError:
+            pass
+
+    def _tip_hide(self):
+        if getattr(self, "_tip_job", None):
+            try:
+                self.root.after_cancel(self._tip_job)
+            except Exception:
+                pass
+            self._tip_job = None
+        t = getattr(self, "_tip", None)
+        if t is not None:
+            try:
+                t.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
 
     def _drag_start(self, e):
+        self._tip_hide()
         if self._hit_gear(e.x, e.y):        # 齿轮是按钮，不是拖动把手
             self._gear_armed = True
             return
@@ -759,6 +959,8 @@ class HoverBar:
 
     # -- 设置面板 --
     def open_settings(self):
+        self._tip_hide()
+        self._set_hover(None)
         dlg = getattr(self, "_dlg", None)
         if dlg is not None:            # 已经开着就抬起来，别开一摞
             try:
@@ -1063,24 +1265,57 @@ def _wp_short(p: str) -> str:
     return Path(p).name if p else "（未设置）"
 
 
-def _wp_refresh() -> bool:
-    """让 zcode-beautify 把当前壁纸重新注入 ZCode。
+BEAUTIFY_CLI = [
+    Path(os.environ.get("APPDATA", "")) / ".zcode/cli/plugins/cache/zcode-beautify",
+    Path.home() / ".zcode/cli/plugins/cache/zcode-beautify",
+]
 
-    它没有公开的命令行入口，只有一个走 CDP 的 MCP 服务。这里不直接连 CDP
-    （端口可配、注入脚本版本也常变，写死等于自找麻烦），而是调 zcode CLI
-    的 MCP 调用口；拿不到就老实返回 False，让上层提示"重启后生效"，
-    绝不假装成功。
+
+def _beautify_cli() -> Path | None:
+    """找插件自带的 CLI 入口。目录带版本号（cache/zcode-beautify/zcode-beautify/0.3.3），
+    所以按名字 glob 最新版，别写死版本——插件一升级写死的路径就废了。"""
+    for root in BEAUTIFY_CLI:
+        if not root.is_dir():
+            continue
+        cands = sorted(root.glob("zcode-beautify/*/dist/cli.js"),
+                       key=lambda p: p.parts[-3])
+        if cands:
+            return cands[-1]
+    return None
+
+
+def _node_exe() -> str | None:
+    """ZCode 自带 node（~/.zcode/nodejs/node），也认 PATH 上的。"""
+    for p in (Path.home() / ".zcode/nodejs/node.exe",
+              Path.home() / ".zcode/nodejs/node"):
+        if p.is_file():
+            return str(p)
+    return shutil.which("node")
+
+
+def _wp_refresh(port: int | None = None) -> bool:
+    """让 zcode-beautify 立刻把壁纸/配色重新注入 ZCode。
+
+    插件没有 MCP 工具可调，但它自带 CLI，`colors` 子命令就是"重放已存的
+    壁纸与配色"，正好是换图之后需要的一步。走 CDP，端口取插件配置里那个
+    （默认 9222，用户可能在客户端里改过）。失败就老实返回 False，
+    让上层提示"重启后生效"，绝不假装成功。
     """
-    exe = shutil.which("zcode") or shutil.which("zcode.cmd")
-    if not exe:
+    cli, node = _beautify_cli(), _node_exe()
+    if cli is None or not node:
         return False
+    cmd = [node, str(cli), "colors"]
+    if port:
+        cmd += ["--port", str(port)]
     try:
-        r = subprocess.run(
-            [exe, "mcp", "call", "zcode-beautify", "refresh_theme"],
-            capture_output=True, text=True, timeout=25,
-            encoding="utf-8", errors="replace")
-        return r.returncode == 0 and "error" not in (r.stdout or "").lower()
-    except (OSError, subprocess.SubprocessError):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                           encoding="utf-8", errors="replace",
+                           cwd=str(cli.parent.parent),
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        return r.returncode == 0 and "error" not in out and "fail" not in out
+    except (OSError, subprocess.SubprocessError) as e:
+        log("重注入壁纸失败", e)
         return False
 
 
@@ -1276,7 +1511,8 @@ class SettingsDialog:
         grid = tk.Frame(body, bg=EF_PAPER)
         grid.pack(fill="x", pady=(0, 2))
         names = [("speed", "速度"), ("ctx", "上下文"), ("turn", "本轮"),
-                 ("session", "会话"), ("today", "今日"), ("tools", "工具")]
+                 ("session", "会话"), ("today", "今日"), ("tools", "工具"),
+                 ("cache", "缓存率")]
         for i, (k, txt) in enumerate(names):
             v = tk.BooleanVar(value=bool(self.cfg["show"].get(k, True)))
             self.v_show[k] = v
@@ -1438,7 +1674,7 @@ class SettingsDialog:
             pass
 
     def _pick_wallpaper(self):
-        """选一张图交给 zcode-beautify：落盘 + 走它的 MCP 让它立刻重注入。"""
+        """选一张图交给 zcode-beautify，写完立刻让它重注入，不用重启客户端。"""
         from tkinter import filedialog
         p = filedialog.askopenfilename(
             parent=self.top, title="选择壁纸",
@@ -1454,7 +1690,8 @@ class SettingsDialog:
             self._wp_label.configure(text=_wp_short(p))
         except tk.TclError:
             pass
-        if not _wp_refresh():
+        self._wp = _wp_read() or self._wp
+        if not _wp_refresh(self._wp.get("port")):
             messagebox.showwarning(
                 "已保存，但没能立刻生效",
                 "壁纸路径已写入配置。要让 ZCode 立刻换图，重启一次客户端，"
@@ -1485,7 +1722,8 @@ class SettingsDialog:
                      "blur": round(float(self.v_wp_blur.get()))}
             if _wp_write(patch):
                 self._wp.update(patch)
-                if not _wp_refresh():
+                self._wp = _wp_read() or self._wp
+                if not _wp_refresh(self._wp.get("port")):
                     log("壁纸配置已写入，但未能立刻重注入")
 
     def reset(self):
