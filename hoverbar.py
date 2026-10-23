@@ -614,10 +614,19 @@ class HoverBar:
         anchor = cfg["anchor"]
 
         if anchor == "free":
+            # 自由位置也要跟 ZCode 绑：不绑的话拖过一次之后，条就既不随 ZCode
+            # 最小化让路、也不会在客户端关掉后收起，跟「贴边」两种行为不一致。
+            self._hwnd = zcode_hwnd()
+            wr = win_state(self._hwnd)
+            if not wr or (cfg["hide_when_inactive"]
+                          and not foreground_is(self._hwnd)):
+                self._hide()
+                return
+            self._win_rect = wr
             x, y = int(cfg["free_x"]), int(cfg["free_y"])
-            if not self._visible:
-                self._show()
+            self._show()
             self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
+            self._bind_zorder()
             return
 
         self._hwnd = zcode_hwnd()
