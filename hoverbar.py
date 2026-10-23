@@ -1054,9 +1054,12 @@ class SettingsDialog:
         # 装进 Canvas + 竖向滚动条（细线风格，不用 tk 原生沟槽）。
         outer = tk.Frame(top, bg=EF_PAPER)
         outer.pack(fill="both", expand=True, padx=(20, 0), pady=(14, 0))
-        body = tk.Frame(outer, bg=EF_PAPER)
         self._scroll_cv = tk.Canvas(outer, bg=EF_PAPER, highlightthickness=0,
                                     bd=0)
+        # body 必须挂在 canvas 自己下面：create_window 只把「canvas 的子控件」
+        # 真正合成进画布。挂到 outer 的话它是一个独立的同级 HWND，会被 canvas
+        # 盖住——控件、几何全对，整块正文却是一片空白。
+        body = tk.Frame(self._scroll_cv, bg=EF_PAPER)
         self._scroll_cv.pack(side="left", fill="both", expand=True)
         self._scrollbar = tk.Canvas(outer, width=3, bg=EF_PAPER,
                                     highlightthickness=0, bd=0)
@@ -1219,14 +1222,16 @@ class SettingsDialog:
         if not total:
             return
         th = total[3]
+        # scrollregion 不设的话 yview 永远是 (0.0, 1.0)，滚轮滚不动。
+        cv.configure(scrollregion=(0, 0, total[2], th))
         sb.delete("all")
         if th <= h + 1:
             return
         frac = h / float(th)
         top_y = max(0.0, min(1.0, -cv.canvasy(0) / float(max(1, th - h))))
-        y1 = top_y * h
-        y2 = y1 + max(18.0, h * frac)
-        sb.configure(height=h)
+        sh = sb.winfo_height() or h          # 滚动条是 fill="y" 撑开的，高度取实际值
+        y1 = top_y * sh
+        y2 = y1 + max(18.0, sh * frac)
         sb.create_rectangle(1, y1, 2, y2, fill=EF_SIGNAL, outline=EF_SIGNAL)
 
     def _on_wheel(self, e):
