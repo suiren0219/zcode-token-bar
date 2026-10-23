@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -36,6 +37,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
+from tkinter import filedialog, messagebox
 
 HERE = Path(__file__).parent.resolve()
 ZUSAGE = HERE / "zusage.py"
@@ -96,6 +98,7 @@ DEFAULTS = {
              "session": True, "today": True, "tools": True},
     "labels": True,
     "poll_ms": 1500,
+    "panel_opacity": 1.0,     # 设置面板自身透明度；1.0=不透明
 }
 
 DEBUG = False
@@ -1012,6 +1015,75 @@ class _EfChips(tk.Frame):
             paint()
 
 
+# ---------------------------------------------------------------- 壁纸（zcode-beautify）
+# 壁纸是 zcode-beautify 插件在管。直接改它的 config.json，不另存一份，
+# 免得两边各记一份、谁都不知道以谁为准。插件没装就返回 None，面板隐藏这段。
+WP_DIRS = [
+    Path(os.environ.get("APPDATA", "")) / ".zcode/cli/plugins/data/zcode-beautify@zcode-beautify",
+    Path.home() / ".zcode/cli/plugins/data/zcode-beautify@zcode-beautify",
+]
+
+
+def _wp_dir() -> Path | None:
+    for d in WP_DIRS:
+        if (d / "config.json").is_file():
+            return d
+    return None
+
+
+def _wp_read() -> dict | None:
+    """读插件配置；文件在但解析失败也返回 None（面板就显示不可用）。"""
+    d = _wp_dir()
+    if d is None:
+        return None
+    try:
+        return json.loads((d / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _wp_write(patch: dict) -> bool:
+    """把 patch 并进插件配置。写失败返回 False，调用方负责提示。"""
+    d = _wp_dir()
+    if d is None:
+        return False
+    cur = _wp_read() or {}
+    cur.update(patch)
+    try:
+        (d / "config.json").write_text(
+            json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except OSError as e:
+        log("写壁纸配置失败", e)
+        return False
+
+
+def _wp_short(p: str) -> str:
+    """配置里是绝对路径，面板上只显示文件名——既省地方也不暴露目录。"""
+    return Path(p).name if p else "（未设置）"
+
+
+def _wp_refresh() -> bool:
+    """让 zcode-beautify 把当前壁纸重新注入 ZCode。
+
+    它没有公开的命令行入口，只有一个走 CDP 的 MCP 服务。这里不直接连 CDP
+    （端口可配、注入脚本版本也常变，写死等于自找麻烦），而是调 zcode CLI
+    的 MCP 调用口；拿不到就老实返回 False，让上层提示"重启后生效"，
+    绝不假装成功。
+    """
+    exe = shutil.which("zcode") or shutil.which("zcode.cmd")
+    if not exe:
+        return False
+    try:
+        r = subprocess.run(
+            [exe, "mcp", "call", "zcode-beautify", "refresh_theme"],
+            capture_output=True, text=True, timeout=25,
+            encoding="utf-8", errors="replace")
+        return r.returncode == 0 and "error" not in (r.stdout or "").lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 class SettingsDialog:
     def __init__(self, bar: HoverBar):
         self.bar = bar
@@ -1020,19 +1092,32 @@ class SettingsDialog:
         self.top = top
         top.title("悬浮条设置")
         top.configure(bg=EF_PAPER)
+        # 不要系统白标题栏：它跟终末地这套暗色完全不是一路。改成无边框 + 自绘标题行，
+        # 拖动靠下面 bind 的 <B1-Motion>，关闭靠右侧的切角方块。
+        top.overrideredirect(True)
         top.attributes("-topmost", True)
         top.resizable(False, False)
         top.protocol("WM_DELETE_WINDOW", self.close)
+        # 面板自己的透明度：下次打开沿用上次的值
+        try:
+            top.attributes("-alpha", min(1.0, max(
+                0.4, float(bar.cfg.get("panel_opacity", 1.0)))))
+        except tk.TclError:
+            pass
 
-        # 三色条：屏幕开始处，只出现一次（终末地签名元素）
-        tri = tk.Frame(top, bg=EF_PAPER, height=3)
+        # 顶部标题行：三色条 + 品牌 + 关闭。整段合成一块，不再有白色断层。
+        bar_hdr = tk.Frame(top, bg=EF_CMD)
+        bar_hdr.pack(fill="x")
+
+        # 三色条贴在标题行顶边，只出现一次（终末地签名元素）
+        tri = tk.Frame(bar_hdr, bg=EF_PAPER, height=3)
         tri.pack(fill="x")
         for col in (EF_TRI_A, EF_TRI_B, EF_TRI_C):
             tk.Frame(tri, bg=col, height=3).pack(side="left", fill="both",
                                                  expand=True)
 
         # 命令栏：品牌 + 面包屑，拉丁字母大写拉开
-        cmd = tk.Frame(top, bg=EF_CMD)
+        cmd = tk.Frame(bar_hdr, bg=EF_CMD)
         cmd.pack(fill="x")
         mark = tk.Canvas(cmd, width=11, height=11, bg=EF_CMD,
                          highlightthickness=0, bd=0)
@@ -1049,6 +1134,41 @@ class SettingsDialog:
         on.pack(side="left", padx=(10, 0))
         tk.Label(on, text="S E T T I N G S", bg=EF_SIGNAL, fg=EF_ON_SIGNAL,
                  font=_ef_font(EF_UI, 8, bold=True)).pack(padx=8, pady=3)
+
+        # 关闭按钮：跟条面上的设置入口同一种语言——切角方块，悬停变酸黄。
+        # 系统标题栏去掉之后，这是唯一的关闭入口（Esc 也绑了）。
+        cl = tk.Canvas(cmd, width=22, height=22, bg=EF_CMD,
+                       highlightthickness=0, bd=0, cursor="hand2")
+        cl.pack(side="right", padx=(0, 14), pady=8)
+        cut = 5
+        pts = [2, 2, 20, 2, 20, 20 - cut, 20 - cut, 20, 2, 20]
+        cl_box = cl.create_polygon(pts, smooth=False, fill=EF_CHIP, outline="")
+        cl.create_line(8, 8, 14, 14, fill=EF_INK2, width=1.4)
+        cl.create_line(14, 8, 8, 14, fill=EF_INK2, width=1.4)
+
+        def cl_hover(on_):
+            cl.itemconfigure(cl_box, fill=EF_SIGNAL if on_ else EF_CHIP)
+            col = EF_ON_SIGNAL if on_ else EF_INK2
+            for i in cl.find_all()[1:]:
+                cl.itemconfigure(i, fill=col)
+
+        cl.bind("<Enter>", lambda e: cl_hover(True))
+        cl.bind("<Leave>", lambda e: cl_hover(False))
+        cl.bind("<Button-1>", lambda e: self.close())
+
+        # 无边框窗口没有系统拖动区，自己绑：按住标题行任意空白处拖。
+        def hdr_press(e):
+            self._drag_off = (e.x_root - top.winfo_x(), e.y_root - top.winfo_y())
+
+        def hdr_move(e):
+            off = getattr(self, "_drag_off", None)
+            if off:
+                top.geometry("+%d+%d" % (e.x_root - off[0], e.y_root - off[1]))
+
+        for w in (cmd, crumb):
+            w.bind("<Button-1>", hdr_press)
+            w.bind("<B1-Motion>", hdr_move)
+        top.bind("<Escape>", lambda e: self.close())
 
         # 内容区可滚动：125% 缩放下整套控件约 900 逻辑像素高，1080p 屏幕放不下，
         # 装进 Canvas + 竖向滚动条（细线风格，不用 tk 原生沟槽）。
@@ -1168,7 +1288,42 @@ class SettingsDialog:
         _EfCheck(body, "显示文字标签（速度 / 上下文 / 本轮 …）", self.v_lab,
                  big=True).pack(anchor="w", pady=(6, 2))
 
-        # ---- 04 行为 ----
+        # ---- 04 面板 / 壁纸 ----
+        section("面板与壁纸", "P A N E L   +   W A L L P A P E R")
+        self.v_pop = tk.DoubleVar(value=float(self.cfg.get("panel_opacity", 1.0)))
+        _EfScale(row("面板透明度", "这个设置面板自己；调到 1.00 就是纯不透明"),
+                 self.v_pop, 0.55, 1.0, fmt="%.2f").pack(anchor="e")
+        self.v_pop.trace_add("write", lambda *_: self._preview_panel())
+
+        # 壁纸：读 zcode-beautify 插件的数据目录，跟它共用同一份配置，
+        # 不另存一份以免两边打架。插件没装就整段隐藏。
+        self._wp = _wp_read()
+        if self._wp is not None:
+            self.v_wp_vis = tk.BooleanVar(value=bool(self._wp.get("wallpaperVisible", True)))
+            _EfCheck(body, "显示壁纸（关掉后 ZCode 回到纯色背景）", self.v_wp_vis,
+                     big=True).pack(anchor="w", pady=(2, 4))
+            self.v_wp_dim = tk.DoubleVar(value=float(self._wp.get("dim", 25)))
+            _EfScale(row("壁纸压暗", "越高壁纸越沉，字越清楚"),
+                     self.v_wp_dim, 0, 100, fmt="%.0f").pack(anchor="e")
+            self.v_wp_blur = tk.DoubleVar(value=float(self._wp.get("blur", 0)))
+            _EfScale(row("壁纸模糊", "px；界面会更糊但更安静"),
+                     self.v_wp_blur, 0, 40, fmt="%.0f").pack(anchor="e")
+            r_pick = row("换壁纸", "jpg / png，选完立刻生效")
+            _EfButton(r_pick, "选择图片…", self._pick_wallpaper).pack(side="left")
+            cur = tk.Label(r_pick, text=_wp_short(self._wp.get("wallpaperPath", "")),
+                           bg=EF_PAPER, fg=EF_INK2,
+                           font=_ef_font(EF_UI, 8))
+            cur.pack(side="left", padx=(10, 0))
+            self._wp_label = cur
+            tk.Label(body, text="壁纸由 zcode-beautify 插件接管，这里改的是同一份配置。",
+                     bg=EF_PAPER, fg=EF_INK2,
+                     font=_ef_font(EF_UI, 8)).pack(anchor="w", pady=(2, 4))
+        else:
+            tk.Label(body, text="没找到 zcode-beautify 插件的数据目录，壁纸设置不可用。",
+                     bg=EF_PAPER, fg=EF_INK2,
+                     font=_ef_font(EF_UI, 8)).pack(anchor="w", pady=(0, 4))
+
+        # ---- 05 行为 ----
         section("行为", "B E H A V I O U R")
         self.v_top = tk.BooleanVar(value=bool(self.cfg["always_on_top"]))
         _EfCheck(body, "总是置顶（会盖住其它程序）", self.v_top,
@@ -1264,6 +1419,37 @@ class SettingsDialog:
         except (tk.TclError, ValueError):
             pass
 
+    def _preview_panel(self):
+        """面板自己的透明度也做实时预览，边拖边看。"""
+        try:
+            a = min(1.0, max(0.4, float(self.v_pop.get())))
+            self.top.attributes("-alpha", a)
+        except (tk.TclError, ValueError):
+            pass
+
+    def _pick_wallpaper(self):
+        """选一张图交给 zcode-beautify：落盘 + 走它的 MCP 让它立刻重注入。"""
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(
+            parent=self.top, title="选择壁纸",
+            filetypes=[("图片", "*.jpg *.jpeg *.png *.webp *.bmp"),
+                       ("全部文件", "*.*")])
+        if not p:
+            return
+        if not _wp_write({"wallpaperPath": p, "wallpaperVisible": True}):
+            messagebox.showerror("保存失败", "写不进 zcode-beautify 的配置目录。",
+                                 parent=self.top)
+            return
+        try:
+            self._wp_label.configure(text=_wp_short(p))
+        except tk.TclError:
+            pass
+        if not _wp_refresh():
+            messagebox.showwarning(
+                "已保存，但没能立刻生效",
+                "壁纸路径已写入配置。要让 ZCode 立刻换图，重启一次客户端，"
+                "或在插件设置里再点一次应用。", parent=self.top)
+
     def _collect(self):
         c = self.cfg
         c["anchor"] = self.v_anchor.get()
@@ -1275,6 +1461,7 @@ class SettingsDialog:
         c["labels"] = bool(self.v_lab.get())
         c["always_on_top"] = bool(self.v_top.get())
         c["hide_when_inactive"] = bool(self.v_hide.get())
+        c["panel_opacity"] = round(float(self.v_pop.get()), 2)
         for k, v in self.v_show.items():
             c["show"][k] = bool(v.get())
 
@@ -1282,6 +1469,14 @@ class SettingsDialog:
         self._collect()
         save_settings(self.cfg)
         self.bar.apply_settings()
+        if self._wp is not None:
+            patch = {"wallpaperVisible": bool(self.v_wp_vis.get()),
+                     "dim": round(float(self.v_wp_dim.get())),
+                     "blur": round(float(self.v_wp_blur.get()))}
+            if _wp_write(patch):
+                self._wp.update(patch)
+                if not _wp_refresh():
+                    log("壁纸配置已写入，但未能立刻重注入")
 
     def reset(self):
         self.cfg.update(json.loads(json.dumps(DEFAULTS)))
