@@ -1,0 +1,177 @@
+# ZCode Token 悬浮条
+
+给 [ZCode](https://zcode.ai) 桌面客户端用的 token 用量悬浮条：**独立进程**，不碰客户端安装目录。
+
+右端方块打开设置面板 ▼
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  速度 51.1t/s │ 上下文 ▰▰▱▱▱ 12.5% │ 本轮 23.2M │ 会话 484.3M   ◢ │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+> 这是从 [zcode-token-usage-statusbar](https://github.com/xhwxt/zcode-token-usage-statusbar)
+> 派生的**独立项目**，只保留「悬浮条」这一条路线并重写。上游的状态条走 asar 注入，
+> 本项目走的是另一条路（见下）。原作者的 MIT 署名保留在 [LICENSE](LICENSE)。
+
+---
+
+## 为什么不用注入版
+
+上游的做法是往 `resources/app.asar` 里注入一行 loader。官方每次升级都整包替换
+`app.asar`，注入行随之消失——表现为「状态条不见了」，而且重装必须先完全退出客户端
+（文件被占用，`WinError 5`）。
+
+这个项目不这么干：
+
+| | 注入版 | 本项目 |
+|---|---|---|
+| 改客户端文件 | 是（`app.asar`，341 MB） | **否** |
+| 官方升级后 | 要重跑一次注入 | **不受影响** |
+| 安装前要先退出 ZCode | 是 | **否** |
+| 画在哪 | 嵌在对话窗口底部 | 浮在窗口上（可贴边） |
+| 依赖 | Electron 内部机制 | 无，只读 SQLite |
+
+代价是它浮在窗口上而不是嵌在底部。默认靠 Windows 的**属主窗口绑定**让它只压在 ZCode
+之上——随 ZCode 最小化一起让路、不抢焦点、不占任务栏——所以代价比听起来小。
+
+---
+
+## 装
+
+只有一个前提：**Python 3.8+**。零第三方依赖，不需要 pip。
+
+```bash
+git clone https://github.com/suiren0219/zcode-token-bar.git
+cd zcode-token-bar
+python hoverbar.py
+```
+
+条面出现在 ZCode 窗口上。点条面最右端的**切角方块**打开设置面板。
+
+```bash
+python hoverbar.py              # 启动（已在运行则打开设置面板）
+python hoverbar.py --settings   # 打开设置面板
+python hoverbar.py --quit       # 关掉
+python hoverbar.py --once       # 不开窗，只在终端打一次数据（排查用）
+python hoverbar.py --debug      # 开窗并打印定位/取数过程
+```
+
+单实例：重复启动只会把设置面板叫到前面，不会再开第二条。
+
+### 开机自启
+
+```bash
+python autostart.py on      # 写入 HKCU 的 Run 项
+python autostart.py off     # 移除
+python autostart.py status  # 看当前状态
+```
+
+只写当前用户，不需要管理员权限。
+
+---
+
+## 条面各项
+
+| 项 | 显示内容 |
+|---|---|
+| 速度 | 最近一次完成请求的输出 tokens ÷ 生成耗时；≥70 绿、40–70 黄、<40 红 |
+| 上下文 | 微进度条 + 占比，颜色随占比变化（大窗口 40%/60% 预警，其余 70%/85%） |
+| 本轮 | 本轮 tokens（tokens 数） |
+| 会话 | 当前会话累计 tokens |
+| 今日 | 今天所有会话的 tokens |
+| 工具 | 当前会话工具调用次数，错误时右侧标红 |
+
+六项都能单独开关。关掉「显示文字标签」只留数字，条面会明显变短。
+
+数据来自本地 SQLite（`~/.zcode/cli/db/db.sqlite`）的**只读**查询，全程不联网。
+请求完成后才落库，所以数字反映的是「最近一次已完成请求」。
+
+---
+
+## 设置面板
+
+终末地（endfield-ui）风格：acid yellow `#FFFA00` 是唯一强调色、只做填充、只表示
+「当前 / 可点 / 注意」；切角 = 可点；展示容器一律直角；1px 细线分区；无阴影无发光无渐变。
+
+**01 位置** — 贴靠（六选一）、范围（跟随窗口 / 整块屏幕）、边距（左右 / 上下 px）
+
+**02 外观** — 透明度 0.30–1.00、字号 10–22 px。拖动即时预览，点「应用」才落盘。
+
+**03 显示项** — 六项开关 + 文字标签总开关
+
+**04 行为** — 总是置顶、ZCode 不在前台时隐藏
+
+拖动条面本身是移动位置。指针按在右端方块上时会被识别成按钮，不会把条拖走。
+
+内容比屏幕高时右侧出 3px 酸黄滚动指示线；面板按指针摆放并夹在屏幕内
+（125% 缩放下原先会掉出底边，已修）。
+
+---
+
+## 为什么默认只浮在 ZCode 上
+
+默认**不勾**「总是置顶」，靠的是 Windows 属主窗口绑定：
+`SetWindowLongPtrW(条窗口, GWLP_HWNDPARENT, ZCode 主窗口)`。效果是
+
+- 条面始终压在 ZCode 之上，不会被对话区盖住
+- ZCode 最小化时条面一起收走，不会孤零零留在桌面上
+- 不抢焦点，点条面不会把输入框踢掉
+- 任务栏上没有它的条目
+
+这比 `-topmost` 温和得多：切到浏览器看文档时它不会挡在那儿。找不到 ZCode 窗口时
+条面会隐藏而不是乱飘，ZCode 启动后下一次轮询自动接上。
+
+---
+
+## 文件
+
+| 文件 | 作用 |
+|---|---|
+| `hoverbar.py` | 悬浮条本体：无边框圆角胶囊 + 设置面板。Win32 属主绑定、DPI 感知、单实例 |
+| `zusage.py` | 数据层：只读 SQLite 查询、上下文窗口查表、`serve` 行协议、`json` 子命令 |
+| `autostart.py` | 开机自启管理（HKCU Run 项） |
+| `hoverbar.json` | 运行期配置，首次运行自动生成，不入库 |
+| `docs/USAGE.md` | 逐项说明、机制细节、排查 |
+
+---
+
+## 排查
+
+**条面不出现**
+
+```bash
+python hoverbar.py --once     # 数据能不能取到
+python hoverbar.py --debug    # 看定位与取数过程
+```
+
+`--once` 有输出说明数据链路正常，问题在窗口层——多半是找不到 ZCode 窗口（客户端没开）。
+
+**数字全是 0**
+
+- 请求完成才落库，正在生成的不计入
+- 新会话还没产生已完成请求时是零值
+- SSH 远程会话的数据落在**远端机**，本地库查不到。条面会显示「不在本地库」徽标，
+  需要在 `zusage.py` 旁的 `config.json` 里配 `remote` 段（见 [docs/USAGE.md §5](docs/USAGE.md#5-取数链路)）
+
+**上下文窗口显示成兜底值**
+
+模型目录在 `~/.zcode/v2/runtime/provider/<平台>/<版本>/endpoint-*/zcode-builtin.json`。
+`zusage.py` 按模型名正则匹配 `modelConfigRules.modelRules[].config.properties.contextWindow`，
+找不到才退到内置表。ZCode 改了目录结构时这里是第一个要跟的地方。
+
+---
+
+## 已知限制
+
+- **只支持 Windows**。属主窗口绑定和 DPI 处理都是 Win32 API（`user32` / `shcore`）。
+  Linux/macOS 需要换一套窗口绑定方式。
+- **浮在窗口上而不是嵌在底部**。这是不走注入的必然代价。
+- **只测过单显示器**。多屏缩放不一致时贴靠坐标可能偏，用「整块屏幕」+ 拖动兜住。
+
+---
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。派生自
+[zcode-token-usage-statusbar](https://github.com/xhwxt/zcode-token-usage-statusbar)（Copyright (c) 2026 xhwx）。

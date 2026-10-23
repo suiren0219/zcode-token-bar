@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+hoverbar.json
+config.json
+diag-*.json
