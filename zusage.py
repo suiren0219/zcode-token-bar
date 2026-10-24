@@ -1016,27 +1016,34 @@ def _remote_fetch(force_sids, have_local, rcfg):
     return by, today, err
 
 
-def snapshot(force_sid=""):
+def snapshot(force_sid="", pin_sid=""):
     """单次快照（自建连接的一次性入口，CLI/测试用）。
     常驻 serve 走 _snapshot_with 复用连接（v63），避免每请求重连开销。"""
     con = connect()
     try:
-        return _snapshot_with(con, force_sid)
+        return _snapshot_with(con, force_sid, pin_sid)
     finally:
         con.close()
 
 
-def _snapshot_with(con, force_sid=""):
+def _snapshot_with(con, force_sid="", pin_sid=""):
     """快照实现：调用方负责连接生命周期。
     force_sid：各窗口当前会话 id，逗号分隔（泵按窗口汇总上报：主进程 IPC 映射的焦点会话 +
     overlay localStorage 键兜底），全部强制纳入快照——不在 6+6 池里的会话（新开的、久远的）
-    也能被各窗口找到自己的会话并显示（v32 起；v34 改为多窗口多 sid）。"""
+    也能被各窗口找到自己的会话并显示（v32 起；v34 改为多窗口多 sid）。
+    pin_sid：悬浮条钉住的会话（v65）。顶层快照从「最近活跃会话」换成钉住的这一份，
+    本地没有就查远端，两边都没有则 pin_lost=True 由悬浮条自动解除钉住。"""
     cfg = load_config()
     force_sids = []
     for fs in str(force_sid).split(","):
         fs = fs.strip()
         if fs and re.fullmatch(r"[A-Za-z0-9_-]+", fs) and fs not in force_sids:
             force_sids.append(fs)
+    # 钉住的会话按 force 同样待遇进候选池：远端补齐、阈值豁免、完整快照都靠它
+    pin_sid = str(pin_sid).strip()
+    pin_ok = bool(re.fullmatch(r"[A-Za-z0-9_-]+", pin_sid))
+    if pin_ok and pin_sid not in force_sids:
+        force_sids.append(pin_sid)
     today = _cached_agg("today", lambda: range_usage(
         con, _epoch_ms(_day_start()), _epoch_ms(_day_start() + timedelta(days=1))))
     rows = _scan_session_ids(con)
@@ -1044,6 +1051,7 @@ def _snapshot_with(con, force_sid=""):
     # 双向依赖它：本地已存在 → 不去远端白跑；远端按同款判定区分"确无此会话"与
     # "零值快照"（负缓存的依据）。两次索引点查 <1ms。
     known_sids = []
+    have_local = set()
     if force_sids:
         qmarks = ",".join("?" * len(force_sids))
         have_local = {r[0] for r in con.execute(
@@ -1076,6 +1084,19 @@ def _snapshot_with(con, force_sid=""):
                 "sub": {"requests": 0, "total": 0, "input": 0, "output": 0, "cache_read": 0,
                         "reasoning": 0, "cache_write": 0, "active": False, "list": []},
                 "context_window": cfg["context_window"], "context_auto": False}
+    # 钉住（v65）：顶层快照换成钉住的会话。本地有 → 完整重算；只在远端 →
+    # 直接用远端那份；两边都没有 → 保持 latest 并报 pin_lost，悬浮条据此自动解钉。
+    pin_base = None
+    if pin_ok:
+        if pin_sid == latest_sid:
+            pin_base = base
+        elif pin_sid in have_local:
+            pin_base = _session_snapshot(con, pin_sid, cfg)
+        elif pin_sid in remote_by:
+            pin_base = remote_by[pin_sid]
+    if pin_base is not None:
+        base = pin_base
+    pin_lost = bool(pin_ok and pin_base is None)
     # 旧会话（v64）：阈值按各会话自己的最后活动时间算，不看"当前是否打开"——
     # 正在用的会话 activity 一定新鲜，不会被误标。
     # 模式只有两种实际行为（插件改不了 ZCode 自己的侧栏，所以不承诺"折叠"）：
@@ -1128,8 +1149,12 @@ def _snapshot_with(con, force_sid=""):
     full_n = len(force_sids) + 3
     rec = []
     for i, sid in enumerate(ids):
-        if sid == latest_sid:
-            rec.append(base)   # base 本就是 latest 的完整快照，不重算第二遍
+        if sid == pin_sid and pin_ok:
+            rec.append(base)   # base 已是钉住会话的完整快照
+        elif sid == latest_sid:
+            # 钉住别的会话时 base 不再是 latest 的，得为 latest 重算一份，
+            # 不能把钉住的快照错挂在 latest 的 sid 下
+            rec.append(base if not pin_ok else _session_snapshot(con, sid, cfg))
         elif sid in force_set or i < full_n:
             rec.append(_session_snapshot(con, sid, cfg))
         else:
@@ -1167,6 +1192,8 @@ def _snapshot_with(con, force_sid=""):
         "not_local": not_local,               # 不在本地库的 force 会话 id（issue #14 提示用）
         "remote_enabled": bool(rcfg),         # 是否配了 remote 段（区分"没配"与"配了没查到"）
         "known_sids": known_sids,
+        "pinned": pin_sid if pin_ok else "",  # 本次快照实际钉住的会话（空 = 跟随模式）
+        "pin_lost": pin_lost,                 # 钉住的会话本地远端都查无 → 悬浮条自动解钉
         "context_window": base["context_window"],
         "context_auto": base["context_auto"],
         "code": base["code"],
@@ -1189,7 +1216,9 @@ def _snapshot_with(con, force_sid=""):
 
 def serve():
     """常驻查询服务（v8 泵配套）：省每次 ~60-100ms 的解释器启动+模块加载费。
-    stdin 每行一个请求（空行 = 无强制会话），stdout 每行一个 JSON 快照。
+    stdin 每行一个请求，stdout 每行一个 JSON 快照。两种请求格式：
+      空行 / 裸 sid 列表   —— v8 老协议，行为不变（空 = 无强制会话）
+      {"force": "...", "pin": "..."} —— v65 起，钉住时顶层快照给 pin 的会话
     stdin EOF = 泵已退出（管道断开），随即退出——孤儿进程自清理。
     v63：连接按请求间隔复用。原先每请求新开 sqlite 连接 + 一次探测查询（326MB 库实测
     ~3-6ms 固定开销，小请求占比可观）；现在保留单连接，出错或空闲超时后重建，
@@ -1210,6 +1239,14 @@ def serve():
                     pass
             return
         try:
+            force, pin = line.strip(), ""
+            if force.startswith("{"):
+                try:
+                    j = json.loads(force)
+                    force = str(j.get("force") or "")
+                    pin = str(j.get("pin") or "")
+                except ValueError:
+                    pass          # 不是 JSON 就按老协议当裸 sid 列表
             # 空闲超过 60s 或上次出错后连接置空：重建，避免长期持有失效句柄
             if con is not None and (time.time() - last_use > 60):
                 try:
@@ -1219,7 +1256,7 @@ def serve():
                 con = None
             if con is None:
                 con = connect()
-            out = json.dumps(_snapshot_with(con, line.strip()))
+            out = json.dumps(_snapshot_with(con, force, pin))
             last_use = time.time()
         except Exception as e:
             out = json.dumps({"error": str(e)[:200]})   # 单次查询失败不杀常驻进程

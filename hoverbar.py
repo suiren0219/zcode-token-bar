@@ -100,6 +100,10 @@ DEFAULTS = {
     "labels": True,
     "poll_ms": 1500,
     "panel_opacity": 1.0,     # 设置面板自身透明度；1.0=不透明
+    "pinned": False,          # 钉住：显示停在 pinned_sid，位置锁死
+    "pinned_sid": "",         # 钉住那一刻的会话 id；解除时清空
+    "pin_x": -1,              # 钉住时冻结的位置；-1 = 未定（下个定位节拍按锚点重钉）
+    "pin_y": -1,
 }
 
 DEBUG = False
@@ -250,10 +254,12 @@ def save_settings(cfg: dict):
 # ---------------------------------------------------------------- 取数
 class SnapshotSource:
     """常驻 `zusage.py serve`：stdin 一行请求，stdout 一行 JSON。
-    比每次起解释器省 60–100ms，也不会每 1.5s 闪一个控制台。"""
+    比每次起解释器省 60–100ms，也不会每 1.5s 闪一个控制台。
+    pin_fn 每次请求前取一次钉住的 sid（钉住时顶层快照给指定会话而不是最近活跃）。"""
 
-    def __init__(self, interval_ms: int):
+    def __init__(self, interval_ms: int, pin_fn=None):
         self.interval = max(300, interval_ms) / 1000.0
+        self.pin_fn = pin_fn or (lambda: "")
         self.q: queue.Queue = queue.Queue()
         self._proc = None
         self._stop = False
@@ -292,7 +298,15 @@ class SnapshotSource:
             try:
                 if self._proc is None:
                     self._spawn()
-                self._proc.stdin.write("\n")
+                pin = ""
+                try:
+                    pin = str(self.pin_fn() or "")
+                except Exception:
+                    pin = ""
+                # 无 pin 走老的空行协议；钉住时用 JSON 请求（zusage 两头都认）
+                self._proc.stdin.write(
+                    (json.dumps({"force": "", "pin": pin}, ensure_ascii=False)
+                     if pin else "") + "\n")
                 self._proc.stdin.flush()
                 line = self._proc.stdout.readline()
                 if not line:
@@ -340,6 +354,7 @@ class HoverBar:
         self._drag = None
         self._hover = None
         self._gear_armed = False
+        self._pin_armed = False
         self._win_rect = None
         self._tip = None           # 悬停详情浮层（Toplevel），没弹时是 None
         self._tip_job = None       # 450ms 延迟任务；None 表示没在等
@@ -363,13 +378,19 @@ class HoverBar:
         self.canvas.bind("<Button-1>", self._drag_start)
         self.canvas.bind("<B1-Motion>", self._drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._drag_end)
-        self.canvas.bind("<Double-Button-1>", lambda e: self.open_settings())
+        # 双击开面板，但两端方块不算——图钉上连点两下是"钉/解钉"，不该带出面板
+        self.canvas.bind(
+            "<Double-Button-1>",
+            lambda e: None if (self._hit_pin(e.x, e.y) or self._hit_gear(e.x, e.y))
+            else self.open_settings())
         self.canvas.bind("<Button-3>", self._menu)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Leave>", self._on_leave)
         self.root.bind("<Escape>", lambda e: None)
 
-        self.src = SnapshotSource(cfg["poll_ms"])
+        self.src = SnapshotSource(
+            cfg["poll_ms"],
+            pin_fn=lambda: self.cfg["pinned_sid"] if self.cfg["pinned"] else "")
         self.src.start()
 
         self._start_ipc()
@@ -405,13 +426,25 @@ class HoverBar:
             except queue.Empty:
                 break
         if got:
+            self._check_pin_lost()
             self._draw()
         if not self.src.alive():           # 后台线程挂了 → 拉起来
-            self.src = SnapshotSource(self.cfg["poll_ms"])
+            self.src = SnapshotSource(
+                self.cfg["poll_ms"],
+                pin_fn=lambda: self.cfg["pinned_sid"] if self.cfg["pinned"] else "")
             self.src.start()
         if got:
             self._draw()
         self.root.after(self.cfg["poll_ms"], self._tick_data)
+
+    def _check_pin_lost(self):
+        """钉住的会话在本地库和远端都查不到了（被删/换库）：自动解除钉住，
+        回到跟随模式——比一直挂着一份查无此会话的旧显示诚实。"""
+        if self.cfg["pinned"] and (self.data or {}).get("pin_lost"):
+            self.cfg["pinned"] = False
+            self.cfg["pinned_sid"] = ""
+            self.cfg["pin_x"] = self.cfg["pin_y"] = -1
+            save_settings(self.cfg)
 
     # -- 拼内容 --
     def _items(self):
@@ -531,12 +564,14 @@ class HoverBar:
             blocks.append((max(0, w), ops))
 
         sep_w = 1
-        # 右端设置入口：方块边长跟着字号走，前面留 12px 与最后一项断开
+        # 两端各一个方块（左钉住右设置）：边长跟字号走，各留 12px 与内容断开
         gear_s = self._gear_size()
         gear_gap = 12
+        pin_s = gear_s
+        pin_gap = 12
         total = (pad * 2 + sum(b[0] for b in blocks)
                  + sep_w * len(blocks) + gap * 2 * (len(blocks) - 1)
-                 + gear_gap + gear_s)
+                 + gear_gap + gear_s + pin_gap + pin_s)
         h = self._px + 14
         total = int(total)
         if total < 60:
@@ -554,7 +589,10 @@ class HoverBar:
                                    fill=BG, outline=BORDER, width=1)
 
         cy = h / 2.0
-        x = pad
+        # 左端图钉方块：内容从它右侧起。钉住时整块反 acid yellow——
+        # 终末地语义里"填充=当前状态"，读作"这根条被钉住了"
+        self._draw_pin(pad, cy, h)
+        x = pad + pin_s + pin_gap
         for i, (w, ops) in enumerate(blocks):
             for op in ops:
                 if op[0] == "t":
@@ -629,6 +667,40 @@ class HoverBar:
                 fill=gcol, width=1.2)
         self._gear_box = (x, y1, x2, y2)
 
+    def _draw_pin(self, x, cy, h):
+        """左端图钉方块，与右端齿轮同一套语言：切角=可点，填充=当前状态。
+        图钉图形用三笔凑：横杠帽 + 针身 + 针尖，14px 内也读得出是"钉"。"""
+        s = self._gear_size()
+        y1 = cy - s / 2.0
+        y2 = cy + s / 2.0
+        x2 = x + s
+        # 左下角切 4px，与齿轮的右下切角成镜像
+        cut = 4
+        pts = [x, y1, x2, y1, x2, y2, x + cut, y2, x, y2 - cut, x, y1]
+        pinned = bool(self.cfg["pinned"])
+        hover = isinstance(self._hover, str) and self._hover == "pin"
+        hot = pinned or hover
+        self.pin_bg = self.canvas.create_polygon(
+            pts, smooth=False,
+            fill=EF_SIGNAL if hot else EF_CHIP, outline="")
+        gcol = EF_ON_SIGNAL if hot else EF_INK2
+        c = x + s / 2.0
+        cap_y = y1 + s * 0.22
+        cap_h = s * 0.16
+        self.canvas.create_rectangle(c - s * 0.24, cap_y, c + s * 0.24,
+                                     cap_y + cap_h, fill=gcol, outline="")
+        self.canvas.create_line(c, cap_y + cap_h, c, y2 - s * 0.18,
+                                fill=gcol, width=max(1.6, s * 0.12))
+        self._pin_box = (x, y1, x2, y2)
+
+    def _pin_rect(self):
+        """返回图钉热区 (x1, y1, x2, y2)；没画过就是空。"""
+        return getattr(self, "_pin_box", (0, 0, 0, 0))
+
+    def _hit_pin(self, x, y):
+        x1, y1, x2, y2 = self._pin_rect()
+        return x1 <= x <= x2 and y1 <= y <= y2
+
     # -- 定位 --
     def _place(self):
         if not self._last_draw:
@@ -648,6 +720,8 @@ class HoverBar:
                 return
             self._win_rect = wr
             x, y = int(cfg["free_x"]), int(cfg["free_y"])
+            if cfg["pinned"]:
+                x, y = self._pinned_xy(x, y, bw, bh)
             self._show()
             self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
             self._bind_zorder()
@@ -670,10 +744,28 @@ class HoverBar:
         x = rx + (rw - bw) // 2 + ox if hpart == "center" else \
             rx + rw - bw - ox if hpart == "right" else rx + ox
         y = ry + rh - bh - oy if v == "bottom" else ry + oy
+        if cfg["pinned"]:
+            x, y = self._pinned_xy(x, y, bw, bh)
 
         self._show()
         self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
         self._bind_zorder()
+
+    def _pinned_xy(self, x, y, bw, bh):
+        """钉住时位置锁死：一律用冻结坐标。pin_x/y 是 -1（刚在面板里改过
+        位置类设置）就把这次按锚点算出的位置就地重新冻结。坐标再夹进
+        ZCode 所在显示器的工作区，免得换屏/改分辨率后条飞出屏幕。"""
+        px, py = int(self.cfg["pin_x"]), int(self.cfg["pin_y"])
+        if px < 0 and py < 0:
+            self.cfg["pin_x"], self.cfg["pin_y"] = x, y
+            save_settings(self.cfg)
+            return x, y
+        wr = monitor_work(self._hwnd) if self._hwnd else None
+        if not wr:
+            return px, py
+        rx, ry, rw, rh = wr
+        return (min(max(rx, px), max(rx, rx + rw - bw)),
+                min(max(ry, py), max(ry, ry + rh - bh)))
 
     _visible = False
 
@@ -735,11 +827,15 @@ class HoverBar:
             self._draw()
 
     def _on_motion(self, e):
-        # 悬停在齿轮上就反白，让它读起来像个按钮；其它地方不折腾，省重绘
-        self._set_hover("gear" if self._hit_gear(e.x, e.y) else None)
-        if self._hit_gear(e.x, e.y):
+        # 悬停在两端方块上就反白，让它们读起来像按钮；其它地方不折腾，省重绘
+        if self._hit_pin(e.x, e.y):
+            self._set_hover("pin")
+            self._tip_hide()
+        elif self._hit_gear(e.x, e.y):
+            self._set_hover("gear")
             self._tip_hide()
         else:
+            self._set_hover(None)
             self._tip_maybe(e.x_root, e.y_root)
 
     # -- 悬停详情 --
@@ -876,7 +972,7 @@ class HoverBar:
 
     def _tip_show(self):
         self._tip_job = None
-        if getattr(self, "_hover", None) == "gear":
+        if getattr(self, "_hover", None) in ("gear", "pin"):
             return
         t = self._tip_build()
         if t is None:
@@ -914,10 +1010,16 @@ class HoverBar:
 
     def _drag_start(self, e):
         self._tip_hide()
+        if self._hit_pin(e.x, e.y):         # 图钉是按钮，不是拖动把手
+            self._pin_armed = True
+            return
+        self._pin_armed = False
         if self._hit_gear(e.x, e.y):        # 齿轮是按钮，不是拖动把手
             self._gear_armed = True
             return
         self._gear_armed = False
+        if self.cfg["pinned"]:
+            return                           # 钉住时位置锁死，拖不动
         self._drag = (e.x_root - self.root.winfo_x(),
                       e.y_root - self.root.winfo_y())
 
@@ -930,6 +1032,11 @@ class HoverBar:
         self.root.geometry("+%d+%d" % (x, y))
 
     def _drag_end(self, e):
+        if getattr(self, "_pin_armed", False):
+            self._pin_armed = False
+            if self._hit_pin(e.x, e.y):
+                self._toggle_pin()
+            return
         if getattr(self, "_gear_armed", False):
             self._gear_armed = False
             if self._hit_gear(e.x, e.y):
@@ -939,8 +1046,28 @@ class HoverBar:
             self._drag = None
             save_settings(self.cfg)
 
+    def _toggle_pin(self):
+        """左端图钉的开关：钉住 = 显示停在当前会话 + 位置冻结在当下；
+        解除 = 两样都恢复跟随。没有会话数据时钉不了。"""
+        if self.cfg["pinned"]:
+            self.cfg["pinned"] = False
+            self.cfg["pinned_sid"] = ""
+            self.cfg["pin_x"] = self.cfg["pin_y"] = -1
+        else:
+            sid = ((self.data or {}).get("session") or {}).get("sid") or ""
+            if not sid:
+                return
+            self.cfg["pinned"] = True
+            self.cfg["pinned_sid"] = sid
+            self.cfg["pin_x"] = self.root.winfo_x()
+            self.cfg["pin_y"] = self.root.winfo_y()
+        save_settings(self.cfg)
+        self._draw()
+
     def _menu(self, e):
         m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="解除钉住" if self.cfg["pinned"] else "钉住当前",
+                      command=self._toggle_pin)
         m.add_command(label="设置…", command=self.open_settings)
         m.add_command(label="重置位置", command=self._reset_pos)
         m.add_separator()
@@ -954,6 +1081,8 @@ class HoverBar:
         self.cfg.update({"anchor": DEFAULTS["anchor"], "scope": DEFAULTS["scope"],
                          "offset_x": DEFAULTS["offset_x"],
                          "offset_y": DEFAULTS["offset_y"]})
+        if self.cfg["pinned"]:
+            self.cfg["pin_x"] = self.cfg["pin_y"] = -1
         save_settings(self.cfg)
         self._place()
 
@@ -973,8 +1102,11 @@ class HoverBar:
         self._dlg = SettingsDialog(self)
         return self._dlg
 
-    def apply_settings(self):
+    def apply_settings(self, repin=False):
         self.cfg["poll_ms"] = max(400, int(self.cfg["poll_ms"]))
+        if repin and self.cfg["pinned"]:
+            # 位置类设置改了：旧冻结坐标作废，下个定位节拍按新锚点重新钉
+            self.cfg["pin_x"] = self.cfg["pin_y"] = -1
         self._apply_winprops()
         self._pick_font()
         self._draw()
@@ -1495,6 +1627,14 @@ class SettingsDialog:
             tk.Label(r, text=tip, bg=EF_PAPER, fg=EF_INK2,
                      font=_ef_font(EF_UI, 8)).pack(side="left", padx=(0, 12))
 
+        # 钉住：与条面左端图钉是同一个状态。勾上 = 显示停在当前会话 +
+        # 位置冻结；改贴靠/范围/边距后应用会按新锚点重新钉。
+        # 勾选框独立成行——塞进 row 右列会被长注释挤出面板边缘
+        self.v_pin = tk.BooleanVar(value=bool(self.cfg["pinned"]))
+        row("钉住", "锁住当前位置；显示停在钉住那一刻的会话，不再跟着最近活跃的会话跳")
+        _EfCheck(body, "钉住条面（等于条面左端的图钉）", self.v_pin,
+                 big=True).pack(anchor="w", pady=(0, 4))
+
         # ---- 02 外观 ----
         section("外观", "A P P E A R A N C E")
         self.v_op = tk.DoubleVar(value=float(self.cfg["opacity"]))
@@ -1711,11 +1851,31 @@ class SettingsDialog:
         c["panel_opacity"] = round(float(self.v_pop.get()), 2)
         for k, v in self.v_show.items():
             c["show"][k] = bool(v.get())
+        c["pinned"] = bool(self.v_pin.get())
 
     def apply(self):
+        # 位置类设置有没有动过：动了且处于钉住状态，就要按新锚点重新钉
+        pos_keys = ("anchor", "scope", "offset_x", "offset_y")
+        before = {k: self.cfg.get(k) for k in pos_keys}
+        was_pinned = bool(self.cfg.get("pinned"))
         self._collect()
+        repin = any(self.cfg[k] != before[k] for k in pos_keys)
+        if self.cfg["pinned"] and not was_pinned:
+            # 面板里勾上钉住：和点条面左端图钉同一套语义——
+            # 钉住当前会话 + 冻结在当下位置；没有会话数据就钉不上
+            sid = ((self.bar.data or {}).get("session") or {}).get("sid") or ""
+            if sid:
+                self.cfg["pinned_sid"] = sid
+                self.cfg["pin_x"] = self.bar.root.winfo_x()
+                self.cfg["pin_y"] = self.bar.root.winfo_y()
+            else:
+                self.cfg["pinned"] = False
+                self.v_pin.set(False)
+        elif not self.cfg["pinned"]:
+            self.cfg["pinned_sid"] = ""
+            self.cfg["pin_x"] = self.cfg["pin_y"] = -1
         save_settings(self.cfg)
-        self.bar.apply_settings()
+        self.bar.apply_settings(repin=repin)
         if self._wp is not None:
             patch = {"wallpaperVisible": bool(self.v_wp_vis.get()),
                      "dim": round(float(self.v_wp_dim.get())),
