@@ -358,6 +358,8 @@ class HoverBar:
         self._win_rect = None
         self._tip = None           # 悬停详情浮层（Toplevel），没弹时是 None
         self._tip_job = None       # 450ms 延迟任务；None 表示没在等
+        self._tip_out_job = None   # 离开条面后的 150ms 收起延时
+        self._tip_hover = False    # 指针在浮层上（进了就别收）
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -428,6 +430,7 @@ class HoverBar:
         if got:
             self._check_pin_lost()
             self._draw()
+            self._tip_refresh()        # 浮层开着就地把数字刷上去
         if not self.src.alive():           # 后台线程挂了 → 拉起来
             self.src = SnapshotSource(
                 self.cfg["poll_ms"],
@@ -817,6 +820,23 @@ class HoverBar:
 
     def _on_leave(self, e=None):
         self._set_hover(None)
+        # 不立刻收：等 150ms 看指针去哪了。条面重绘变宽会引发假 Leave，
+        # 鼠标往浮层挪的路上也会先 Leave 一下——两种都不能把浮层杀掉
+        if getattr(self, "_tip_out_job", None):
+            return
+        self._tip_out_job = self.root.after(150, self._tip_leave_check)
+
+    def _tip_leave_check(self):
+        self._tip_out_job = None
+        if getattr(self, "_tip_hover", False):
+            return                      # 已经进浮层了，继续看
+        try:
+            w = self.root.winfo_containing(self.root.winfo_pointerx(),
+                                           self.root.winfo_pointery())
+        except Exception:
+            w = None
+        if w is self.canvas:
+            return                      # 指针其实还在条面上，假 Leave
         self._tip_hide()
 
     def _set_hover(self, what):
@@ -929,7 +949,9 @@ class HoverBar:
 
     def _tip_build(self):
         """详情浮层：无边框 Toplevel + 自绘行，跟条面同一套深色语言。
-        只用 Label，不做滚动——行数由 _tip_lines 限制在十行出头。"""
+        只用 Label，不做滚动——行数由 _tip_lines 限制在十行出头。
+        完全不透明：详情是拿来读的，透出底下的正文就没法看了，
+        所以不吃条面自己的透明度设置。"""
         if getattr(self, "_tip", None) is not None:
             return self._tip
         rows = self._tip_lines()
@@ -939,7 +961,6 @@ class HoverBar:
         t.overrideredirect(True)
         try:
             t.attributes("-topmost", True)
-            t.attributes("-alpha", min(1.0, max(0.55, float(self.cfg["opacity"]))))
         except tk.TclError:
             pass
         t.configure(bg=BORDER)
@@ -949,17 +970,62 @@ class HoverBar:
         tk.Frame(inner, bg=EF_SIGNAL, height=2).pack(fill="x")
         f_k = _ef_font(EF_UI, 8)
         f_v = _ef_font(EF_UI, 8, bold=True)
+        self._tip_row_labels = []
         for k, v in rows:
             line = tk.Frame(inner, bg=BG)
             line.pack(fill="x", padx=10, pady=1)
-            tk.Label(line, text=k, bg=BG, fg=EF_INK2, font=f_k,
-                     anchor="w").pack(side="left")
-            tk.Label(line, text=v, bg=BG, fg=EF_INK, font=f_v,
-                     anchor="e").pack(side="right")
+            kl = tk.Label(line, text=k, bg=BG, fg=EF_INK2, font=f_k,
+                          anchor="w")
+            vl = tk.Label(line, text=v, bg=BG, fg=EF_INK, font=f_v,
+                          anchor="e")
+            kl.pack(side="left")
+            vl.pack(side="right")
+            self._tip_row_labels.append((kl, vl))
         tk.Frame(inner, bg=BG, height=3).pack(fill="x")
+        # 鼠标移进浮层 = 继续看：收起延时就地作废；移出去才真的收
+        t.bind("<Enter>", self._on_tip_enter)
+        t.bind("<Leave>", self._on_tip_leave)
         t.update_idletasks()
+        self._tip_rows = rows
         self._tip = t
         return t
+
+    def _on_tip_enter(self, e=None):
+        self._tip_hover = True
+        if getattr(self, "_tip_out_job", None):
+            try:
+                self.root.after_cancel(self._tip_out_job)
+            except Exception:
+                pass
+            self._tip_out_job = None
+
+    def _on_tip_leave(self, e=None):
+        self._tip_hover = False
+        self._tip_hide()
+
+    def _tip_refresh(self):
+        """浮层开着时数据到点了：就地改字，不整窗重建（重建会闪）。
+        行数对不上才按原位置重建一份。"""
+        t = getattr(self, "_tip", None)
+        if t is None:
+            return
+        rows = self._tip_lines()
+        if rows == getattr(self, "_tip_rows", None):
+            return
+        labels = getattr(self, "_tip_row_labels", None)
+        if labels is None or len(rows) != len(labels):
+            bx, by = t.winfo_x(), t.winfo_y()
+            self._tip_hide()
+            nt = self._tip_build()
+            if nt is not None:
+                nt.geometry("+%d+%d" % (bx, by))
+            return
+        for (kl, vl), (k, v) in zip(labels, rows):
+            kl.configure(text=k)
+            vl.configure(text=v)
+        self._tip_rows = rows
+        t.update_idletasks()
+        self._tip_position(t)
 
     def _tip_maybe(self, xr, yr):
         """悬停 450ms 才弹，鼠标一路划过条面不会闪一串浮层。"""
@@ -977,6 +1043,13 @@ class HoverBar:
         t = self._tip_build()
         if t is None:
             return
+        self._tip_position(t)
+        try:
+            t.deiconify()
+        except tk.TclError:
+            pass
+
+    def _tip_position(self, t):
         # 条面正下方；下面放不下就翻到上方，左右夹在屏幕内
         bx, by = self.root.winfo_x(), self.root.winfo_y()
         bw, bh = self.root.winfo_width(), self.root.winfo_height()
@@ -987,12 +1060,15 @@ class HoverBar:
         if y + th > sh - 8:
             y = max(8, by - th - 6)
         t.geometry("+%d+%d" % (x, y))
-        try:
-            t.deiconify()
-        except tk.TclError:
-            pass
 
     def _tip_hide(self):
+        if getattr(self, "_tip_out_job", None):
+            try:
+                self.root.after_cancel(self._tip_out_job)
+            except Exception:
+                pass
+            self._tip_out_job = None
+        self._tip_hover = False
         if getattr(self, "_tip_job", None):
             try:
                 self.root.after_cancel(self._tip_job)
