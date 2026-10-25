@@ -1961,6 +1961,8 @@ class SettingsDialog:
                 self._wp = _wp_read() or self._wp
                 if not _wp_refresh(self._wp.get("port")):
                     log("壁纸配置已写入，但未能立刻重注入")
+        # 应用 = 确认：落盘即收，不留着一个已经没事可做的面板
+        self.close()
 
     def reset(self):
         self.cfg.update(json.loads(json.dumps(DEFAULTS)))
