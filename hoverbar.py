@@ -741,6 +741,16 @@ class HoverBar:
             rx, ry, rw, rh = monitor_work(self._hwnd)
         else:
             rx, ry, rw, rh = wr
+            # 全屏/最大化的窗口矩形不可直接当贴靠基准：最大化带 9px 隐形边框
+            # （实测 -9,-9,1938,1098），F11 全屏则盖住整块显示器——贴它的边
+            # 等于把条面送出屏幕、或压进任务栏底下被任务栏盖住。与所在显示器
+            # 工作区取交集，两种形态都落回可见区；普通窗口与工作区本就相容，
+            # 交集不改变结果。
+            wx, wy, ww, wh = monitor_work(self._hwnd)
+            il, it = max(rx, wx), max(ry, wy)
+            ir, ib = min(rx + rw, wx + ww), min(ry + rh, wy + wh)
+            if ir - il >= 400 and ib - it >= 100:   # 交集太小（极端窗口）不采用
+                rx, ry, rw, rh = il, it, ir - il, ib - it
         ox, oy = int(cfg["offset_x"]), int(cfg["offset_y"])
 
         v, hpart = anchor.split("-", 1)          # bottom / top, left / center / right
