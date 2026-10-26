@@ -383,6 +383,7 @@ class HoverBar:
 
         self.canvas = tk.Canvas(self.root, bg=KEY, highlightthickness=0, bd=0)
         self.canvas.pack()
+        self._draw_key = None      # 上次画的内容签名；不变就跳过整次重绘
 
         self.font = None
         self._pick_font()
@@ -479,8 +480,6 @@ class HoverBar:
                 self.cfg["poll_ms"],
                 pin_fn=lambda: self.cfg["pinned_sid"] if self.cfg["pinned"] else "")
             self.src.start()
-        if got:
-            self._draw()
         self._upd_drain()
         self.root.after(self.cfg["poll_ms"], self._tick_data)
 
@@ -624,16 +623,30 @@ class HoverBar:
         if total < 60:
             total = 60
 
+        # 内容签名：文字、颜色、尺寸、钉住态、悬停态。全没变就不重画——
+        # 每 1.5s 一次的轮询里大多数时候数字确实没动（空闲时速度/本轮
+        # 都不更新），重画一遍纯属白闪。
+        # 注意 ops 必须物化成元组：生成器对象每次新建，拿它比等于永远不相等。
+        sig = (total, h, self._px, bool(self.cfg["pinned"]),
+               self._hover,
+               tuple(tuple(tuple(o) for o in ops) for _, ops in blocks))
+        if sig == self._draw_key:
+            self._last_draw = (total, h)
+            self._place()
+            return
+        self._draw_key = sig
+
         self.canvas.configure(width=total, height=h)
         self.canvas.delete("all")
+        cv = self.canvas
 
         r = 9
         x1, y1, x2, y2 = 0.5, 0.5, total - 1.0, h - 1.0
         pts = [x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
                x2, y2 - r, x2, y2, x2, y2 - r, x2 - r, y2, x1 + r, y2,
                x1, y2, x1, y2 - r, x1, y1 + r, x1, y1, x1 + r, y1]
-        self.canvas.create_polygon(pts, smooth=True, splinesteps=20,
-                                   fill=BG, outline=BORDER, width=1)
+        cv.create_polygon(pts, smooth=True, splinesteps=20,
+                          fill=BG, outline=BORDER, width=1)
 
         cy = h / 2.0
         # 左端图钉方块：内容从它右侧起。钉住时整块反 acid yellow——
@@ -644,21 +657,21 @@ class HoverBar:
             for op in ops:
                 if op[0] == "t":
                     _, txt, col = op
-                    self.canvas.create_text(x, cy, text=txt, fill=col,
-                                            font=self.font, anchor="w")
+                    cv.create_text(x, cy, text=txt, fill=col,
+                                   font=self.font, anchor="w")
                     x += twidth(txt) + GAP
                 else:
                     _, pct, col = op
                     bh = 5
                     bw = BAR_W_HINT
                     by = cy - bh / 2.0
-                    self.canvas.create_polygon(
+                    cv.create_polygon(
                         [x + 2.5, by, x + bw - 2.5, by, x + bw, by + bh / 2,
                          x + bw - 2.5, by + bh, x + 2.5, by + bh, x, by + bh / 2],
                         smooth=False, fill="#272c36", outline="")
                     fw = max(0.0, bw * pct / 100.0)
                     if fw > 1:
-                        self.canvas.create_polygon(
+                        cv.create_polygon(
                             [x + 2.5, by, x + max(2.6, fw - 2.5), by,
                              x + fw, by + bh / 2, x + max(2.6, fw - 2.5), by + bh,
                              x + 2.5, by + bh, x, by + bh / 2],
@@ -667,7 +680,7 @@ class HoverBar:
             x -= GAP
             if i < len(blocks) - 1:
                 x += gap
-                self.canvas.create_line(x, cy - 7, x, cy + 7, fill="#2f343e")
+                cv.create_line(x, cy - 7, x, cy + 7, fill="#2f343e")
                 x += sep_w + gap
 
         # 右端 ⚙：整条最后一项，切角方块 —— 终末地语义里"切角=可点"。
@@ -696,19 +709,20 @@ class HoverBar:
         cut = 4
         pts = [x, y1, x2, y1, x2, y2 - cut, x2 - cut, y2, x, y2]
         hover = isinstance(self._hover, str) and self._hover == "gear"
-        self.gear_bg = self.canvas.create_polygon(
+        cv = self.canvas
+        self.gear_bg = cv.create_polygon(
             pts, smooth=False,
             fill=EF_SIGNAL if hover else EF_CHIP,
             outline="")
         gcol = EF_ON_SIGNAL if hover else EF_INK2
         c = s / 2.0
         r = max(3.0, s * 0.30)
-        self.gear_glyph = self.canvas.create_oval(
+        cv.create_oval(
             x + c - r, cy - r, x + c + r, cy + r,
             outline=gcol, width=1.2, fill="")
         # 齿：四根短线，绕中心 45° 交叉，够小仍能读成齿轮
         for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
-            self.canvas.create_line(
+            cv.create_line(
                 x + c + dx * r * 0.72, cy + dy * r * 0.72,
                 x + c + dx * (r + 1.8), cy + dy * (r + 1.8),
                 fill=gcol, width=1.2)
@@ -727,17 +741,18 @@ class HoverBar:
         pinned = bool(self.cfg["pinned"])
         hover = isinstance(self._hover, str) and self._hover == "pin"
         hot = pinned or hover
-        self.pin_bg = self.canvas.create_polygon(
+        cv = self.canvas
+        self.pin_bg = cv.create_polygon(
             pts, smooth=False,
             fill=EF_SIGNAL if hot else EF_CHIP, outline="")
         gcol = EF_ON_SIGNAL if hot else EF_INK2
         c = x + s / 2.0
         cap_y = y1 + s * 0.22
         cap_h = s * 0.16
-        self.canvas.create_rectangle(c - s * 0.24, cap_y, c + s * 0.24,
-                                     cap_y + cap_h, fill=gcol, outline="")
-        self.canvas.create_line(c, cap_y + cap_h, c, y2 - s * 0.18,
-                                fill=gcol, width=max(1.6, s * 0.12))
+        cv.create_rectangle(c - s * 0.24, cap_y, c + s * 0.24,
+                            cap_y + cap_h, fill=gcol, outline="")
+        cv.create_line(c, cap_y + cap_h, c, y2 - s * 0.18,
+                       fill=gcol, width=max(1.6, s * 0.12))
         self._pin_box = (x, y1, x2, y2)
 
     def _pin_rect(self):
@@ -769,9 +784,7 @@ class HoverBar:
             x, y = int(cfg["free_x"]), int(cfg["free_y"])
             if cfg["pinned"]:
                 x, y = self._pinned_xy(x, y, bw, bh)
-            self._show()
-            self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
-            self._bind_zorder()
+            self._settle(bw, bh, x, y)
             return
 
         self._hwnd = zcode_hwnd()
@@ -804,9 +817,23 @@ class HoverBar:
         if cfg["pinned"]:
             x, y = self._pinned_xy(x, y, bw, bh)
 
-        self._show()
-        self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
-        self._bind_zorder()
+        # 只在真的变了才动窗口。geometry() 和改 HWLP_HWNDPARENT 都会让 Windows
+        # 重排窗口，坐标没变也做一遍就是每 400ms 闪一次——肉眼看得见的抖动。
+        self._settle(bw, bh, x, y)
+
+    def _settle(self, bw, bh, x, y):
+        """把窗口落到 (bw, bh, x, y)。四元组没变就什么都不做——
+        geometry() 和 set_owner 都会触发 Windows 重排，空跑就是闪屏。"""
+        if (bw, bh, x, y) != self._placed:
+            self._show()
+            self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
+            self._placed = (bw, bh, x, y)
+            self._bind_zorder()
+        elif not self._visible:
+            self._show()
+            self._bind_zorder()
+
+    _placed = None
 
     def _pinned_xy(self, x, y, bw, bh):
         """钉住时位置锁死：一律用冻结坐标。pin_x/y 是 -1（刚在面板里改过
@@ -835,6 +862,9 @@ class HoverBar:
         if self._visible:
             self.root.withdraw()
             self._visible = False
+            # 收回来的条下次出现时必须重新 geometry：withdraw 之后窗口位置
+            # 状态不可信，留着旧的 _placed 会让门控以为"没变"而不落位
+            self._placed = None
 
     def _bind_zorder(self):
         """把条设成 ZCode 的「属主窗口」(GWLP_HWNDPARENT)。
@@ -861,10 +891,13 @@ class HoverBar:
         self._owner = self._hwnd
 
     def _tick_anchor(self):
-        try:
-            self._place()
-        except Exception as e:
-            log("定位失败", e)
+        # 拖动中不定位：_place() 会 set_owner 重排窗口，拖起来一抖一抖。
+        # 松手后 _drag_end 置空 _drag，下一拍自然接上。
+        if getattr(self, "_drag", None) is None:
+            try:
+                self._place()
+            except Exception as e:
+                log("定位失败", e)
         self.root.after(400, self._tick_anchor)
 
     # -- 拖动 / 菜单 --
@@ -1113,7 +1146,10 @@ class HoverBar:
         y = by + bh + 6
         if y + th > sh - 8:
             y = max(8, by - th - 6)
-        t.geometry("+%d+%d" % (x, y))
+        # 坐标没变就不 geometry：刷新数字时每拍都摆一次，浮层会跟着抖
+        if (x, y) != getattr(t, "_placed_at", None):
+            t.geometry("+%d+%d" % (x, y))
+            t._placed_at = (x, y)
 
     def _tip_hide(self):
         if getattr(self, "_tip_out_job", None):
