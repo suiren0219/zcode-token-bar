@@ -14,6 +14,8 @@
     python hoverbar.py --settings   # 打开设置面板
     python hoverbar.py --quit       # 关掉正在运行的悬浮条
     python hoverbar.py --once       # 只在终端打印一次数据，不开窗（排查用）
+    python hoverbar.py --check-update   # 只问 GitHub 有没有新版，不动文件
+    python hoverbar.py --update     # 拉取最新版（工作区干净时才拉）
     python hoverbar.py --debug      # 开窗并打印定位/取数过程
 
 打开设置（三种等价入口）：点条面最右端的切角方块（悬停变酸黄）、双击条面、
@@ -21,7 +23,11 @@
 acid yellow #FFFA00 唯一强调色、切角=可点、展示容器直角、1px 细线分区。
 
 设置项：位置 / 跟随窗口还是整块屏幕 / 偏移 / 透明度 / 字号 / 显示哪些项 /
-失焦是否隐藏 / 是否置顶。拖动条面可直接改位置。
+失焦是否隐藏 / 是否置顶 / 是否启动时检查更新。拖动条面可直接改位置。
+
+更新：默认**不自动安装**。勾上「启动时自动检查」后，每次启动 5 秒悄悄问一次
+GitHub，有新版本只在设置面板「06 更新」和右键菜单里提示；拉不拉、什么时候拉
+由用户点。手动入口是设置面板里的「检查更新 / 立即更新」或上面的命令行两个开关。
 """
 from __future__ import annotations
 
@@ -100,6 +106,7 @@ DEFAULTS = {
     "labels": True,
     "poll_ms": 1500,
     "panel_opacity": 1.0,     # 设置面板自身透明度；1.0=不透明
+    "auto_update": False,     # 启动时静默问一次 GitHub；只提示，绝不自动安装
     "pinned": False,          # 钉住：显示停在 pinned_sid，位置锁死
     "pinned_sid": "",         # 钉住那一刻的会话 id；解除时清空
     "pin_x": -1,              # 钉住时冻结的位置；-1 = 未定（下个定位节拍按锚点重钉）
@@ -360,6 +367,9 @@ class HoverBar:
         self._tip_job = None       # 450ms 延迟任务；None 表示没在等
         self._tip_out_job = None   # 离开条面后的 150ms 收起延时
         self._tip_hover = False    # 指针在浮层上（进了就别收）
+        self._upd_new = False      # 启动静默检查：发现新版就是 True
+        self._upd_ver = ""         # "本地 → 远端"，右键菜单里直接显示
+        self._upd_q: queue.Queue = queue.Queue()   # 后台检查结果回主线程
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -398,6 +408,39 @@ class HoverBar:
         self._start_ipc()
         self.root.after(60, self._tick_data)
         self.root.after(80, self._tick_anchor)
+        # 启动 5 秒后才问，避开开机那一阵的网络拥塞；没勾自动检查就什么都不做
+        if self.cfg.get("auto_update"):
+            self.root.after(5000, self._upd_silent)
+
+    # -- 启动时静默检查更新 --
+    def _upd_silent(self):
+        """只查、不装。查到的差异留给右键菜单和设置面板展示，
+        要不要更新由用户在那个面板里点。"""
+        def work():
+            try:
+                remote, local = remote_commit(), local_commit()
+            except Exception:
+                return
+            # 走队列回主线程：跨线程直接调 root.after 在循环不运行时
+            # 会静默失败，那个检查就永远没有下文
+            try:
+                self._upd_q.put((remote, local))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _upd_drain(self):
+        """把后台检查的结果收进主线程。数据轮询同一个节拍上顺便做，
+        不另起定时器。"""
+        while True:
+            try:
+                remote, local = self._upd_q.get_nowait()
+            except queue.Empty:
+                return
+            self._upd_new = bool(remote) and remote != local
+            if self._upd_new:
+                self._upd_ver = "%s → %s" % (local, remote)
 
     # -- 窗口属性 --
     def _apply_winprops(self):
@@ -438,6 +481,7 @@ class HoverBar:
             self.src.start()
         if got:
             self._draw()
+        self._upd_drain()
         self.root.after(self.cfg["poll_ms"], self._tick_data)
 
     def _check_pin_lost(self):
@@ -1156,6 +1200,10 @@ class HoverBar:
                       command=self._toggle_pin)
         m.add_command(label="设置…", command=self.open_settings)
         m.add_command(label="重置位置", command=self._reset_pos)
+        if getattr(self, "_upd_new", False):
+            m.add_separator()
+            m.add_command(label="有新版本 %s，去更新" % self._upd_ver,
+                          command=self.open_settings)
         m.add_separator()
         m.add_command(label="退出", command=self.quit)
         try:
@@ -1541,6 +1589,8 @@ class SettingsDialog:
     def __init__(self, bar: HoverBar):
         self.bar = bar
         self.cfg = bar.cfg
+        self._closed = False
+        self._upd_q: queue.Queue = queue.Queue()
         top = tk.Toplevel(bar.root)
         self.top = top
         top.title("悬浮条设置")
@@ -1798,6 +1848,29 @@ class SettingsDialog:
         _EfCheck(body, "ZCode 不在前台时隐藏", self.v_hide,
                  big=True).pack(anchor="w", pady=(0, 4))
 
+        # ---- 06 更新 ----
+        section("更新", "U P D A T E")
+        # 当前版本号直接读 git：没有 tag 体系，短 hash 就是最好的版本标识
+        self._upd_local = local_commit() or "（非 git 安装）"
+        r = row("当前版本", "git 短 hash；没有就是解压使用时不在版本控制里")
+        tk.Label(r, text=self._upd_local, bg=EF_PAPER, fg=EF_INK,
+                 font=_ef_font(EF_MONO, 9, bold=True)).pack(side="left",
+                                                            padx=(0, 10))
+        self._upd_btn = _EfButton(r, "检查更新", self._upd_check)
+        self._upd_btn.pack(side="left")
+        self._upd_msg = tk.Label(body, text="", bg=EF_PAPER, fg=EF_INK2,
+                                 font=_ef_font(EF_UI, 8))
+        self._upd_msg.pack(anchor="w", pady=(2, 4))
+
+        self.v_auto = tk.BooleanVar(
+            value=bool(self.cfg.get("auto_update", False)))
+        _EfCheck(body, "启动时自动检查（只提示，不自动安装）", self.v_auto,
+                 big=True).pack(anchor="w", pady=2)
+        tk.Label(body, text="勾上后每次启动悄悄问一次 GitHub：有新版本就在本区和"
+                            "右键菜单里提示，点不点由你定。默认不勾。",
+                 bg=EF_PAPER, fg=EF_INK2,
+                 font=_ef_font(EF_UI, 8)).pack(anchor="w", pady=(0, 4))
+
         # ---- 底部按钮 ----
         tk.Frame(top, bg=EF_RULE, height=1).pack(fill="x", pady=(12, 0))
         foot = tk.Frame(top, bg=EF_PANEL)
@@ -1829,6 +1902,8 @@ class SettingsDialog:
         top.update_idletasks()
         self._sync_scroll(None)
         self._place_near_pointer()
+        # 后台 git 调用的结果回主线程：起泵，跟着面板同生共死
+        self._upd_pump()
 
     def _sync_scroll(self, body_id):
         """内容比视口高时，画出可滚动的细线指示条。"""
@@ -1923,6 +1998,101 @@ class SettingsDialog:
                 "壁纸路径已写入配置。要让 ZCode 立刻换图，重启一次客户端，"
                 "或在插件设置里再点一次应用。", parent=self.top)
 
+    # -- 更新 --
+    def _upd_say(self, text, fg=None):
+        """更新区那一行状态字。按钮文字单独控制，避免和正文提示缠在一起。"""
+        try:
+            self._upd_msg.configure(text=text, fg=fg or EF_INK2)
+        except tk.TclError:
+            pass
+
+    def _upd_button(self, text, cmd):
+        """就地换一个按钮：文字、动作都能改，不用重建整个面板。"""
+        old = self._upd_btn
+        self._upd_btn = _EfButton(old.master, text, cmd, primary=True)
+        self._upd_btn.pack(side="left")
+        try:
+            old.destroy()
+        except tk.TclError:
+            pass
+
+    def _upd_pump(self):
+        """后台线程的结果回主线程的唯一入口。
+
+        不用 root.after(0, ...)：跨线程注册在 Tk 循环没跑的时候会静默失败，
+        按钮就永远卡在「检查中…」。改用队列 + 200ms 轮询，循环在不在都丢不了。
+        """
+        try:
+            while True:
+                fn, a = self._upd_q.get_nowait()
+                fn(*a)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return                      # 面板已销毁，别再排下一轮
+        if not self._closed:
+            self._upd_job = self.top.after(200, self._upd_pump)
+
+    def _upd_check(self):
+        """联网问一次远端 HEAD。全程在后台线程里跑，界面不卡。"""
+        self._upd_say("正在连接 GitHub…")
+        self._upd_button("检查中…", lambda: None)
+
+        def work():
+            remote = remote_commit()
+            local = local_commit()
+            self._upd_q.put((self._upd_done, (remote, local)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _upd_done(self, remote, local):
+        if not remote:
+            self._upd_say("连不上 GitHub（或不是 git 安装）。检查网络后重试。",
+                          EF_DANGER)
+            self._upd_button("重试", self._upd_check)
+            return
+        if remote == local:
+            self._upd_say("已是最新 %s。" % local)
+            self._upd_button("检查更新", self._upd_check)
+            return
+        self._upd_say("有新版本：%s → %s。点右侧按钮拉取，"
+                      "重启后生效。" % (local, remote), EF_SIGNAL)
+        self._upd_button("立即更新", self._upd_apply)
+
+    def _upd_apply(self):
+        """真的拉。拉之前把设置存了——更新要重启，没保存的设置会丢。"""
+        try:
+            self._collect()
+            save_settings(self.cfg)
+        except (ValueError, tk.TclError):
+            pass
+        if repo_dirty():
+            self._upd_say("项目里有未提交的改动，先提交或 stash 再更新。",
+                          EF_DANGER)
+            return
+        self._upd_say("正在拉取…")
+        self._upd_button("更新中…", lambda: None)
+
+        def work():
+            ok, msg = do_update()
+            self._upd_q.put((self._upd_finish, (ok, msg)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _upd_finish(self, ok, msg):
+        if ok:
+            self._upd_say(msg)
+            self._upd_button("重启生效", self._upd_restart)
+        else:
+            self._upd_say(msg, EF_DANGER)
+            self._upd_button("重试", self._upd_apply)
+
+    def _upd_restart(self):
+        if relaunch():
+            self.bar.quit()
+        else:
+            self._upd_say("起不来新实例，手动重启一下悬浮条。", EF_DANGER)
+
     def _collect(self):
         c = self.cfg
         c["anchor"] = self.v_anchor.get()
@@ -1935,6 +2105,7 @@ class SettingsDialog:
         c["always_on_top"] = bool(self.v_top.get())
         c["hide_when_inactive"] = bool(self.v_hide.get())
         c["panel_opacity"] = round(float(self.v_pop.get()), 2)
+        c["auto_update"] = bool(self.v_auto.get())
         for k, v in self.v_show.items():
             c["show"][k] = bool(v.get())
         c["pinned"] = bool(self.v_pin.get())
@@ -1982,12 +2153,141 @@ class SettingsDialog:
         self.bar.open_settings()
 
     def close(self):
+        self._closed = True
+        job = getattr(self, "_upd_job", None)
+        if job:
+            try:
+                self.top.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
         try:
             self.top.destroy()
         except tk.TclError:
             pass
         if getattr(self.bar, "_dlg", None) is self:
             self.bar._dlg = None
+
+
+# ---------------------------------------------------------------- 更新
+# 用户自己决定要不要更：默认只在启动后静默问一次 GitHub，有新版就在设置面板
+# 「06 更新」里摆出来，点不点由用户定。绝不在后台偷偷 pull——那会在用户
+# 编辑 hoverbar.py 的时候把他的改动冲掉。
+def _git(args, timeout=20):
+    """在项目目录跑 git。返回 (rc, stdout)。stderr 合进 stdout，调用方自己判。"""
+    try:
+        r = subprocess.run(["git"] + args, cwd=str(HERE), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, str(e)
+
+
+def git_available() -> bool:
+    rc, out = _git(["--version"])
+    return rc == 0
+
+
+def local_commit() -> str:
+    """本地 HEAD 短 hash；不在 git 仓库里就返回空串。"""
+    rc, out = _git(["rev-parse", "--short", "HEAD"])
+    return out.strip() if rc == 0 else ""
+
+
+def repo_dirty() -> bool:
+    """有未提交改动就不许自动更新——pull 会冲掉用户自己改的东西。"""
+    rc, out = _git(["status", "--porcelain"])
+    return rc == 0 and bool(out.strip())
+
+
+def remote_commit() -> str:
+    """远端 HEAD 短 hash。只 fetch 那一个 ref，不拉全历史。"""
+    rc, out = _git(["ls-remote", "origin", "HEAD"], timeout=25)
+    if rc != 0:
+        return ""
+    line = (out.strip().splitlines() or [""])[0]
+    return line.split("\t")[0][:12] if line else ""
+
+
+def behind_count() -> int:
+    """本地落后远端几个提交。没有 upstream 或 fetch 失败返回 -1（未知）。"""
+    _git(["fetch", "origin", "HEAD"], timeout=40)
+    rc, out = _git(["rev-list", "--count", "HEAD..FETCH_HEAD"])
+    if rc != 0:
+        return -1
+    try:
+        return int(out.strip())
+    except ValueError:
+        return -1
+
+
+def do_update() -> tuple:
+    """拉到最新。返回 (ok, 人话说明)。
+
+    只在工作区干净时真拉；有本地改动时说明情况并放弃——宁可让用户自己决定
+    要不要先提交，也不能替他覆盖掉。
+    """
+    if repo_dirty():
+        return False, ("项目里有未提交的改动，先提交或 stash 再更新，"
+                       "免得把你的修改冲掉。")
+    _git(["fetch", "origin", "HEAD"], timeout=40)
+    rc, out = _git(["merge", "--ff-only", "FETCH_HEAD"], timeout=60)
+    if rc != 0:
+        head = (out.strip().splitlines() or [""])[0]
+        return False, "拉不下来（%s）。" % head if head else "拉不下来，看日志。"
+    rc, out = _git(["rev-parse", "--short", "HEAD"])
+    return True, "已更新到 %s，重启悬浮条后生效。" % (out.strip()[:8] or "新版")
+
+
+def relaunch() -> bool:
+    """起一个新实例然后退出当前这个。Windows 上先起后杀，中间留 800ms
+    让新进程把锁文件写进去，否则旧实例退出时会把新实例的锁一起删掉。"""
+    try:
+        subprocess.Popen(
+            [sys.executable, str(HERE / "hoverbar.py")],
+            cwd=str(HERE),
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError as e:
+        log("重启失败", e)
+        return False
+    return True
+
+
+def cli_check_update() -> int:
+    """--check-update：只问，不动。返回码 0=已最新，1=有新版本，2=查不了。"""
+    if not git_available():
+        print("找不到 git。更新功能需要 git；也可以直接重新下载解压覆盖。")
+        return 2
+    local = local_commit()
+    if not local:
+        print("这个目录不在 git 版本控制里（解压使用），无法比对版本。")
+        return 2
+    print("本地版本 :", local)
+    print("正在连接 GitHub…")
+    remote = remote_commit()
+    if not remote:
+        print("连不上 GitHub。检查网络后重试。")
+        return 2
+    print("远端版本 :", remote)
+    if remote == local:
+        print("已是最新。")
+        return 0
+    print("有新版本：%s → %s" % (local, remote))
+    print("执行 python hoverbar.py --update 拉取，或重开悬浮条在设置面板「06 更新」里点。")
+    return 1
+
+
+def cli_update() -> int:
+    """--update：拉取。有本地改动就拒绝，不覆盖。"""
+    if not git_available():
+        print("找不到 git，无法自动更新。")
+        return 2
+    ok, msg = do_update()
+    print(msg)
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------- CLI
@@ -2070,6 +2370,10 @@ def main(argv):
             return 0
         print("悬浮条未运行，先启动：python hoverbar.py")
         return 1
+    if "--check-update" in argv:
+        return cli_check_update()
+    if "--update" in argv:
+        return cli_update()
 
     if running_pid():
         if not send("settings"):
