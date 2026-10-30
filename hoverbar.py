@@ -873,49 +873,31 @@ class HoverBar:
         self._settle(bw, bh, x, y)
 
     def _settle(self, bw, bh, x, y):
-        """把窗口落到 (bw, bh, x, y)。四元组没变就什么都不做——
-        geometry() 和 set_owner 都会触发 Windows 重排，空跑就是闪屏。
+        """把窗口落到 (bw, bh, x, y)。已经是这个状态就什么都不做。
 
-        但要留一条自愈路径：_placed 只是"我们上次要求的位置"，不代表窗口
-        现在真的在那儿。外部因素会让两者不一致，光比对四元组永远修不回来。
-        自愈检查做了节流（每 ~3 秒一次），因为它要问 Tk 真实几何，比整数
-        比对贵；而真正需要它的场景（窗口被挪走/被藏起来）不会在 400ms 内
-        恶化，低频足矣。
+        为什么不用"我们上次设过什么"来判断：_placed/_visible 只是信念，
+        不是事实。窗口会被外部原因改掉（别的程序移动它、系统重排、DPI 变化、
+        Tk 重映射），信念和事实一分叉就再也修不回来——这轮修的一串"条面
+        丢失"全是这一类。所以每次直接问 Tk 真实几何，跟目标比对。
+        实测 4µs 一次（比枚举窗口便宜 65 倍），每秒 2.5 拍完全是噪声级；
+        换来的是这类 bug 从"要靠自愈逻辑救"变成"结构上不可能发生"。
         """
         self._miss = 0                      # 这一拍能定位到，清空隐藏计数
-        if (bw, bh, x, y) != self._placed:
-            self._show()
-            self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
-            self._placed = (bw, bh, x, y)
-            self._bind_zorder()
-            return
-        if not self._visible:
-            self._show()
-            self._bind_zorder()
-            return
-        # 目标没变、自认为可见：低频核对一次真实状态
-        now = time.time()
-        if now - getattr(self, "_verify_t", 0) < 3.0:
-            return
-        self._verify_t = now
+        want = (bw, bh, x, y)
         real = self._real_state()
-        if real is not None and real != (bw, bh, x, y):
-            log("窗口实际状态与记录不符 %r != %r，强制重落位",
-                real, (bw, bh, x, y))
-            self._placed = None
-            # 不能只靠 _show()：_visible 可能还是 True，而窗口其实已经
-            # withdraw 了（外部原因或事件丢失）。deiconify 必须无条件发一次，
-            # 否则对 withdraw 状态的窗口 geometry() 不生效，条面永远回不来。
-            self._visible = False
-            self._show()
-            self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
-            self._placed = (bw, bh, x, y)
-            self._bind_zorder()
+        if real is not None and real == want:
+            return                          # 事实就是目标：不动窗口，零闪
+        # 事实不等于目标（或问不到）：无条件 deiconify + 落位。
+        # deiconify 必须发：对 withdraw 的窗口调 geometry() 不生效，
+        # 只改标志位没用，必须重新映射。
+        self.root.deiconify()
+        self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
+        self._bind_zorder()
 
     def _real_state(self):
         """窗口真实的 (宽, 高, x, y)；查不到返回 None。
-        被系统藏起来（ismapped 为假）时返回全 0 —— 非空且不等于目标，
-        正好触发重落位。"""
+        被藏起来（ismapped 为假）时返回全 0 —— 非空且不等于任何目标，
+        正好触发一次真正的落位。"""
         try:
             if not self.root.winfo_exists():
                 return None
@@ -937,9 +919,7 @@ class HoverBar:
         if self._miss >= 2:
             self._hide()
 
-    _placed = None
     _miss = 0
-    _verify_t = 0.0
 
     def _pinned_xy(self, x, y, bw, bh):
         """钉住时位置锁死：一律用冻结坐标。pin_x/y 是 -1（刚在面板里改过
@@ -957,21 +937,30 @@ class HoverBar:
         return (min(max(rx, px), max(rx, rx + rw - bw)),
                 min(max(ry, py), max(ry, ry + rh - bh)))
 
-    _visible = False
-
     def _show(self):
-        if not self._visible:
-            self.root.deiconify()
-            self._visible = True
+        """确保窗口是映射状态。已经映射就什么都不做（问 Tk 比记标志可靠）。"""
+        try:
+            if not self.root.winfo_ismapped():
+                self.root.deiconify()
+        except tk.TclError:
+            pass
 
     def _hide(self):
-        if self._visible:
-            self.root.withdraw()
-            self._visible = False
-            # 收回来的条下次出现时必须重新 geometry：withdraw 之后窗口位置
-            # 状态不可信，留着旧的 _placed 会让门控以为"没变"而不落位
-            self._placed = None
-            self._verify_t = 0.0        # 下次出现立刻核对一次真实状态
+        """收起。已经收起就不用再动。"""
+        try:
+            if self.root.winfo_ismapped():
+                self.root.withdraw()
+        except tk.TclError:
+            pass
+
+    @property
+    def _visible(self) -> bool:
+        """条面现在是否真的可见。直接问 Tk，不维护副本——
+        这轮修的几个"丢失"全是副本与现实不同步。属性形式保住旧调用点。"""
+        try:
+            return bool(self.root.winfo_ismapped())
+        except tk.TclError:
+            return False
 
     def _bind_zorder(self):
         """把条设成 ZCode 的「属主窗口」(GWLP_HWNDPARENT)。
@@ -1450,7 +1439,7 @@ class HoverBar:
         d = {
             "pid": os.getpid(),
             "visible": self._visible,
-            "placed": self._placed,
+            "real_state": self._real_state(),
             "last_draw": self._last_draw,
             "draw_key_len": len(self._draw_key) if self._draw_key else 0,
             "draw_key_head": (self._draw_key[:4] if self._draw_key else None),
@@ -1473,9 +1462,12 @@ class HoverBar:
         return d
 
     def _force_redraw(self):
-        """丢掉签名缓存，无条件重画 + 重新落位。"""
+        """丢掉签名缓存，无条件重画并落位。
+
+        签名门控正常情况下是省开销的好东西，但画布被外部原因清空时
+        （Tk 重映射、DPI 变化）签名不变就会一直跳过重画——这是那种情况的兜底。
+        """
         self._draw_key = None
-        self._placed = None
         self._draw()
 
     def quit(self):
@@ -2332,7 +2324,7 @@ class SettingsDialog:
             hwnd = zcode_hwnd()
         except Exception:
             hwnd = 0
-        hidden = not getattr(self.bar, "_visible", False)
+        hidden = not self.bar._visible
         if hwnd and hidden and self.bar.cfg.get("hide_when_inactive"):
             self._st_set("zcode",
                          "已找到，但条面因失焦隐藏（见「05 行为」那项）", WARM)
