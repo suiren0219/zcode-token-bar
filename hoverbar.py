@@ -50,6 +50,7 @@ HERE = Path(__file__).parent.resolve()
 ZUSAGE = HERE / "zusage.py"
 CONFIG = HERE / "hoverbar.json"
 LOCK = Path(os.environ.get("TEMP", ".")) / "zusage-hoverbar.lock"
+DUMP = Path(os.environ.get("TEMP", ".")) / "zusage-hoverbar-dump.json"
 IPC_PORT = 47615          # --settings 唤起已在运行实例的控制端口
 
 # 注入版状态条的配色（overlay.js 同名变量）
@@ -222,12 +223,50 @@ def monitor_work(hwnd: int):
 
 
 def foreground_is(hwnd: int) -> bool:
+    """ZCode 是不是（或它的子窗口/我们自己的窗口是不是）在前台。
+
+    只看 GetForegroundWindow() == hwnd 不够。用户和悬浮条交互时——打开设置
+    面板、右键菜单、拖条面——前台窗口是**我们自己的** Toplevel，此时如果
+    判成"ZCode 不在前台"，条面会在用户正操作它的时候把自己藏起来，体感就是
+    "条丢了"。所以把"我们自己的窗口在前台"也算作可以显示。
+    """
     import ctypes
     u32 = _u32()
     fg = u32.GetForegroundWindow()
     if not fg or not hwnd:
         return False
-    return fg == hwnd or u32.GetAncestor(fg, 2) == hwnd   # GA_ROOT=2
+    if fg == hwnd or u32.GetAncestor(fg, 2) == hwnd:   # GA_ROOT=2
+        return True
+    # 前台是我们自己的窗口（设置面板 / 浮层 / 条面本身）→ 也算"在用"
+    mine = _OWN_HWNDS.get("bar", 0)
+    if mine and (fg == mine or u32.GetAncestor(fg, 2) == mine):
+        return True
+    for h in _OWN_HWNDS.get("extra", ()):
+        if h and (fg == h or u32.GetAncestor(fg, 2) == h):
+            return True
+    return False
+
+
+# 我们自己的窗口句柄，给 foreground_is 判断"用户正在操作条面"用。
+# bar = 条面根窗口；extra = 设置面板、浮层等临时 Toplevel。
+_OWN_HWNDS: dict = {"bar": 0, "extra": set()}
+
+
+def register_own_window(win) -> int:
+    """把一个 Toplevel/顶层窗口的根 HWND 记进 _OWN_HWNDS，返回它。
+    失败返回 0（不影响功能，只是这项判断会退回旧行为）。"""
+    try:
+        h = _u32().GetAncestor(win.winfo_id(), 2)      # GA_ROOT
+        if h:
+            _OWN_HWNDS["extra"].add(h)
+        return h
+    except Exception:
+        return 0
+
+
+def unregister_own_window(h: int):
+    if h:
+        _OWN_HWNDS["extra"].discard(h)
 
 
 def lbutton_down() -> bool:
@@ -946,6 +985,9 @@ class HoverBar:
             self._bar_hwnd = u32.GetAncestor(self.root.winfo_id(), 2)   # GA_ROOT
             if not self._bar_hwnd:
                 return
+            # 登记给 foreground_is：用户在拖条面/点图钉时前台是我们自己，
+            # 那种时候绝不能判成"ZCode 不在前台"而把条藏了
+            _OWN_HWNDS["bar"] = self._bar_hwnd
             ex = u32.GetWindowLongW(self._bar_hwnd, -20)               # GWL_EXSTYLE
             u32.SetWindowLongW(self._bar_hwnd, -20,
                                ex | 0x00000080 | 0x08000000)           # TOOLWINDOW|NOACTIVATE
@@ -1155,6 +1197,7 @@ class HoverBar:
         # 鼠标移进浮层 = 继续看：收起延时就地作废；移出去才真的收
         t.bind("<Enter>", self._on_tip_enter)
         t.bind("<Leave>", self._on_tip_leave)
+        register_own_window(t)            # 视线在浮层上也算"在用条面"
         t.update_idletasks()
         self._tip_rows = rows
         self._tip = t
@@ -1385,10 +1428,55 @@ class HoverBar:
                         self.root.after(0, self.open_settings)
                     elif msg == "quit":
                         self.root.after(0, self.quit)
+                    elif msg == "dump":
+                        # 排查用：把进程内真实状态打到一个文件里。
+                        # 条面"看不见"时，光看窗口几何分不清是没画出来、
+                        # 画到屏幕外、还是被藏起来了。
+                        try:
+                            DUMP.write_text(json.dumps(self._dump(), ensure_ascii=False,
+                                                       indent=2), encoding="utf-8")
+                        except OSError:
+                            pass
+                    elif msg == "repaint":
+                        # 强制丢弃签名缓存重画一次（排查/兜底用）
+                        self.root.after(0, self._force_redraw)
                 except OSError:
                     return
 
         threading.Thread(target=srv, daemon=True).start()
+
+    def _dump(self) -> dict:
+        """进程内真实状态快照。只读，不改任何东西。"""
+        d = {
+            "pid": os.getpid(),
+            "visible": self._visible,
+            "placed": self._placed,
+            "last_draw": self._last_draw,
+            "draw_key_len": len(self._draw_key) if self._draw_key else 0,
+            "draw_key_head": (self._draw_key[:4] if self._draw_key else None),
+            "canvas_items": len(self.canvas.find_all()),
+            "canvas_size": [self.canvas.winfo_width(), self.canvas.winfo_height()],
+            "canvas_req": [self.canvas.winfo_reqwidth(), self.canvas.winfo_reqheight()],
+            "root_geom": [self.root.winfo_x(), self.root.winfo_y(),
+                          self.root.winfo_width(), self.root.winfo_height()],
+            "root_mapped": bool(self.root.winfo_ismapped()),
+            "drag": self._drag,
+            "miss": self._miss,
+            "hover": self._hover,
+            "hwnd": self._hwnd,
+            "font_px": self._px,
+            "data_none": self.data is None,
+            "session": ((self.data or {}).get("session") or {}).get("sid", "")[-8:],
+            "anchor": self.cfg.get("anchor"),
+            "scope": self.cfg.get("scope"),
+        }
+        return d
+
+    def _force_redraw(self):
+        """丢掉签名缓存，无条件重画 + 重新落位。"""
+        self._draw_key = None
+        self._placed = None
+        self._draw()
 
     def quit(self):
         try:
@@ -2062,8 +2150,14 @@ class SettingsDialog:
         self._sync_scroll(None)
         self._place_near_pointer()
         self._st_refresh()          # 状态区先填一次，别让用户看到四行 —
+        # 面板开着时用户就是在操作悬浮条，别让 hide_when_inactive 把条藏了
+        self._own_hwnd = register_own_window(top)
         # 后台 git 调用的结果回主线程：起泵，跟着面板同生共死
         self._upd_pump()
+
+    def _unregister_own_window(self):
+        unregister_own_window(getattr(self, "_own_hwnd", 0))
+        self._own_hwnd = 0
 
     def _sync_scroll(self, body_id):
         """内容比视口高时，画出可滚动的细线指示条。"""
@@ -2231,15 +2325,23 @@ class SettingsDialog:
                 self._st_set("data", "已连接，还没取到数据", WARM)
         else:
             self._st_set("data", "断开（serve 子进程没起来）", HOT)
-        # 3) ZCode 窗口：找不到窗口条面会主动隐藏，最常见的"条不见了"原因
+        # 3) ZCode 窗口：找不到窗口条面会主动隐藏，最常见的"条不见了"原因。
+        #    还要区分"窗口在但条面被故意藏了"——那是失焦隐藏生效，
+        #    不是丢了；不写清楚用户会以为是 bug。
         try:
             hwnd = zcode_hwnd()
         except Exception:
             hwnd = 0
-        if hwnd:
+        hidden = not getattr(self.bar, "_visible", False)
+        if hwnd and hidden and self.bar.cfg.get("hide_when_inactive"):
+            self._st_set("zcode",
+                         "已找到，但条面因失焦隐藏（见「05 行为」那项）", WARM)
+        elif hwnd and hidden:
+            self._st_set("zcode", "已找到 HWND %d，条面当前不可见" % hwnd, WARM)
+        elif hwnd:
             self._st_set("zcode", "已找到  HWND %d" % hwnd, OK)
         else:
-            self._st_set("zcode", "没找到（客户端没开？）", HOT)
+            self._st_set("zcode", "没找到（客户端没开？条面会主动隐藏）", HOT)
         # 4) 开机自启：不只是"注册表有值"，还要验目标路径还在
         try:
             import winreg
@@ -2423,6 +2525,7 @@ class SettingsDialog:
 
     def close(self):
         self._closed = True
+        self._unregister_own_window()
         job = getattr(self, "_upd_job", None)
         if job:
             try:
