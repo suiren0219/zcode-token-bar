@@ -230,6 +230,18 @@ def foreground_is(hwnd: int) -> bool:
     return fg == hwnd or u32.GetAncestor(fg, 2) == hwnd   # GA_ROOT=2
 
 
+def lbutton_down() -> bool:
+    """左键物理状态。拖动状态机的兜底：<ButtonRelease-1> 会丢（快速点击、
+    拖出屏幕、拖动中被 set_owner 重排打断、别的窗口抢焦点），丢了 _drag
+    就永远非空，定位节拍跟着永久停摆——条面看起来"概率丢失"。
+    直接问系统按键状态，比信任最后收到的事件可靠。"""
+    import ctypes
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+    except Exception:
+        return True        # 查不出来就当还按着，宁可慢一拍也别误松手
+
+
 # ---------------------------------------------------------------- 设置读写
 def load_settings() -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))     # 深拷贝
@@ -778,7 +790,7 @@ class HoverBar:
             wr = win_state(self._hwnd)
             if not wr or (cfg["hide_when_inactive"]
                           and not foreground_is(self._hwnd)):
-                self._hide()
+                self._maybe_hide()
                 return
             self._win_rect = wr
             x, y = int(cfg["free_x"]), int(cfg["free_y"])
@@ -790,7 +802,7 @@ class HoverBar:
         self._hwnd = zcode_hwnd()
         wr = win_state(self._hwnd)
         if not wr or (cfg["hide_when_inactive"] and not foreground_is(self._hwnd)):
-            self._hide()
+            self._maybe_hide()
             return
         self._win_rect = wr
 
@@ -823,17 +835,72 @@ class HoverBar:
 
     def _settle(self, bw, bh, x, y):
         """把窗口落到 (bw, bh, x, y)。四元组没变就什么都不做——
-        geometry() 和 set_owner 都会触发 Windows 重排，空跑就是闪屏。"""
+        geometry() 和 set_owner 都会触发 Windows 重排，空跑就是闪屏。
+
+        但要留一条自愈路径：_placed 只是"我们上次要求的位置"，不代表窗口
+        现在真的在那儿。外部因素会让两者不一致，光比对四元组永远修不回来。
+        自愈检查做了节流（每 ~3 秒一次），因为它要问 Tk 真实几何，比整数
+        比对贵；而真正需要它的场景（窗口被挪走/被藏起来）不会在 400ms 内
+        恶化，低频足矣。
+        """
+        self._miss = 0                      # 这一拍能定位到，清空隐藏计数
         if (bw, bh, x, y) != self._placed:
             self._show()
             self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
             self._placed = (bw, bh, x, y)
             self._bind_zorder()
-        elif not self._visible:
+            return
+        if not self._visible:
             self._show()
             self._bind_zorder()
+            return
+        # 目标没变、自认为可见：低频核对一次真实状态
+        now = time.time()
+        if now - getattr(self, "_verify_t", 0) < 3.0:
+            return
+        self._verify_t = now
+        real = self._real_state()
+        if real is not None and real != (bw, bh, x, y):
+            log("窗口实际状态与记录不符 %r != %r，强制重落位",
+                real, (bw, bh, x, y))
+            self._placed = None
+            # 不能只靠 _show()：_visible 可能还是 True，而窗口其实已经
+            # withdraw 了（外部原因或事件丢失）。deiconify 必须无条件发一次，
+            # 否则对 withdraw 状态的窗口 geometry() 不生效，条面永远回不来。
+            self._visible = False
+            self._show()
+            self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
+            self._placed = (bw, bh, x, y)
+            self._bind_zorder()
+
+    def _real_state(self):
+        """窗口真实的 (宽, 高, x, y)；查不到返回 None。
+        被系统藏起来（ismapped 为假）时返回全 0 —— 非空且不等于目标，
+        正好触发重落位。"""
+        try:
+            if not self.root.winfo_exists():
+                return None
+            if not self.root.winfo_ismapped():
+                return (0, 0, 0, 0)
+            return (self.root.winfo_width(), self.root.winfo_height(),
+                    self.root.winfo_x(), self.root.winfo_y())
+        except tk.TclError:
+            return None
+
+    def _maybe_hide(self):
+        """连续两拍都判定"该藏"才真藏。
+
+        单拍判断不可靠：zcode_hwnd() 在客户端重启/切全屏/子窗口短暂变大时
+        会瞬间找不到主窗口，foreground_is() 在前台切换瞬间也会误判。以前
+        单拍就 withdraw，配合拖动状态卡死就会变成永久丢失。攒够两拍再藏，
+        代价是多等 400ms，换来的是不会因为一次采样噪声把条面弄没。"""
+        self._miss = getattr(self, "_miss", 0) + 1
+        if self._miss >= 2:
+            self._hide()
 
     _placed = None
+    _miss = 0
+    _verify_t = 0.0
 
     def _pinned_xy(self, x, y, bw, bh):
         """钉住时位置锁死：一律用冻结坐标。pin_x/y 是 -1（刚在面板里改过
@@ -865,6 +932,7 @@ class HoverBar:
             # 收回来的条下次出现时必须重新 geometry：withdraw 之后窗口位置
             # 状态不可信，留着旧的 _placed 会让门控以为"没变"而不落位
             self._placed = None
+            self._verify_t = 0.0        # 下次出现立刻核对一次真实状态
 
     def _bind_zorder(self):
         """把条设成 ZCode 的「属主窗口」(GWLP_HWNDPARENT)。
@@ -892,7 +960,22 @@ class HoverBar:
 
     def _tick_anchor(self):
         # 拖动中不定位：_place() 会 set_owner 重排窗口，拖起来一抖一抖。
-        # 松手后 _drag_end 置空 _drag，下一拍自然接上。
+        # 但拖动状态可能永远解不开——<ButtonRelease-1> 是窗口事件，快速点击、
+        # 拖出屏幕、拖动中被 set_owner 重排打断、别的窗口抢焦点，任何一个都能
+        # 让它丢掉。丢了之后 _drag 非空 → 这里永久跳过 _place → 条面卡在旧
+        # 位置、hide_when_inactive 一触发就彻底藏住，表现为"概率丢失"。
+        # 两道兜底：问系统按键的真实状态，以及拖动总时长封顶。
+        if getattr(self, "_drag", None) is not None:
+            stuck = (not lbutton_down()
+                     or (time.time() - getattr(self, "_drag_t0", 0)) > 30)
+            if stuck:
+                self._drag = None
+                self._pin_armed = self._gear_armed = False
+                try:
+                    save_settings(self.cfg)     # 拖到哪算哪，落盘
+                except Exception:
+                    pass
+                log("拖动状态卡住，已自动松手")
         if getattr(self, "_drag", None) is None:
             try:
                 self._place()
@@ -1188,6 +1271,7 @@ class HoverBar:
             return                           # 钉住时位置锁死，拖不动
         self._drag = (e.x_root - self.root.winfo_x(),
                       e.y_root - self.root.winfo_y())
+        self._drag_t0 = time.time()          # 拖动超时兜底的起点（见 _tick_anchor）
 
     def _drag_move(self, e):
         if not self._drag:
