@@ -1907,6 +1907,45 @@ class SettingsDialog:
                  bg=EF_PAPER, fg=EF_INK2,
                  font=_ef_font(EF_UI, 8)).pack(anchor="w", pady=(0, 4))
 
+        # ---- 07 状态 ----
+        # 面板是在运行中的实例里打开的，所以"悬浮条进程"这一行必然是运行中——
+        # 它的价值在于给出 PID，以及配合下面三行一起判断"哪儿断了"。
+        section("状态", "S T A T U S")
+        st = tk.Frame(body, bg=EF_PAPER)
+        st.pack(fill="x", pady=(0, 2))
+        self._st_labels = {}
+        for key, cn in (("run", "悬浮条进程"), ("data", "数据链路"),
+                        ("zcode", "ZCode 窗口"), ("auto", "开机自启")):
+            rr = tk.Frame(st, bg=EF_PAPER)
+            rr.pack(fill="x", pady=1)
+            tk.Label(rr, text=cn, bg=EF_PAPER, fg=EF_INK2, width=11,
+                     anchor="w",
+                     font=_ef_font(EF_UI, 9)).pack(side="left")
+            v = tk.Label(rr, text="—", bg=EF_PAPER, fg=EF_INK,
+                         font=_ef_font(EF_MONO, 9))
+            v.pack(side="left")
+            self._st_labels[key] = v
+
+        r_st = tk.Frame(body, bg=EF_PAPER)
+        r_st.pack(fill="x", pady=(4, 2))
+        _EfButton(r_st, "刷新", self._st_refresh).pack(side="left")
+        _EfButton(r_st, "重启悬浮条", self._st_restart).pack(side="left",
+                                                              padx=(8, 0))
+        self._st_msg = tk.Label(body, text="", bg=EF_PAPER, fg=EF_INK2,
+                                font=_ef_font(EF_UI, 8))
+        self._st_msg.pack(anchor="w", pady=(2, 4))
+
+        # 自启开关即时生效：写的是注册表 Run 项，属于系统级状态，
+        # 不该等「应用」——而且取消自启这种操作，用户期望点了就走。
+        self.v_autostart = tk.BooleanVar(value=self._st_autostart_on())
+        _EfCheck(body, "开机自动启动悬浮条（写当前用户 Run 项）",
+                 self.v_autostart, big=True).pack(anchor="w", pady=(0, 2))
+        self.v_autostart.trace_add("write", lambda *_: self._st_set_autostart())
+        tk.Label(body, text="只用当前用户权限，不需要管理员。路径写在注册表里，"
+                            "换了 Python 或搬了目录会失效——上面那行会标红提醒。",
+                 bg=EF_PAPER, fg=EF_INK2,
+                 font=_ef_font(EF_UI, 8)).pack(anchor="w", pady=(0, 4))
+
         # ---- 底部按钮 ----
         tk.Frame(top, bg=EF_RULE, height=1).pack(fill="x", pady=(12, 0))
         foot = tk.Frame(top, bg=EF_PANEL)
@@ -1938,6 +1977,7 @@ class SettingsDialog:
         top.update_idletasks()
         self._sync_scroll(None)
         self._place_near_pointer()
+        self._st_refresh()          # 状态区先填一次，别让用户看到四行 —
         # 后台 git 调用的结果回主线程：起泵，跟着面板同生共死
         self._upd_pump()
 
@@ -2033,6 +2073,115 @@ class SettingsDialog:
                 "已保存，但没能立刻生效",
                 "壁纸路径已写入配置。要让 ZCode 立刻换图，重启一次客户端，"
                 "或在插件设置里再点一次应用。", parent=self.top)
+
+    # -- 状态 / 自启 --
+    def _st_autostart_on(self) -> bool:
+        """读 HKCU Run 项。只认我们自己那个名字，别把别的软件算进来。"""
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+                winreg.QueryValueEx(k, "ZCodeTokenBar")
+            return True
+        except (OSError, ImportError):
+            return False
+
+    def _st_set_autostart(self):
+        """勾选即时写注册表。失败就把勾退回原样并说清楚原因，
+        不能让它显示"已开"而注册表里其实没有。"""
+        want = bool(self.v_autostart.get())
+        if want == self._st_autostart_on():
+            return
+        try:
+            import winreg
+            key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            if want:
+                exe = Path(sys.executable)
+                pw = exe.with_name("pythonw.exe")
+                py = pw if pw.is_file() else exe
+                cmd = '"%s" "%s"' % (py, HERE / "hoverbar.py")
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key) as k:
+                    winreg.SetValueEx(k, "ZCodeTokenBar", 0, winreg.REG_SZ, cmd)
+                self._st_say("已开启开机自启。")
+            else:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0,
+                                    winreg.KEY_SET_VALUE) as k:
+                    winreg.DeleteValue(k, "ZCodeTokenBar")
+                self._st_say("已取消开机自启。")
+        except (OSError, ImportError) as e:
+            self._st_say("改注册表失败：%s" % e, EF_DANGER)
+            try:
+                self.v_autostart.set(not want)      # 退回原样
+            except tk.TclError:
+                pass
+            return
+        self._st_refresh()
+
+    def _st_say(self, text, fg=None):
+        try:
+            self._st_msg.configure(text=text, fg=fg or EF_INK2)
+        except tk.TclError:
+            pass
+
+    def _st_set(self, key, text, fg=None):
+        lb = getattr(self, "_st_labels", {}).get(key)
+        if lb is None:
+            return
+        try:
+            lb.configure(text=text, fg=fg or EF_INK)
+        except tk.TclError:
+            pass
+
+    def _st_refresh(self):
+        """四行状态，各查各的，任何一项查不出来都只影响自己那一行。"""
+        # 1) 悬浮条进程：面板就活在这个进程里，能打开就说明在跑
+        self._st_set("run", "运行中  PID %d" % os.getpid(), OK)
+        # 2) 数据链路：serve 子进程还活着吗、有没有拿到快照
+        src = getattr(self.bar, "src", None)
+        if src is not None and src.alive():
+            if self.bar.data:
+                s = (self.bar.data.get("session") or {})
+                sid = (s.get("sid") or "")[-8:] or "—"
+                self._st_set("data", "正常  会话 %s" % sid, OK)
+            else:
+                self._st_set("data", "已连接，还没取到数据", WARM)
+        else:
+            self._st_set("data", "断开（serve 子进程没起来）", HOT)
+        # 3) ZCode 窗口：找不到窗口条面会主动隐藏，最常见的"条不见了"原因
+        try:
+            hwnd = zcode_hwnd()
+        except Exception:
+            hwnd = 0
+        if hwnd:
+            self._st_set("zcode", "已找到  HWND %d" % hwnd, OK)
+        else:
+            self._st_set("zcode", "没找到（客户端没开？）", HOT)
+        # 4) 开机自启：不只是"注册表有值"，还要验目标路径还在
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+                cmd = winreg.QueryValueEx(k, "ZCodeTokenBar")[0]
+            try:
+                target = Path(cmd.split('"')[1])
+                alive_path = target.is_file()
+            except (IndexError, OSError):
+                alive_path = False
+            if alive_path:
+                self._st_set("auto", "已开", OK)
+            else:
+                self._st_set("auto", "已开，但解释器路径失效", HOT)
+        except (OSError, ImportError, TypeError):
+            self._st_set("auto", "未开", EF_INK2)
+
+    def _st_restart(self):
+        """起一个新实例，然后本进程退出。先起后杀，中间留一拍让新实例
+        把锁文件写进去——顺序反了旧实例会把新实例的锁一起删掉。"""
+        if not relaunch():
+            self._st_say("新实例起不来，手动跑一次 hoverbar.py。", EF_DANGER)
+            return
+        self._st_say("已拉起新实例，本窗口马上关闭。")
+        self.bar.root.after(400, self.bar.quit)
 
     # -- 更新 --
     def _upd_say(self, text, fg=None):
