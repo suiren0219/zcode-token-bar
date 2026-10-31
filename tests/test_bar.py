@@ -1,0 +1,701 @@
+"""悬浮条回归测试。一个文件跑完所有场景，不依赖外部框架。
+
+用法：
+    python tests/test_bar.py            # 全部
+    python tests/test_bar.py pin pages  # 只跑指定组
+
+为什么放在仓库里而不是临时目录：这些脚本以前放在 %TEMP%，被系统清理过
+三次，每次都得重写。测试是代码的一部分，跟代码一起版本控制。
+
+设计约束：
+- 每个用例都在打桩环境里跑（假数据源、假窗口句柄、假注册表），
+  不碰真实 ZCode、不碰真实配置、不弹真窗口抢焦点。
+- 共用一套 GUI 环境：tkinter 起一次，各用例之间重置状态。
+"""
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import queue
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+try:
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+except Exception:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+os.chdir(ROOT)
+
+import hoverbar as hb
+
+TMP = Path(tempfile.mkdtemp(prefix="bar_test_"))
+hb.CONFIG = TMP / "hoverbar.json"
+hb._wp_read = lambda: None          # 壁纸段整体跳过
+
+DEMO = {
+    "session": {"sid": "sess_demo_0001", "title": "demo-project",
+                "active": True, "input": 412000, "output": 18600,
+                "cache_read": 268000, "cache_write": 0, "total": 430600,
+                "turns": 7, "requests": 42, "ctx": 412000,
+                "sub": {}, "last_turn": {}, "last": {}},
+    "last_turn": {"total": 84200, "requests": 5, "input": 76000,
+                  "cache_read": 51000, "output": 1900, "duration_ms": 41000},
+    "last": {"model": "demo-model", "tps": 158.2, "ttft_ms": 1200},
+    "today": {"total": 2860000, "requests": 318},
+    "tools": {"total": 96, "errors": 2,
+              "list": [{"name": "Bash", "count": 54, "errors": 1},
+                       {"name": "Edit", "count": 21, "errors": 0}]},
+    "code": {"add": 412, "del": 88, "files": 9},
+    "context_window": 1000000, "remote": False, "remote_error": None,
+    "not_local": [], "pinned": "", "pin_lost": False,
+}
+
+# ---------------------------------------------------------------- 打桩环境
+ZC = 198836
+OWN = 555001
+
+
+class FakeSrc:
+    """假快照源：不起子进程，队列由测试自己塞。"""
+
+    def __init__(self, interval_ms, pin_fn=None):
+        self.pin_fn = pin_fn or (lambda: "")
+        self.q = queue.Queue()
+        self._alive = True
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self._alive = False
+
+    def alive(self):
+        return self._alive
+
+
+ENV = {"win": (100, 100, 900, 700), "work": (0, 0, 1920, 1040),
+       "hwnd": ZC, "fg": ZC}
+
+
+def install_stubs():
+    hb.SnapshotSource = FakeSrc
+    hb.zcode_hwnd = lambda: ENV["hwnd"]
+    # hwnd=0（找不到窗口）时要像真的一样返回 None，否则测试测不到隐藏分支
+    hb.win_state = lambda h: (ENV["win"] if h else None)
+    hb.monitor_work = lambda h: ENV["work"]
+    hb.foreground_is = lambda h: ENV["fg"] == h
+    hb.lbutton_down = lambda: False
+
+
+install_stubs()
+
+ok = True
+FAILED: list[str] = []
+
+
+def check(name, cond):
+    global ok
+    if cond:
+        print("  PASS  " + name)
+    else:
+        print("  FAIL  " + name)
+        ok = False
+        FAILED.append(name)
+
+
+def new_bar(**over):
+    """建一个干净的条面实例。每组用例都从默认配置起步——
+    上一组可能把配置写进磁盘（钉住开关就会 save_settings），
+    串下去会让后面的位置断言莫名其妙地失败。"""
+    try:
+        hb.CONFIG.unlink()
+    except OSError:
+        pass
+    cfg = hb.load_settings()
+    cfg.update(over)
+    bar = hb.HoverBar(cfg)
+    bar.data = dict(DEMO)
+    bar._draw()
+    bar.root.update_idletasks()
+    bar.root.update()
+    return bar
+
+
+def kill(bar):
+    try:
+        bar.src.stop()
+        bar.root.destroy()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 用例
+def t_pin():
+    """图钉：开关语义、位置冻结、pin_lost 自动解钉。"""
+    bar = new_bar()
+    bar._place(); bar.root.update()
+    px1, py1, px2, py2 = bar._pin_rect()
+    check("pin 热区在条面左端", px2 > px1 and px1 <= 24)
+    check("未钉时底色是 EF_CHIP",
+          bar.canvas.itemcget(bar.pin_bg, "fill") == hb.EF_CHIP)
+
+    bar._toggle_pin()
+    saved = json.loads(hb.CONFIG.read_text(encoding="utf-8"))
+    check("钉住后 pinned=True", bar.cfg["pinned"] is True)
+    check("钉住记录了当前会话", saved["pinned_sid"] == "sess_demo_0001")
+    check("位置已冻结", saved["pin_x"] >= 0)
+    check("底色变 acid yellow",
+          bar.canvas.itemcget(bar.pin_bg, "fill") == hb.EF_SIGNAL)
+
+    before = (bar.root.winfo_x(), bar.root.winfo_y())
+
+    class E:
+        x, y = 100, 10
+        x_root, y_root = before[0] + 130, before[1] + 10
+
+    bar._drag_start(E())
+    check("钉住时不进入拖动", bar._drag is None)
+
+    bar._toggle_pin()
+    saved = json.loads(hb.CONFIG.read_text(encoding="utf-8"))
+    check("解除后字段清空", saved["pinned"] is False
+          and saved["pinned_sid"] == "" and saved["pin_x"] == -1)
+    check("解除后底色回 EF_CHIP",
+          bar.canvas.itemcget(bar.pin_bg, "fill") == hb.EF_CHIP)
+
+    bar._toggle_pin()
+    bar.data = dict(DEMO, pin_lost=True)
+    bar._check_pin_lost()
+    check("pin_lost 自动解钉", bar.cfg["pinned"] is False)
+
+    bar.data = {}
+    bar._toggle_pin()
+    check("无会话数据时钉不上", bar.cfg["pinned"] is False)
+    kill(bar)
+
+
+def t_flicker():
+    """闪屏：内容没变就一次都不重画、不动窗口。"""
+    bar = new_bar()
+    bar._place(); bar.root.update()
+    COUNT = {"geo": 0, "clear": 0}
+    rg, rdel = bar.root.geometry, bar.canvas.delete
+    bar.root.geometry = lambda *a, **k: (
+        COUNT.__setitem__("geo", COUNT["geo"] + 1), rg(*a, **k))[1]
+
+    def cdel(*a, **k):
+        if a and a[0] == "all":
+            COUNT["clear"] += 1
+        return rdel(*a, **k)
+
+    bar.canvas.delete = cdel
+    for _ in range(10):
+        bar._draw(); bar._place(); bar.root.update()
+    check("10 拍空转：geometry 0 次", COUNT["geo"] == 0)
+    check("10 拍空转：delete(all) 0 次", COUNT["clear"] == 0)
+
+    COUNT["clear"] = 0
+    bar.data = dict(DEMO)
+    bar.data["last"] = dict(DEMO["last"], tps=321.9)
+    bar._draw(); bar.root.update()
+    check("数字变了：恰好重画 1 次", COUNT["clear"] == 1)
+    COUNT["clear"] = 0
+    for _ in range(3):
+        bar._draw()
+    check("同一份数据再画 3 次：0 次", COUNT["clear"] == 0)
+
+    COUNT["geo"] = 0
+    bar.cfg["anchor"] = "top-right"
+    bar._place(); bar.root.update()
+    check("换锚点：geometry 1 次", COUNT["geo"] == 1)
+    COUNT["geo"] = 0
+    for _ in range(5):
+        bar._place()
+    check("新锚点稳定后：geometry 0 次", COUNT["geo"] == 0)
+    bar.root.geometry = rg
+    bar.canvas.delete = rdel
+    kill(bar)
+
+
+def t_fs():
+    """全屏适配：F11 / 最大化下六向贴靠都在可见区。"""
+    CASES = [
+        ("F11·任务栏自动隐藏", (0, 0, 1920, 1080), (0, 0, 1920, 1080)),
+        ("F11·任务栏可见", (0, 0, 1920, 1080), (0, 0, 1920, 1032)),
+        ("最大化·隐形边框", (-9, -9, 1938, 1098), (0, 0, 1920, 1080)),
+        ("最大化·任务栏可见", (-9, -9, 1938, 1098), (0, 0, 1920, 1032)),
+        ("普通窗口", (100, 100, 800, 600), (0, 0, 1920, 1032)),
+    ]
+    ANCHORS = ["bottom-left", "bottom-center", "bottom-right",
+               "top-left", "top-center", "top-right"]
+    bar = new_bar()
+    for desc, wr, wa in CASES:
+        ENV["win"], ENV["work"] = wr, wa
+        bad = []
+        for a in ANCHORS:
+            bar.cfg["anchor"] = a
+            bar.cfg["scope"] = "window"
+            bar._place()
+            bar.root.update_idletasks()
+            x, y = bar.root.winfo_x(), bar.root.winfo_y()
+            w, h = bar.root.winfo_width(), bar.root.winfo_height()
+            if not (wa[0] <= x and wa[1] <= y
+                    and x + w <= wa[0] + wa[2] and y + h <= wa[1] + wa[3]):
+                bad.append(a)
+        check("%s：六向全在界内" % desc, not bad)
+
+    ENV["win"], ENV["work"] = (100, 100, 800, 600), (0, 0, 1920, 1032)
+    bar.cfg.update({"anchor": "bottom-left", "scope": "window",
+                    "offset_x": 16, "offset_y": 6})
+    bar._place(); bar.root.update_idletasks()
+    bw, bh = bar._last_draw
+    check("普通窗口坐标与公式一致",
+          (bar.root.winfo_x(), bar.root.winfo_y())
+          == (116, 100 + 600 - bh - 6))
+
+    ENV["win"] = (5000, 5000, 50, 50)
+    bar.cfg["anchor"] = "bottom-left"
+    bar._placed = None
+    try:
+        bar._place()
+        check("极端窗口不崩溃", True)
+    except Exception as e:
+        check("极端窗口不崩溃（%s）" % e, False)
+    ENV["win"] = (100, 100, 900, 700)
+    kill(bar)
+
+
+def t_status():
+    """状态页四行：各自独立判断、颜色对、自启读写注册表。"""
+    REG = {}
+
+    class FakeKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class FakeWinReg:
+        HKEY_CURRENT_USER = object()
+        KEY_SET_VALUE = 2
+        REG_SZ = 1
+
+        @staticmethod
+        def OpenKey(root, path, reserved=0, access=0):
+            return FakeKey()
+
+        @staticmethod
+        def CreateKey(root, path):
+            return FakeKey()
+
+        @staticmethod
+        def QueryValueEx(k, name):
+            if name not in REG:
+                raise FileNotFoundError(name)
+            return REG[name], 1
+
+        @staticmethod
+        def SetValueEx(k, name, reserved, typ, value):
+            REG[name] = value
+
+        @staticmethod
+        def DeleteValue(k, name):
+            if name not in REG:
+                raise FileNotFoundError(name)
+            del REG[name]
+
+    real = sys.modules.get("winreg")
+    sys.modules["winreg"] = FakeWinReg
+    REG.clear()
+    try:
+        bar = new_bar()
+        dlg = hb.SettingsDialog(bar)
+        dlg.top.update_idletasks(); dlg.top.update()
+        check("四行状态齐全",
+              set(dlg._st_labels) == {"run", "data", "zcode", "auto"})
+        dlg._st_refresh()
+        check("进程行给出 PID",
+              "运行中" in str(dlg._st_labels["run"]["text"])
+              and str(os.getpid()) in str(dlg._st_labels["run"]["text"]))
+        check("数据链路正常", "正常" in str(dlg._st_labels["data"]["text"]))
+
+        bar.src._alive = False
+        dlg._st_refresh()
+        check("serve 挂了标红",
+              "断开" in str(dlg._st_labels["data"]["text"])
+              and str(dlg._st_labels["data"]["fg"]) == hb.HOT)
+        bar.src._alive = True
+
+        ENV["hwnd"] = 0
+        dlg._st_refresh()
+        check("找不到窗口标红",
+              "没找到" in str(dlg._st_labels["zcode"]["text"]))
+        ENV["hwnd"] = ZC
+        dlg._st_refresh()
+
+        REG.clear()
+        check("注册表空 → 未开", dlg._st_autostart_on() is False)
+        dlg.v_autostart.set(True)
+        check("勾上写注册表", "ZCodeTokenBar" in REG)
+        check("命令带 --wait-zcode", "--wait-zcode" in REG["ZCodeTokenBar"])
+        dlg.v_autostart.set(False)
+        check("取消后清空", "ZCodeTokenBar" not in REG)
+        dlg.close()
+        kill(bar)
+    finally:
+        if real is not None:
+            sys.modules["winreg"] = real
+        else:
+            sys.modules.pop("winreg", None)
+
+
+def t_ghost():
+    """丢失防护：拖动卡死自愈、单拍噪声不藏、位置偏离自愈。"""
+    bar = new_bar()
+    bar._place(); bar.root.update()
+
+    HB = hb.HoverBar
+
+    class Root:
+        def after(self, *a):
+            pass
+
+    class FakeBar:
+        def __init__(self):
+            self.root = Root()
+            self.cfg = bar.cfg
+            self._drag = (5, 5)
+            self._drag_t0 = time.time()
+            self._pin_armed = self._gear_armed = False
+            self.n = 0
+            self._tick_anchor = HB._tick_anchor
+
+        def _place(self):
+            self.n += 1
+
+    hb.lbutton_down = lambda: False
+    f = FakeBar()
+    HB._tick_anchor(f)
+    check("松开但事件丢失：自动松手并恢复定位", f._drag is None and f.n == 1)
+
+    hb.lbutton_down = lambda: True
+    f = FakeBar()
+    f._drag_t0 = time.time() - 40
+    HB._tick_anchor(f)
+    check("按住超时：强制松手", f._drag is None)
+
+    f = FakeBar()
+    HB._tick_anchor(f)
+    check("正常拖动中不定位", f._drag is not None and f.n == 0)
+    hb.lbutton_down = lambda: False
+
+    bar._show(); bar._place(); bar.root.update()
+    bar._miss = 0
+    ENV["hwnd"] = 0
+    bar._place(); bar.root.update()
+    check("单拍找不到窗口：还不藏", bar._visible is True)
+    bar._place(); bar.root.update()
+    check("连续两拍才藏", bar._visible is False)
+    ENV["hwnd"] = ZC
+    bar._place(); bar.root.update()
+    check("窗口回来恢复显示", bar._visible is True)
+
+    target = (bar.root.winfo_x(), bar.root.winfo_y())
+    bar.root.geometry("+%d+%d" % (target[0] + 200, target[1] + 150))
+    bar.root.update()
+    bar._place(); bar.root.update()
+    check("被外部挪走：下一拍纠正",
+          (bar.root.winfo_x(), bar.root.winfo_y()) == target)
+
+    bar.root.withdraw(); bar.root.update()
+    bar._place(); bar.root.update()
+    check("被外部藏起来：下一拍重新出现", bar._visible is True)
+    kill(bar)
+
+
+def t_truth():
+    """窗口状态以事实为准，不存副本。"""
+    bar = new_bar()
+    bar._place(); bar.root.update()
+    check("_visible 是 property",
+          isinstance(type(bar).__dict__["_visible"], property))
+    src = (ROOT / "hoverbar.py").read_text(encoding="utf-8")
+    check("无 _placed 赋值", "self._placed = " not in src)
+    check("无 _verify_t", "_verify_t" not in src)
+    check("无 _visible 赋值", "self._visible = " not in src)
+
+    bar.root.withdraw(); bar.root.update()
+    check("外部 withdraw 后立刻读到 False", bar._visible is False)
+    bar._place(); bar.root.update()
+    check("下一拍自动恢复", bar._visible is True)
+
+    for desc, mangle in (("挪走", lambda: bar.root.geometry("+900+700")),
+                         ("改尺寸", lambda: bar.root.geometry("300x10")),
+                         ("挪到屏外", lambda: bar.root.geometry("+-2000+-2000"))):
+        bar._place(); bar.root.update()
+        tgt = (bar.root.winfo_x(), bar.root.winfo_y())
+        mangle(); bar.root.update()
+        bar._place(); bar.root.update()
+        check("%s → 下一拍纠正" % desc,
+              (bar.root.winfo_x(), bar.root.winfo_y()) == tgt)
+
+    N = 300
+    t0 = time.perf_counter()
+    for _ in range(N):
+        bar._real_state()
+    dt = (time.perf_counter() - t0) / N * 1000
+    check("_real_state 单次 < 0.05ms（实测 %.4fms）" % dt, dt < 0.05)
+    kill(bar)
+
+
+def t_spin():
+    """加载动画：弧线出现、真的在转、不触发重绘、数据到位自动停。"""
+    bar = new_bar()
+    bar.data = None
+    bar._draw(); bar.root.update()
+    check("loading 置位", bar._loading is True)
+    check("弧线存在且酸黄",
+          bar._spin_id is not None
+          and bar.canvas.itemcget(bar._spin_id, "outline") == hb.EF_SIGNAL)
+    check("暗色轨道存在",
+          bar._spin_track is not None
+          and bar.canvas.itemcget(bar._spin_track, "outline") == "#272c36")
+
+    a0 = float(bar.canvas.itemcget(bar._spin_id, "start"))
+    n0 = len(bar.canvas.find_all())
+    bar._spin_tick()
+    a1 = float(bar.canvas.itemcget(bar._spin_id, "start"))
+    check("真的在转 (%.0f° → %.0f°)" % (a0, a1), a1 != a0)
+    check("转一格不新增图元", len(bar.canvas.find_all()) == n0)
+
+    exts = []
+    for _ in range(40):
+        bar._spin_tick()
+        exts.append(float(bar.canvas.itemcget(bar._spin_id, "extent")))
+    check("弧长在呼吸（幅度 > 60°）", max(exts) - min(exts) > 60)
+    check("弧长在 100~260° 内", min(exts) >= 99.9 and max(exts) <= 260.1)
+
+    if bar._spin_job:
+        bar.root.after_cancel(bar._spin_job)
+        bar._spin_job = None
+    bar.data = dict(DEMO)
+    bar._draw(); bar.root.update()
+    check("数据到位自动停", bar._loading is False and bar._spin_job is None)
+    check("弧线清掉",
+          not any(bar.canvas.type(i) == "arc" for i in bar.canvas.find_all()))
+    kill(bar)
+
+
+def t_wait():
+    """--wait-zcode：待命、原地开条、已有实例则安静退出。"""
+    CREATED = []
+
+    class FakeBar:
+        def __init__(self, cfg):
+            CREATED.append("bar")
+
+        def run(self):
+            CREATED.append("run")
+
+    real_bar, real_ls = hb.HoverBar, hb.load_settings
+    real_pid, real_hwnd, real_sleep = (hb.running_pid, hb.zcode_hwnd,
+                                       hb.time.sleep)
+    hb.HoverBar = FakeBar
+    hb.load_settings = lambda: {}
+    hb.time.sleep = lambda s: None
+    try:
+        hb.running_pid = lambda: 4321
+        check("已有实例：直接返回不起第二条",
+              hb.wait_zcode() == 0 and not CREATED)
+
+        CREATED.clear()
+        hb.running_pid = lambda: None
+        seq = iter([0, 0, ZC])
+        hb.zcode_hwnd = lambda: next(seq)
+        check("ZCode 出现后原地开条",
+              hb.wait_zcode() == 0 and CREATED == ["bar", "run"])
+
+        CREATED.clear()
+        seq = iter([0, ZC])
+        hb.zcode_hwnd = lambda: next(seq)
+        hb.running_pid = lambda: 9999
+        check("待命期间已有实例：不重复开",
+              hb.wait_zcode() == 0 and not CREATED)
+    finally:
+        hb.HoverBar, hb.load_settings = real_bar, real_ls
+        hb.running_pid, hb.zcode_hwnd, hb.time.sleep = (real_pid, real_hwnd,
+                                                        real_sleep)
+
+    import autostart
+    check("自启命令带 --wait-zcode", "--wait-zcode" in autostart.command())
+
+
+def t_pages():
+    """分页面板：七页、只显示当前页、高度随页收放、宽度固定。"""
+    bar = new_bar()
+    dlg = hb.SettingsDialog(bar)
+    dlg.top.update_idletasks(); dlg.top.update()
+    KEYS = ["pos", "look", "items", "panel", "behav", "upd", "stat"]
+    check("七个页面齐全", list(dlg._pages) == KEYS)
+    check("七个标签齐全", list(dlg._tab_cvs) == KEYS)
+    check("默认第一页", dlg._cur_page == "pos")
+
+    top_h = dlg.top.winfo_reqheight()
+    scr_h = dlg.top.winfo_screenheight()
+    check("面板高度 < 屏幕 72%%（实测 %d/%d）" % (top_h, scr_h),
+          top_h < scr_h * 0.72)
+
+    heights, widths = {}, set()
+    for k in KEYS:
+        dlg._show_page(k, animate=False)
+        dlg.top.update_idletasks(); dlg.top.update()
+        heights[k] = dlg._scroll_cv.winfo_reqheight()
+        widths.add(dlg.top.winfo_reqwidth())
+        shown = [kk for kk, f in dlg._pages.items() if f.winfo_ismapped()]
+        check("切到 %s：只有它在显示" % k, shown == [k])
+    check("各页高度不同（真按页收放）", len(set(heights.values())) > 1)
+    check("七页宽度一致（不左右跳）", len(widths) == 1)
+
+    dlg._show_page("look", animate=True)
+    ys = set()
+    for _ in range(10):
+        dlg.top.update()
+        p = dlg._pages["look"]
+        if p.winfo_ismapped():
+            ys.add(int(p.place_info().get("y", 0)))
+        time.sleep(0.02)
+    check("滑入动画 y 在变化", len(ys) > 1)
+    for _ in range(30):
+        dlg.top.update(); time.sleep(0.02)
+        if dlg._slide_job is None:
+            break
+    check("动画落定在 y=0",
+          int(dlg._pages["look"].place_info().get("y", -1)) == 0)
+
+    dlg._show_page("items", animate=False)
+    dlg.v_show["speed"].set(False)
+    dlg.v_lab.set(False)
+    dlg.apply()
+    saved = json.loads(hb.CONFIG.read_text(encoding="utf-8"))
+    check("跨页的值都能写盘",
+          saved["labels"] is False and saved["show"]["speed"] is False)
+    check("应用后面板关闭", getattr(bar, "_dlg", None) is None)
+    kill(bar)
+
+
+def t_tip():
+    """浮层：先藏后显、不透明、就地刷新不重建、行数变了才重建。"""
+    bar = new_bar()
+    t = bar._tip_build()
+    check("build 后不可见", t.winfo_ismapped() == 0)
+    bar._tip_position(t)
+    bar.root.update()
+    check("定位后仍不可见（不闪）", t.winfo_ismapped() == 0)
+    t.deiconify(); bar.root.update()
+    check("deiconify 后才出现", t.winfo_ismapped() == 1)
+    try:
+        alpha = float(t.attributes("-alpha"))
+    except Exception:
+        alpha = 1.0
+    check("浮层完全不透明", alpha == 1.0)
+    bar._tip_hide()
+
+    bar._hover = None
+    bar._tip_show()
+    bar.root.update()
+    t1 = bar._tip
+    check("浮层已显示", t1 is not None and t1.winfo_exists())
+    bar.data = dict(DEMO)
+    bar.data["last"] = dict(DEMO["last"], tps=321.9)
+    bar._tip_refresh()
+    bar.root.update()
+    check("只改值不重建窗口", bar._tip is t1)
+    texts = [str(v["text"]) for (k, v) in bar._tip_row_labels]
+    check("值已就地更新", any("321.9" in x for x in texts))
+
+    bar.data = dict(DEMO)
+    bar.data["tools"] = {}
+    bar.data["code"] = {}
+    bar._tip_refresh()
+    bar.root.update()
+    check("行数变了才重建", bar._tip is not t1)
+    bar._tip_hide()
+    check("_tip_hide 清掉行缓存",
+          bar._tip is None and bar._tip_rows is None
+          and bar._tip_row_labels is None)
+    kill(bar)
+
+
+def t_flash():
+    """启动闪屏：一律先定位再显示。"""
+    src = (ROOT / "hoverbar.py").read_text(encoding="utf-8")
+    i = src.index("def _settle(")
+    j = src.index("def _real_state(", i)
+    body = src[i:j]
+    gi, di = body.find("self.root.geometry("), body.find("self.root.deiconify(")
+    check("_settle 里 geometry 在 deiconify 之前", 0 <= gi < di)
+    check("_settle 对未映射窗口先定位", "winfo_ismapped()" in body)
+
+    i = src.index("top = tk.Toplevel(bar.root)")
+    j = src.index("top.overrideredirect(True)", i)
+    check("面板创建后立刻 withdraw", "top.withdraw()" in src[i:j])
+    k = src.index("self._place_near_pointer()", j)
+    check("面板摆位之后才 deiconify", "top.deiconify()" in src[k:k + 200])
+
+    i = src.index("def _tip_build(")
+    j = src.index("def _tip_show(", i)
+    check("浮层建好之后 withdraw", "t.withdraw()" in src[i:j])
+    i = src.index("def _tip_show(")
+    j = src.index("def _tip_position(", i)
+    body2 = src[i:j]
+    check("浮层先定位再 deiconify",
+          body2.find("self._tip_position(t)") < body2.find("t.deiconify()"))
+
+    bar = new_bar()
+    bar._place(); bar.root.update()
+    pos = (bar.root.winfo_x(), bar.root.winfo_y())
+    check("条面首次出现不在 (0,0)（实测 %s）" % (pos,), pos != (0, 0))
+    bar._hide(); bar.root.update()
+    bar._place(); bar.root.update()
+    check("隐藏再出现位置一致",
+          (bar.root.winfo_x(), bar.root.winfo_y()) == pos)
+    kill(bar)
+
+
+GROUPS = {
+    "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
+    "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
+    "pages": t_pages, "tip": t_tip, "flash": t_flash,
+}
+
+
+def main(argv):
+    names = [a for a in argv if a in GROUPS] or list(GROUPS)
+    for n in names:
+        print("\n=== %s ===" % n)
+        try:
+            GROUPS[n]()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            check("%s 抛异常：%s" % (n, e), False)
+    print()
+    if ok:
+        print("=== 全部通过（%d 组）===" % len(names))
+        return 0
+    print("=== 有失败项：%s ===" % ", ".join(FAILED))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

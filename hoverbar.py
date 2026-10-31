@@ -271,6 +271,24 @@ def unregister_own_window(h: int):
         _OWN_HWNDS["extra"].discard(h)
 
 
+def _autostart_command() -> str:
+    """自启命令串的唯一来源，统一走 autostart.py。
+
+    两边各拼一份的后果是真实的：autostart.py 那份带 --wait-zcode（随 ZCode
+    启动），面板里曾经另拼一份不带 flag 的，于是「命令行 on」和「面板勾选」
+    写出两种行为，用户在面板里勾一下就把待命模式改回了开机直开。
+    autostart.py 不在（用户只拷了 hoverbar.py）时降级成等价的内联命令。
+    """
+    try:
+        import autostart
+        return autostart.command()
+    except Exception:
+        exe = Path(sys.executable)
+        pw = exe.with_name("pythonw.exe")
+        py = pw if pw.is_file() else exe
+        return '"%s" "%s" --wait-zcode' % (py, HERE / "hoverbar.py")
+
+
 def lbutton_down() -> bool:
     """左键物理状态。拖动状态机的兜底：<ButtonRelease-1> 会丢（快速点击、
     拖出屏幕、拖动中被 set_owner 重排打断、别的窗口抢焦点），丢了 _drag
@@ -935,6 +953,12 @@ class HoverBar:
         x = rx + (rw - bw) // 2 + ox if hpart == "center" else \
             rx + rw - bw - ox if hpart == "right" else rx + ox
         y = ry + rh - bh - oy if v == "bottom" else ry + oy
+        # 条面比 ZCode 窗口还宽时，右贴靠会算出负 x（比如窗口 800 宽、
+        # 条面 1000 宽 → x = -216），整条跑到屏幕左边外面去。
+        # 夹进所在显示器工作区：宁可偏离锚点，也不能让它不可见。
+        wx, wy, ww, wh = monitor_work(self._hwnd)
+        x = min(max(wx, x), max(wx, wx + ww - bw))
+        y = min(max(wy, y), max(wy, wy + wh - bh))
         if cfg["pinned"]:
             x, y = self._pinned_xy(x, y, bw, bh)
 
@@ -1993,261 +2017,25 @@ class SettingsDialog:
         tabs.pack(fill="x", padx=(20, 14), pady=(10, 0))
         tk.Frame(top, bg=EF_RULE, height=1).pack(fill="x", padx=(20, 14),
                                                  pady=(8, 0))
+        self._tabs_bar = tabs
         self._tab_cvs = {}
         self._cur_page = None
         self._pages = {}
         self._slide_job = None
-
-        def tab_chip(key, cn):
-            f = _ef_font(EF_UI, 9)
-            w = tkfont.Font(root=top, font=f).measure(cn) + 20
-            c = tk.Canvas(tabs, width=w, height=26, bg=EF_PAPER,
-                          highlightthickness=0, bd=0, cursor="hand2")
-            c.pack(side="left", padx=(0, 5))
-            c._hover = False
-            self._tab_cvs[key] = (c, cn, f, w)
-            c.bind("<Enter>", lambda e: self._tab_hover(key, True))
-            c.bind("<Leave>", lambda e: self._tab_hover(key, False))
-            c.bind("<Button-1>", lambda e: self._show_page(key))
-            return c
-
-        def tab_paint(key):
-            c, cn, f, w = self._tab_cvs[key]
-            c.delete("all")
-            on = (key == self._cur_page)
-            h, cut = 26, 6
-            pts = [0.5, 0.5, w - cut, 0.5, w - 0.5, cut + 0.5,
-                   w - 0.5, h - 0.5, 0.5, h - 0.5]
-            if on:
-                c.create_polygon(pts, smooth=False, fill=EF_SIGNAL,
-                                 outline=EF_SIGNAL)
-                fg = EF_ON_SIGNAL
-            else:
-                c.create_polygon(pts, smooth=False,
-                                 fill=EF_CHIP if c._hover else EF_PAPER,
-                                 outline=EF_RULE)
-                fg = EF_INK if c._hover else EF_INK2
-            c.create_text(w / 2.0, h / 2.0, text=cn, fill=fg, font=f)
-
-        def tab_hover(key, v):
-            c = self._tab_cvs[key][0]
-            if c._hover != v:
-                c._hover = v
-                tab_paint(key)
-
-        self._tab_paint = tab_paint
-        self._tab_hover = tab_hover
-
-        # 分区标题：固定编号（跟标签顺序一致）+ 中文 + 拉开字距的拉丁眉标
-        def section(parent, no, cn, en):
-            head = tk.Frame(parent, bg=EF_PAPER)
-            head.pack(fill="x", pady=(0, 0))
-            tk.Label(head, text="%02d" % no, bg=EF_PAPER, fg=EF_SIGNAL,
-                     font=_ef_font(EF_MONO, 9, bold=True)
-                     ).pack(side="left", padx=(0, 10))
-            tk.Label(head, text=cn, bg=EF_PAPER, fg=EF_INK,
-                     font=_ef_font(EF_UI, 10, bold=True)).pack(side="left")
-            tk.Label(head, text=en, bg=EF_PAPER, fg=EF_INK2,
-                     font=_ef_font(EF_UI, 8)).pack(side="right")
-            tk.Frame(parent, bg=EF_RULE, height=1).pack(fill="x",
-                                                        pady=(5, 9))
-
-        def row(parent, cn, note=None):
-            """一行：左边说明（中文 + 小字注释），右边控件区。"""
-            r = tk.Frame(parent, bg=EF_PAPER)
-            r.pack(fill="x", pady=3)
-            left = tk.Frame(r, bg=EF_PAPER)
-            left.pack(side="left", fill="x", expand=True)
-            tk.Label(left, text=cn, bg=EF_PAPER, fg=EF_INK,
-                     font=_ef_font(EF_UI, 9)).pack(anchor="w")
-            if note:
-                tk.Label(left, text=note, bg=EF_PAPER, fg=EF_INK2,
-                         font=_ef_font(EF_UI, 8)).pack(anchor="w")
-            right = tk.Frame(r, bg=EF_PAPER)
-            right.pack(side="right")
-            return right
-
-        def note(parent, text):
-            tk.Label(parent, text=text, bg=EF_PAPER, fg=EF_INK2,
-                     font=_ef_font(EF_UI, 8)).pack(anchor="w", pady=(2, 4))
-
-        # ---- 01 位置 ----
-        p = self._pages["pos"] = tk.Frame(self._holder, bg=EF_PAPER)
-        tab_chip("pos", "位置")
-        section(p, 1, "位置", "P O S I T I O N")
-        self.v_anchor = tk.StringVar(value=self.cfg["anchor"])
-        _EfChips(row(p, "贴靠", "相对 ZCode 窗口或整块屏幕"), self.v_anchor,
-                 [(a, ANCHOR_TXT[a]) for a in ANCHORS if a != "free"]
-                 ).pack(anchor="e")
-
-        self.v_scope = tk.StringVar(value=self.cfg["scope"])
-        _EfChips(row(p, "范围", "跟随窗口 = 只贴 ZCode；整块屏幕 = 贴显示器"),
-                 self.v_scope,
-                 [("window", "跟随窗口"), ("screen", "整块屏幕")]
-                 ).pack(anchor="e")
-
-        self.v_ox = tk.IntVar(value=int(self.cfg["offset_x"]))
-        self.v_oy = tk.IntVar(value=int(self.cfg["offset_y"]))
-        r = row(p, "边距", "左右 / 上下，单位 px")
-        for v, tip in ((self.v_ox, "左右"), (self.v_oy, "上下")):
-            tk.Spinbox(r, from_=0, to=600, textvariable=v, width=5,
-                       bg=EF_CHIP, fg=EF_INK, insertbackground=EF_SIGNAL,
-                       buttonbackground=EF_CHIP, relief="flat", bd=0,
-                       highlightthickness=1,
-                       highlightbackground=EF_RULE,
-                       highlightcolor=EF_SIGNAL,
-                       font=_ef_font(EF_MONO, 9)
-                       ).pack(side="left", padx=(0, 6))
-            tk.Label(r, text=tip, bg=EF_PAPER, fg=EF_INK2,
-                     font=_ef_font(EF_UI, 8)).pack(side="left", padx=(0, 10))
-
-        # 钉住：与条面左端图钉是同一个状态。
-        self.v_pin = tk.BooleanVar(value=bool(self.cfg["pinned"]))
-        row(p, "钉住", "锁住当前位置；显示停在被钉住的那一轮对话上")
-        _EfCheck(p, "钉住条面（等于条面左端的图钉）", self.v_pin,
-                 big=True).pack(anchor="w", pady=(0, 2))
-
-        # ---- 02 外观 ----
-        p = self._pages["look"] = tk.Frame(self._holder, bg=EF_PAPER)
-        tab_chip("look", "外观")
-        section(p, 2, "外观", "A P P E A R A N C E")
-        self.v_op = tk.DoubleVar(value=float(self.cfg["opacity"]))
-        _EfScale(row(p, "透明度", "拖动即时预览，点「应用」才落盘"),
-                 self.v_op, 0.30, 1.0, fmt="%.2f").pack(anchor="e")
-
-        self.v_fs = tk.IntVar(value=int(self.cfg["font_px"]))
-        _EfScale(row(p, "字号", "px；上下文微进度条会一起缩放"),
-                 self.v_fs, 10, 22, fmt="%d", suffix="px").pack(anchor="e")
-
-        self.v_lab = tk.BooleanVar(value=bool(self.cfg["labels"]))
-        _EfCheck(p, "显示文字标签（速度 / 上下文 / 本轮 …）", self.v_lab,
-                 big=True).pack(anchor="w", pady=(8, 2))
-
-        # ---- 03 显示项 ----
-        p = self._pages["items"] = tk.Frame(self._holder, bg=EF_PAPER)
-        tab_chip("items", "显示")
-        section(p, 3, "显示项", "E L E M E N T S")
-        self.v_show = {}
-        grid = tk.Frame(p, bg=EF_PAPER)
-        grid.pack(fill="x", pady=(0, 2))
-        names = [("speed", "速度"), ("ctx", "上下文"), ("turn", "本轮"),
-                 ("session", "会话"), ("today", "今日"), ("tools", "工具"),
-                 ("cache", "缓存率")]
-        for i, (k, txt) in enumerate(names):
-            v = tk.BooleanVar(value=bool(self.cfg["show"].get(k, True)))
-            self.v_show[k] = v
-            _EfCheck(grid, txt, v).grid(row=i // 3, column=i % 3,
-                                        sticky="w", padx=(0, 14), pady=3)
-
-        # ---- 04 面板 / 壁纸 ----
-        p = self._pages["panel"] = tk.Frame(self._holder, bg=EF_PAPER)
-        tab_chip("panel", "壁纸")
-        section(p, 4, "面板与壁纸", "P A N E L   +   W A L L P A P E R")
-        self.v_pop = tk.DoubleVar(value=float(self.cfg.get("panel_opacity", 1.0)))
-        _EfScale(row(p, "面板透明度", "这个设置面板自己；1.00 = 纯不透明"),
-                 self.v_pop, 0.55, 1.0, fmt="%.2f").pack(anchor="e")
-        self.v_pop.trace_add("write", lambda *_: self._preview_panel())
-
-        # 壁纸：读 zcode-beautify 插件的数据目录，跟它共用同一份配置，
-        # 不另存一份以免两边打架。插件没装就整段换成一行提示。
-        self._wp = _wp_read()
-        if self._wp is not None:
-            self.v_wp_vis = tk.BooleanVar(
-                value=bool(self._wp.get("wallpaperVisible", True)))
-            _EfCheck(p, "显示壁纸（关掉后 ZCode 回到纯色背景）", self.v_wp_vis,
-                     big=True).pack(anchor="w", pady=(8, 4))
-            self.v_wp_dim = tk.DoubleVar(value=float(self._wp.get("dim", 25)))
-            _EfScale(row(p, "壁纸压暗", "越高壁纸越沉，字越清楚"),
-                     self.v_wp_dim, 0, 100, fmt="%.0f").pack(anchor="e")
-            self.v_wp_blur = tk.DoubleVar(value=float(self._wp.get("blur", 0)))
-            _EfScale(row(p, "壁纸模糊", "px；界面会更糊但更安静"),
-                     self.v_wp_blur, 0, 40, fmt="%.0f").pack(anchor="e")
-            r_pick = row(p, "换壁纸", "jpg / png，选完立刻生效")
-            _EfButton(r_pick, "选择图片…", self._pick_wallpaper).pack(side="left")
-            cur = tk.Label(r_pick, text=_wp_short(self._wp.get("wallpaperPath", "")),
-                           bg=EF_PAPER, fg=EF_INK2,
-                           font=_ef_font(EF_UI, 8))
-            cur.pack(side="left", padx=(10, 0))
-            self._wp_label = cur
-            note(p, "壁纸由 zcode-beautify 插件接管，这里改的是同一份配置。")
-        else:
-            note(p, "没找到 zcode-beautify 插件的数据目录，壁纸设置不可用。")
-
-        # ---- 05 行为 ----
-        p = self._pages["behav"] = tk.Frame(self._holder, bg=EF_PAPER)
-        tab_chip("behav", "行为")
-        section(p, 5, "行为", "B E H A V I O U R")
-        self.v_top = tk.BooleanVar(value=bool(self.cfg["always_on_top"]))
-        _EfCheck(p, "总是置顶（会盖住其它程序）", self.v_top,
-                 big=True).pack(anchor="w", pady=2)
-        note(p, "默认不勾：靠 Windows 属主窗口绑定，只浮在 ZCode 上，随它最小化让路。")
-
-        self.v_hide = tk.BooleanVar(value=bool(self.cfg["hide_when_inactive"]))
-        _EfCheck(p, "ZCode 不在前台时隐藏", self.v_hide,
-                 big=True).pack(anchor="w", pady=(6, 2))
-        note(p, "开着时切到别的程序条面就收起，看起来很像「条丢了」——一般不建议勾。")
-
-        # ---- 06 更新 ----
-        p = self._pages["upd"] = tk.Frame(self._holder, bg=EF_PAPER)
-        tab_chip("upd", "更新")
-        section(p, 6, "更新", "U P D A T E")
-        # 当前版本号直接读 git：没有 tag 体系，短 hash 就是最好的版本标识
-        self._upd_local = local_commit() or "（非 git 安装）"
-        r = row(p, "当前版本", "git 短 hash；没有就是解压使用时不在版本控制里")
-        tk.Label(r, text=self._upd_local, bg=EF_PAPER, fg=EF_INK,
-                 font=_ef_font(EF_MONO, 9, bold=True)).pack(side="left",
-                                                            padx=(0, 10))
-        self._upd_btn = _EfButton(r, "检查更新", self._upd_check)
-        self._upd_btn.pack(side="left")
-        self._upd_msg = tk.Label(p, text="", bg=EF_PAPER, fg=EF_INK2,
-                                 font=_ef_font(EF_UI, 8))
-        self._upd_msg.pack(anchor="w", pady=(2, 6))
-
-        self.v_auto = tk.BooleanVar(
-            value=bool(self.cfg.get("auto_update", False)))
-        _EfCheck(p, "启动时自动检查（只提示，不自动安装）", self.v_auto,
-                 big=True).pack(anchor="w", pady=2)
-        note(p, "勾上后每次启动悄悄问一次 GitHub：有新版本就在这里和右键菜单提示，"
-                "点不点由你定。默认不勾。")
-
-        # ---- 07 状态 ----
-        # 面板是在运行中的实例里打开的，所以"悬浮条进程"这一行必然是运行中——
-        # 它的价值在于给出 PID，以及配合下面三行一起判断"哪儿断了"。
-        p = self._pages["stat"] = tk.Frame(self._holder, bg=EF_PAPER)
-        tab_chip("stat", "状态")
-        section(p, 7, "状态", "S T A T U S")
-        st = tk.Frame(p, bg=EF_PAPER)
-        st.pack(fill="x", pady=(0, 2))
-        self._st_labels = {}
-        for key, cn in (("run", "悬浮条进程"), ("data", "数据链路"),
-                        ("zcode", "ZCode 窗口"), ("auto", "开机自启")):
-            rr = tk.Frame(st, bg=EF_PAPER)
-            rr.pack(fill="x", pady=1)
-            tk.Label(rr, text=cn, bg=EF_PAPER, fg=EF_INK2, width=11,
-                     anchor="w",
-                     font=_ef_font(EF_UI, 9)).pack(side="left")
-            v = tk.Label(rr, text="—", bg=EF_PAPER, fg=EF_INK,
-                         font=_ef_font(EF_MONO, 9))
-            v.pack(side="left")
-            self._st_labels[key] = v
-
-        r_st = tk.Frame(p, bg=EF_PAPER)
-        r_st.pack(fill="x", pady=(6, 2))
-        _EfButton(r_st, "刷新", self._st_refresh).pack(side="left")
-        _EfButton(r_st, "重启悬浮条", self._st_restart).pack(side="left",
-                                                              padx=(8, 0))
-        self._st_msg = tk.Label(p, text="", bg=EF_PAPER, fg=EF_INK2,
-                                font=_ef_font(EF_UI, 8))
-        self._st_msg.pack(anchor="w", pady=(2, 4))
-
-        # 自启开关即时生效：写的是注册表 Run 项，属于系统级状态，
-        # 不该等「应用」——而且取消自启这种操作，用户期望点了就走。
-        self.v_autostart = tk.BooleanVar(value=self._st_autostart_on())
-        _EfCheck(p, "开机自动启动悬浮条（写当前用户 Run 项）",
-                 self.v_autostart, big=True).pack(anchor="w", pady=(6, 2))
-        self.v_autostart.trace_add("write", lambda *_: self._st_set_autostart())
-        note(p, "只用当前用户权限，不需要管理员。路径写在注册表里，"
-                "换了 Python 或搬了目录会失效——上面那行会标红提醒。")
+        # 每页一个构建方法（原来全塞在 __init__ 里，424 行）：
+        # 位置 → 外观 → 显示 → 壁纸 → 行为 → 更新 → 状态
+        for key, cn, build in (
+                ("pos", "位置", self._page_pos),
+                ("look", "外观", self._page_look),
+                ("items", "显示", self._page_items),
+                ("panel", "壁纸", self._page_panel),
+                ("behav", "行为", self._page_behav),
+                ("upd", "更新", self._page_upd),
+                ("stat", "状态", self._page_stat)):
+            self._tab_chip(key, cn)
+            page = tk.Frame(self._holder, bg=EF_PAPER)
+            self._pages[key] = page
+            build(page)
 
         # ---- 底部按钮 ----
         tk.Frame(top, bg=EF_RULE, height=1).pack(fill="x", pady=(10, 0))
@@ -2297,6 +2085,390 @@ class SettingsDialog:
         self._own_hwnd = register_own_window(top)
         # 后台 git 调用的结果回主线程：起泵，跟着面板同生共死
         self._upd_pump()
+
+    def _page_pos(self, p):
+        """01 位置。"""
+        self._section(p, 1, "位置", "P O S I T I O N")
+        self.v_anchor = tk.StringVar(value=self.cfg["anchor"])
+
+        _EfChips(self._row(p, "贴靠", "相对 ZCode 窗口或整块屏幕"), self.v_anchor,
+
+                 [(a, ANCHOR_TXT[a]) for a in ANCHORS if a != "free"]
+
+                 ).pack(anchor="e")
+
+
+
+        self.v_scope = tk.StringVar(value=self.cfg["scope"])
+
+        _EfChips(self._row(p, "范围", "跟随窗口 = 只贴 ZCode；整块屏幕 = 贴显示器"),
+
+                 self.v_scope,
+
+                 [("window", "跟随窗口"), ("screen", "整块屏幕")]
+
+                 ).pack(anchor="e")
+
+
+
+        self.v_ox = tk.IntVar(value=int(self.cfg["offset_x"]))
+
+        self.v_oy = tk.IntVar(value=int(self.cfg["offset_y"]))
+
+        r = self._row(p, "边距", "左右 / 上下，单位 px")
+
+        for v, tip in ((self.v_ox, "左右"), (self.v_oy, "上下")):
+
+            tk.Spinbox(r, from_=0, to=600, textvariable=v, width=5,
+
+                       bg=EF_CHIP, fg=EF_INK, insertbackground=EF_SIGNAL,
+
+                       buttonbackground=EF_CHIP, relief="flat", bd=0,
+
+                       highlightthickness=1,
+
+                       highlightbackground=EF_RULE,
+
+                       highlightcolor=EF_SIGNAL,
+
+                       font=_ef_font(EF_MONO, 9)
+
+                       ).pack(side="left", padx=(0, 6))
+
+            tk.Label(r, text=tip, bg=EF_PAPER, fg=EF_INK2,
+
+                     font=_ef_font(EF_UI, 8)).pack(side="left", padx=(0, 10))
+
+
+
+        # 钉住：与条面左端图钉是同一个状态。
+
+        self.v_pin = tk.BooleanVar(value=bool(self.cfg["pinned"]))
+
+        self._row(p, "钉住", "锁住当前位置；显示停在被钉住的那一轮对话上")
+
+        _EfCheck(p, "钉住条面（等于条面左端的图钉）", self.v_pin,
+
+                 big=True).pack(anchor="w", pady=(0, 2))
+
+
+    def _page_look(self, p):
+        """02 外观。"""
+        self._section(p, 2, "外观", "A P P E A R A N C E")
+        self.v_op = tk.DoubleVar(value=float(self.cfg["opacity"]))
+
+        _EfScale(self._row(p, "透明度", "拖动即时预览，点「应用」才落盘"),
+
+                 self.v_op, 0.30, 1.0, fmt="%.2f").pack(anchor="e")
+
+
+
+        self.v_fs = tk.IntVar(value=int(self.cfg["font_px"]))
+
+        _EfScale(self._row(p, "字号", "px；上下文微进度条会一起缩放"),
+
+                 self.v_fs, 10, 22, fmt="%d", suffix="px").pack(anchor="e")
+
+
+
+        self.v_lab = tk.BooleanVar(value=bool(self.cfg["labels"]))
+
+        _EfCheck(p, "显示文字标签（速度 / 上下文 / 本轮 …）", self.v_lab,
+
+                 big=True).pack(anchor="w", pady=(8, 2))
+
+
+    def _page_items(self, p):
+        """03 显示项。"""
+        self._section(p, 3, "显示项", "E L E M E N T S")
+        self.v_show = {}
+
+        grid = tk.Frame(p, bg=EF_PAPER)
+
+        grid.pack(fill="x", pady=(0, 2))
+
+        names = [("speed", "速度"), ("ctx", "上下文"), ("turn", "本轮"),
+
+                 ("session", "会话"), ("today", "今日"), ("tools", "工具"),
+
+                 ("cache", "缓存率")]
+
+        for i, (k, txt) in enumerate(names):
+
+            v = tk.BooleanVar(value=bool(self.cfg["show"].get(k, True)))
+
+            self.v_show[k] = v
+
+            _EfCheck(grid, txt, v).grid(row=i // 3, column=i % 3,
+
+                                        sticky="w", padx=(0, 14), pady=3)
+
+
+    def _page_panel(self, p):
+        """04 面板与壁纸。"""
+        self._section(p, 4, "面板与壁纸", "P A N E L   +   W A L L P A P E R")
+        self.v_pop = tk.DoubleVar(value=float(self.cfg.get("panel_opacity", 1.0)))
+
+        _EfScale(self._row(p, "面板透明度", "这个设置面板自己；1.00 = 纯不透明"),
+
+                 self.v_pop, 0.55, 1.0, fmt="%.2f").pack(anchor="e")
+
+        self.v_pop.trace_add("write", lambda *_: self._preview_panel())
+
+
+
+        # 壁纸：读 zcode-beautify 插件的数据目录，跟它共用同一份配置，
+
+        # 不另存一份以免两边打架。插件没装就整段换成一行提示。
+
+        self._wp = _wp_read()
+
+        if self._wp is not None:
+
+            self.v_wp_vis = tk.BooleanVar(
+
+                value=bool(self._wp.get("wallpaperVisible", True)))
+
+            _EfCheck(p, "显示壁纸（关掉后 ZCode 回到纯色背景）", self.v_wp_vis,
+
+                     big=True).pack(anchor="w", pady=(8, 4))
+
+            self.v_wp_dim = tk.DoubleVar(value=float(self._wp.get("dim", 25)))
+
+            _EfScale(self._row(p, "壁纸压暗", "越高壁纸越沉，字越清楚"),
+
+                     self.v_wp_dim, 0, 100, fmt="%.0f").pack(anchor="e")
+
+            self.v_wp_blur = tk.DoubleVar(value=float(self._wp.get("blur", 0)))
+
+            _EfScale(self._row(p, "壁纸模糊", "px；界面会更糊但更安静"),
+
+                     self.v_wp_blur, 0, 40, fmt="%.0f").pack(anchor="e")
+
+            r_pick = self._row(p, "换壁纸", "jpg / png，选完立刻生效")
+
+            _EfButton(r_pick, "选择图片…", self._pick_wallpaper).pack(side="left")
+
+            cur = tk.Label(r_pick, text=_wp_short(self._wp.get("wallpaperPath", "")),
+
+                           bg=EF_PAPER, fg=EF_INK2,
+
+                           font=_ef_font(EF_UI, 8))
+
+            cur.pack(side="left", padx=(10, 0))
+
+            self._wp_label = cur
+
+            self._note(p, "壁纸由 zcode-beautify 插件接管，这里改的是同一份配置。")
+
+        else:
+
+            self._note(p, "没找到 zcode-beautify 插件的数据目录，壁纸设置不可用。")
+
+
+    def _page_behav(self, p):
+        """05 行为。"""
+        self._section(p, 5, "行为", "B E H A V I O U R")
+        self.v_top = tk.BooleanVar(value=bool(self.cfg["always_on_top"]))
+
+        _EfCheck(p, "总是置顶（会盖住其它程序）", self.v_top,
+
+                 big=True).pack(anchor="w", pady=2)
+
+        self._note(p, "默认不勾：靠 Windows 属主窗口绑定，只浮在 ZCode 上，随它最小化让路。")
+
+
+
+        self.v_hide = tk.BooleanVar(value=bool(self.cfg["hide_when_inactive"]))
+
+        _EfCheck(p, "ZCode 不在前台时隐藏", self.v_hide,
+
+                 big=True).pack(anchor="w", pady=(6, 2))
+
+        self._note(p, "开着时切到别的程序条面就收起，看起来很像「条丢了」——一般不建议勾。")
+
+
+    def _page_upd(self, p):
+        """06 更新。"""
+        self._section(p, 6, "更新", "U P D A T E")
+        # 当前版本号直接读 git：没有 tag 体系，短 hash 就是最好的版本标识
+
+        self._upd_local = local_commit() or "（非 git 安装）"
+
+        r = self._row(p, "当前版本", "git 短 hash；没有就是解压使用时不在版本控制里")
+
+        tk.Label(r, text=self._upd_local, bg=EF_PAPER, fg=EF_INK,
+
+                 font=_ef_font(EF_MONO, 9, bold=True)).pack(side="left",
+
+                                                            padx=(0, 10))
+
+        self._upd_btn = _EfButton(r, "检查更新", self._upd_check)
+
+        self._upd_btn.pack(side="left")
+
+        self._upd_msg = tk.Label(p, text="", bg=EF_PAPER, fg=EF_INK2,
+
+                                 font=_ef_font(EF_UI, 8))
+
+        self._upd_msg.pack(anchor="w", pady=(2, 6))
+
+
+
+        self.v_auto = tk.BooleanVar(
+
+            value=bool(self.cfg.get("auto_update", False)))
+
+        _EfCheck(p, "启动时自动检查（只提示，不自动安装）", self.v_auto,
+
+                 big=True).pack(anchor="w", pady=2)
+
+        self._note(p, "勾上后每次启动悄悄问一次 GitHub：有新版本就在这里和右键菜单提示，"
+
+                "点不点由你定。默认不勾。")
+
+
+    def _page_stat(self, p):
+        """07 状态。"""
+        self._section(p, 7, "状态", "S T A T U S")
+        st = tk.Frame(p, bg=EF_PAPER)
+
+        st.pack(fill="x", pady=(0, 2))
+
+        self._st_labels = {}
+
+        for key, cn in (("run", "悬浮条进程"), ("data", "数据链路"),
+
+                        ("zcode", "ZCode 窗口"), ("auto", "开机自启")):
+
+            rr = tk.Frame(st, bg=EF_PAPER)
+
+            rr.pack(fill="x", pady=1)
+
+            tk.Label(rr, text=cn, bg=EF_PAPER, fg=EF_INK2, width=11,
+
+                     anchor="w",
+
+                     font=_ef_font(EF_UI, 9)).pack(side="left")
+
+            v = tk.Label(rr, text="—", bg=EF_PAPER, fg=EF_INK,
+
+                         font=_ef_font(EF_MONO, 9))
+
+            v.pack(side="left")
+
+            self._st_labels[key] = v
+
+
+
+        r_st = tk.Frame(p, bg=EF_PAPER)
+
+        r_st.pack(fill="x", pady=(6, 2))
+
+        _EfButton(r_st, "刷新", self._st_refresh).pack(side="left")
+
+        _EfButton(r_st, "重启悬浮条", self._st_restart).pack(side="left",
+
+                                                              padx=(8, 0))
+
+        self._st_msg = tk.Label(p, text="", bg=EF_PAPER, fg=EF_INK2,
+
+                                font=_ef_font(EF_UI, 8))
+
+        self._st_msg.pack(anchor="w", pady=(2, 4))
+
+
+
+        # 自启开关即时生效：写的是注册表 Run 项，属于系统级状态，
+
+        # 不该等「应用」——而且取消自启这种操作，用户期望点了就走。
+
+        self.v_autostart = tk.BooleanVar(value=self._st_autostart_on())
+
+        _EfCheck(p, "开机自动启动悬浮条（写当前用户 Run 项）",
+
+                 self.v_autostart, big=True).pack(anchor="w", pady=(6, 2))
+
+        self.v_autostart.trace_add("write", lambda *_: self._st_set_autostart())
+
+        self._note(p, "只用当前用户权限，不需要管理员。路径写在注册表里，"
+
+                "换了 Python 或搬了目录会失效——上面那行会标红提醒。")
+
+
+    # -- 面板内的通用构件（原来都是 __init__ 里的闭包） --
+    def _tab_chip(self, key, cn):
+        """标签栏上的一个切角小方块。存档信息供 _tab_paint 重绘。"""
+        f = _ef_font(EF_UI, 9)
+        w = tkfont.Font(root=self.top, font=f).measure(cn) + 20
+        c = tk.Canvas(self._tabs_bar, width=w, height=26, bg=EF_PAPER,
+                      highlightthickness=0, bd=0, cursor="hand2")
+        c.pack(side="left", padx=(0, 5))
+        c._hover = False
+        self._tab_cvs[key] = (c, cn, f, w)
+        c.bind("<Enter>", lambda e: self._tab_hover(key, True))
+        c.bind("<Leave>", lambda e: self._tab_hover(key, False))
+        c.bind("<Button-1>", lambda e: self._show_page(key))
+        return c
+
+    def _tab_paint(self, key):
+        c, cn, f, w = self._tab_cvs[key]
+        c.delete("all")
+        on = (key == self._cur_page)
+        h, cut = 26, 6
+        pts = [0.5, 0.5, w - cut, 0.5, w - 0.5, cut + 0.5,
+               w - 0.5, h - 0.5, 0.5, h - 0.5]
+        if on:
+            c.create_polygon(pts, smooth=False, fill=EF_SIGNAL,
+                             outline=EF_SIGNAL)
+            fg = EF_ON_SIGNAL
+        else:
+            c.create_polygon(pts, smooth=False,
+                             fill=EF_CHIP if c._hover else EF_PAPER,
+                             outline=EF_RULE)
+            fg = EF_INK if c._hover else EF_INK2
+        c.create_text(w / 2.0, h / 2.0, text=cn, fill=fg, font=f)
+
+    def _tab_hover(self, key, v):
+        c = self._tab_cvs[key][0]
+        if c._hover != v:
+            c._hover = v
+            self._tab_paint(key)
+
+    @staticmethod
+    def _section(parent, no, cn, en):
+        """分区标题：固定编号（跟标签顺序一致）+ 中文 + 拉开字距的拉丁眉标。"""
+        head = tk.Frame(parent, bg=EF_PAPER)
+        head.pack(fill="x")
+        tk.Label(head, text="%02d" % no, bg=EF_PAPER, fg=EF_SIGNAL,
+                 font=_ef_font(EF_MONO, 9, bold=True)
+                 ).pack(side="left", padx=(0, 10))
+        tk.Label(head, text=cn, bg=EF_PAPER, fg=EF_INK,
+                 font=_ef_font(EF_UI, 10, bold=True)).pack(side="left")
+        tk.Label(head, text=en, bg=EF_PAPER, fg=EF_INK2,
+                 font=_ef_font(EF_UI, 8)).pack(side="right")
+        tk.Frame(parent, bg=EF_RULE, height=1).pack(fill="x", pady=(5, 9))
+
+    @staticmethod
+    def _row(parent, cn, note=None):
+        """一行：左边说明（中文 + 小字注释），右边控件区。返回右侧容器。"""
+        r = tk.Frame(parent, bg=EF_PAPER)
+        r.pack(fill="x", pady=3)
+        left = tk.Frame(r, bg=EF_PAPER)
+        left.pack(side="left", fill="x", expand=True)
+        tk.Label(left, text=cn, bg=EF_PAPER, fg=EF_INK,
+                 font=_ef_font(EF_UI, 9)).pack(anchor="w")
+        if note:
+            tk.Label(left, text=note, bg=EF_PAPER, fg=EF_INK2,
+                     font=_ef_font(EF_UI, 8)).pack(anchor="w")
+        right = tk.Frame(r, bg=EF_PAPER)
+        right.pack(side="right")
+        return right
+
+    @staticmethod
+    def _note(parent, text):
+        tk.Label(parent, text=text, bg=EF_PAPER, fg=EF_INK2,
+                 font=_ef_font(EF_UI, 8)).pack(anchor="w", pady=(2, 4))
 
     def _show_page(self, key, animate=True):
         """切到某一页：换页 + 按该页高度收放画布 + 滑入动画。
@@ -2472,7 +2644,12 @@ class SettingsDialog:
 
     def _st_set_autostart(self):
         """勾选即时写注册表。失败就把勾退回原样并说清楚原因，
-        不能让它显示"已开"而注册表里其实没有。"""
+        不能让它显示"已开"而注册表里其实没有。
+
+        命令串统一由 autostart.py 提供——那份带 --wait-zcode（随 ZCode 启动）。
+        以前这里自己拼了一份不带 flag 的，于是「命令行 on」和「面板里勾选」
+        写出两种不同行为，用户在面板里勾一下就把待命模式悄悄改回了开机直开。
+        """
         want = bool(self.v_autostart.get())
         if want == self._st_autostart_on():
             return
@@ -2480,13 +2657,10 @@ class SettingsDialog:
             import winreg
             key = r"Software\Microsoft\Windows\CurrentVersion\Run"
             if want:
-                exe = Path(sys.executable)
-                pw = exe.with_name("pythonw.exe")
-                py = pw if pw.is_file() else exe
-                cmd = '"%s" "%s"' % (py, HERE / "hoverbar.py")
+                cmd = _autostart_command()
                 with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key) as k:
                     winreg.SetValueEx(k, "ZCodeTokenBar", 0, winreg.REG_SZ, cmd)
-                self._st_say("已开启开机自启。")
+                self._st_say("已开启开机自启（随 ZCode 启动）。")
             else:
                 with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0,
                                     winreg.KEY_SET_VALUE) as k:

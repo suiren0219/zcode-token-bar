@@ -248,8 +248,29 @@ python hoverbar.py --update         # 拉取（工作区干净时才拉）
 | `hoverbar.py` | 悬浮条本体：无边框圆角胶囊 + 设置面板。Win32 属主绑定、DPI 感知、单实例 |
 | `zusage.py` | 数据层：只读 SQLite 查询、上下文窗口查表、`serve` 行协议、`json` 子命令 |
 | `autostart.py` | 开机自启管理（HKCU Run 项） |
+| `tests/test_bar.py` | 回归测试，11 组、约 150 项断言，零依赖 |
 | `hoverbar.json` | 运行期配置，首次运行自动生成，不入库 |
 | `docs/USAGE.md` | 逐项说明、机制细节、排查 |
+
+---
+
+## 测试
+
+```bash
+python tests/test_bar.py            # 全部（约 20 秒）
+python tests/test_bar.py pin pages  # 只跑指定组
+```
+
+覆盖：图钉、闪屏门控、全屏适配、状态页、丢失防护、事实驱动、加载动画、
+待命自启、分页面板、浮层、启动闪屏。
+
+全部在打桩环境里跑——假数据源、假窗口句柄、假注册表，不碰真实 ZCode、
+不改真实配置、不弹窗抢焦点。注册表操作全程走内存里的假实现。
+
+测试跟着仓库走而不是放临时目录，是因为被系统清理过三次，每次都得重写。
+
+代码质量基线（`python -m radon cc hoverbar.py -a`）：平均圈复杂度 **A**，
+没有 D 级及以上函数；最长的 `SettingsDialog.__init__` 已从 424 行拆到 188 行。
 
 ---
 
