@@ -421,6 +421,12 @@ class HoverBar:
         self._upd_new = False      # 启动静默检查：发现新版就是 True
         self._upd_ver = ""         # "本地 → 远端"，右键菜单里直接显示
         self._upd_q: queue.Queue = queue.Queue()   # 后台检查结果回主线程
+        # 加载动画：等待首包时旋转的酸黄弧线。帧更新走 itemconfig 只改角度，
+        # 不重建图元也不进签名门控——动画期间既不闪也不被门控拦住
+        self._loading = False
+        self._spin_id = None       # 弧线的 canvas item id
+        self._spin_job = None      # after 定时任务；None = 没在转
+        self._spin_angle = 0
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -634,8 +640,10 @@ class HoverBar:
     # -- 绘制 --
     def _draw(self):
         items = self._items()
-        if not items:
-            items = [[("t", "等待数据…", DIM)]]
+        loading = not items
+        if loading:
+            # 等待首包：一个旋转的加载弧线 + 提示文字，同一个块里不画分隔线
+            items = [[("spin",), ("t", "等待数据…", DIM)]]
 
         pad, gap, inner = 10, 9, 4
         GAP = self.font.measure(" ")
@@ -652,6 +660,9 @@ class HoverBar:
                     _, txt, col = tok
                     ops.append(("t", txt, col))
                     w += twidth(txt)
+                elif tok[0] == "spin":
+                    ops.append(("spin",))
+                    w += self._spin_size() + 2
                 else:
                     _, pct, col = tok
                     ops.append(("bar", pct, col))
@@ -711,6 +722,15 @@ class HoverBar:
                     cv.create_text(x, cy, text=txt, fill=col,
                                    font=self.font, anchor="w")
                     x += twidth(txt) + GAP
+                elif op[0] == "spin":
+                    d = self._spin_size()
+                    # 酸黄弧线：终末地语义里 acid yellow = 当前活动，
+                    # 读作"正在取数"。start 角度由 _spin_tick 转动
+                    self._spin_id = cv.create_arc(
+                        x + 1, cy - d / 2.0, x + 1 + d, cy + d / 2.0,
+                        start=self._spin_angle, extent=270, style="arc",
+                        outline=EF_SIGNAL, width=2)
+                    x += d + 2 + GAP
                 else:
                     _, pct, col = op
                     bh = 5
@@ -739,8 +759,41 @@ class HoverBar:
         # 方块右边距与左边 pad 对齐，视觉上才是"紧贴末端"而不是悬在中间。
         self._draw_gear(total - pad - gear_s, cy, h)
 
+        # 加载动画的启停。数据到位后停表——delete("all") 已经把弧线清掉了，
+        # 不停的话定时器会对着死 id 转，白耗电还可能在重画瞬间闪一帧错位
+        if loading:
+            self._loading = True
+            if not self._spin_job:
+                self._spin_job = self.root.after(110, self._spin_tick)
+        else:
+            self._loading = False
+            self._spin_id = None
+            if self._spin_job:
+                try:
+                    self.root.after_cancel(self._spin_job)
+                except Exception:
+                    pass
+                self._spin_job = None
+
         self._last_draw = (total, h)
         self._place()
+
+    def _spin_size(self):
+        """加载弧线直径：跟字号走，比文字略矮，读作附属指示而不是主角。"""
+        return max(10, int(self._px * 0.7))
+
+    def _spin_tick(self):
+        """转一格。只 itemconfig 改 start 角度——不重建图元、不动几何、
+        不经过签名门控，所以动画期间条面既不闪也不会被"没变就不重画"拦住。"""
+        self._spin_job = None
+        if not self._loading or not self._spin_id:
+            return
+        try:
+            self._spin_angle = (self._spin_angle + 40) % 360
+            self.canvas.itemconfigure(self._spin_id, start=self._spin_angle)
+            self._spin_job = self.root.after(110, self._spin_tick)
+        except tk.TclError:
+            pass              # 画布没了（退出中），静默收场
 
     def _gear_size(self):
         """齿轮方块边长：跟字号走，但不小于 14，免得小字号点不中。"""
@@ -1452,6 +1505,7 @@ class HoverBar:
             "drag": self._drag,
             "miss": self._miss,
             "hover": self._hover,
+            "loading": self._loading,
             "hwnd": self._hwnd,
             "font_px": self._px,
             "data_none": self.data is None,
