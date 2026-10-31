@@ -650,7 +650,16 @@ def t_flash():
     j = src.index("top.overrideredirect(True)", i)
     check("面板创建后立刻 withdraw", "top.withdraw()" in src[i:j])
     k = src.index("self._place_near_pointer()", j)
-    check("面板摆位之后才 deiconify", "top.deiconify()" in src[k:k + 200])
+    seg2 = src[k:k + 200]
+    check("面板摆位之后才走入场动画", "self._animate_open()" in seg2)
+    ai = src.index("def _animate_open(")
+    aseg = src[ai:ai + 1600]
+    # 只查动画分支：geometry(y+12) 之后的第一个 deiconify 才是入场用的；
+    # reduced-motion 分支里直接 deiconify 是对的（无位移，无需先定位）
+    gi = aseg.find('top.geometry("+%d+%d" % (x, y + 12))')
+    check("入场动画内部也是先定位再 deiconify",
+          gi >= 0 and aseg.find("top.deiconify()", gi) > gi)
+    check("入场动画尊重系统动效开关", "motion_ok()" in aseg)
 
     i = src.index("def _tip_build(")
     j = src.index("def _tip_show(", i)

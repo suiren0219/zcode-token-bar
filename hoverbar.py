@@ -271,6 +271,36 @@ def unregister_own_window(h: int):
         _OWN_HWNDS["extra"].discard(h)
 
 
+# ---------------------------------------------------------------- 动效
+# 曲线与时长照 Emil Kowalski 的 animate 技能定的一套来：入场一律 ease-out、
+# 时长压在 300ms 内、动位移和透明度（tkinter 里对应 geometry/alpha），
+# 系统关了动画就全部直接落位——gentler, not zero。
+_MOTION_OK = None
+
+
+def motion_ok() -> bool:
+    """Windows「显示动画」辅助功能开关（SPI_GETCLIENTAREAANIMATION）。
+    关掉时跳过所有入场动画，直接落位。探测一次缓存。"""
+    global _MOTION_OK
+    if _MOTION_OK is None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            v = wintypes.BOOL()
+            ok = ctypes.windll.user32.SystemParametersInfoW(
+                0x1042, 0, ctypes.byref(v), 0)      # SPI_GETCLIENTAREAANIMATION
+            _MOTION_OK = bool(ok) and bool(v.value)
+        except Exception:
+            _MOTION_OK = True       # 查不到就当开着，别因为排查失败砍掉动效
+    return _MOTION_OK
+
+
+def ease_out(t: float) -> float:
+    """三次方 ease-out：起步快、收尾缓。近似 cubic-bezier(0.23, 1, 0.32, 1)。"""
+    t = min(1.0, max(0.0, t))
+    return 1.0 - (1.0 - t) ** 3
+
+
 def _autostart_command() -> str:
     """自启命令串的唯一来源，统一走 autostart.py。
 
@@ -2079,12 +2109,52 @@ class SettingsDialog:
         self._show_page("pos", animate=False)
         self._place_near_pointer()
         # 摆好位置、内容齐了才显示——顺序反了就是"每次打开面板都在左上角闪一下"
-        top.deiconify()
+        self._animate_open()
         self._st_refresh()          # 状态区先填一次，别让用户看到四行 —
         # 面板开着时用户就是在操作悬浮条，别让 hide_when_inactive 把条藏了
         self._own_hwnd = register_own_window(top)
         # 后台 git 调用的结果回主线程：起泵，跟着面板同生共死
         self._upd_pump()
+
+    def _animate_open(self):
+        """面板入场：160ms ease-out，从下方 12px 落定 + 淡入。
+
+        第一帧就画在偏移位置且透明（先 geometry/alpha 再 deiconify），
+        所以不会闪。系统关了动画就直接落位。终点透明度是用户设的
+        panel_opacity——动画只负责"到那里"，不覆盖设置。
+        """
+        top = self.top
+        x, y = top.winfo_x(), top.winfo_y()
+        target = min(1.0, max(0.4, float(self.cfg.get("panel_opacity", 1.0))))
+        try:
+            if not motion_ok():
+                top.attributes("-alpha", target)
+                top.deiconify()
+                return
+            # 入场起点：scale(0.95)+opacity 0 那一档——位移要小，不是从天而降
+            top.geometry("+%d+%d" % (x, y + 12))
+            top.attributes("-alpha", 0.0)
+            top.deiconify()
+        except tk.TclError:
+            return
+        t0 = time.perf_counter()
+
+        def step():
+            t = (time.perf_counter() - t0) / 0.16
+            e = ease_out(t)
+            try:
+                if t >= 1.0 or getattr(self, "_open_job", None) is None:
+                    top.geometry("+%d+%d" % (x, y))
+                    top.attributes("-alpha", target)
+                    self._open_job = None
+                    return
+                top.geometry("+%d+%d" % (x, y + max(0, round(12 * (1 - e)))))
+                top.attributes("-alpha", round(target * e, 3))
+                self._open_job = top.after(16, step)
+            except tk.TclError:
+                pass
+
+        self._open_job = top.after(0, step)
 
     def _page_pos(self, p):
         """01 位置。"""
@@ -2499,7 +2569,7 @@ class SettingsDialog:
         self._scroll_cv.yview_moveto(0)
         for k in self._tab_cvs:
             self._tab_paint(k)
-        if not animate:
+        if not animate or not motion_ok():
             page.place(x=0, y=0, relwidth=1)
             self._sync_scroll()
             return
@@ -2509,16 +2579,25 @@ class SettingsDialog:
             except Exception:
                 pass
             self._slide_job = None
-        frames = [13, 10, 7, 4, 2, 0]
+        # 150ms ease-out（emil 规则：下拉类 150-250ms，入场 ease-out，
+        # 每帧只动位移不碰布局）。时间基而不是固定帧序列，掉帧时终点
+        # 位置照样准。
+        t0 = time.perf_counter()
 
-        def step(i=0):
-            if i >= len(frames):
+        def step():
+            t = (time.perf_counter() - t0) / 0.15
+            if t >= 1.0:
                 self._slide_job = None
-                self._sync_scroll()
+                try:
+                    page.place(x=0, y=0, relwidth=1)
+                    self._sync_scroll()
+                except tk.TclError:
+                    pass
                 return
             try:
-                page.place(x=0, y=frames[i], relwidth=1)
-                self._slide_job = self.top.after(16, lambda: step(i + 1))
+                page.place(x=0, y=max(0, round(14 * (1 - ease_out(t)))),
+                           relwidth=1)
+                self._slide_job = self.top.after(16, step)
             except tk.TclError:
                 self._slide_job = None
 
@@ -2599,7 +2678,15 @@ class SettingsDialog:
             pass
 
     def _preview_panel(self):
-        """面板自己的透明度也做实时预览，边拖边看。"""
+        """面板自己的透明度也做实时预览，边拖边看。
+        拖滑块 = 用户在接管透明度，入场动画立刻让位。"""
+        job = getattr(self, "_open_job", None)
+        if job:
+            try:
+                self.top.after_cancel(job)
+            except Exception:
+                pass
+            self._open_job = None
         try:
             a = min(1.0, max(0.4, float(self.v_pop.get())))
             self.top.attributes("-alpha", a)
