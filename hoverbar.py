@@ -957,11 +957,19 @@ class HoverBar:
         real = self._real_state()
         if real is not None and real == want:
             return                          # 事实就是目标：不动窗口，零闪
-        # 事实不等于目标（或问不到）：无条件 deiconify + 落位。
-        # deiconify 必须发：对 withdraw 的窗口调 geometry() 不生效，
-        # 只改标志位没用，必须重新映射。
-        self.root.deiconify()
-        self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
+        # 顺序至关重要：未映射的窗口必须先 geometry 再 deiconify。
+        # 反过来的话 deiconify 会先把它按当前位置（新建窗口就是屏幕左上角
+        # 0,0）显示出来，下一句 geometry 才挪到目标——启动时那一下左上角
+        # 闪屏就是这么来的。已映射的窗口 geometry 本来就能直接生效，
+        # 不需要 deiconify，但多发一次也无害（对映射窗口是 no-op）。
+        try:
+            if not self.root.winfo_ismapped():
+                self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
+                self.root.deiconify()
+            else:
+                self.root.geometry("%dx%d+%d+%d" % (bw, bh, x, y))
+        except tk.TclError:
+            return
         self._bind_zorder()
 
     def _real_state(self):
@@ -1259,6 +1267,9 @@ class HoverBar:
         t.bind("<Leave>", self._on_tip_leave)
         register_own_window(t)            # 视线在浮层上也算"在用条面"
         t.update_idletasks()
+        # 建好先不显示：_tip_show 会摆好位置再 deiconify。
+        # 否则 Toplevel 一创建就在左上角露一帧，跟条面启动闪屏同一个毛病。
+        t.withdraw()
         self._tip_rows = rows
         self._tip = t
         return t
@@ -1358,6 +1369,10 @@ class HoverBar:
             except tk.TclError:
                 pass
             self._tip = None
+        # 行缓存跟着窗口一起作废：留着旧的行数/标签会让下一次 _tip_refresh
+        # 误判成"行数变了"而白重建一个新窗口
+        self._tip_rows = None
+        self._tip_row_labels = None
 
 
     def _drag_start(self, e):
@@ -1865,6 +1880,10 @@ class SettingsDialog:
         self._upd_q: queue.Queue = queue.Queue()
         top = tk.Toplevel(bar.root)
         self.top = top
+        # 先藏起来：Toplevel 一创建就按默认位置（屏幕左上）显示，等下面
+        # 一堆控件建完再摆位，中间会看到它在左上角闪一下。建完、
+        # 摆好位置之后才 deiconify（见 __init__ 末尾）。
+        top.withdraw()
         top.title("悬浮条设置")
         top.configure(bg=EF_PAPER)
         # 不要系统白标题栏：它跟终末地这套暗色完全不是一路。改成无边框 + 自绘标题行，
@@ -2271,6 +2290,8 @@ class SettingsDialog:
         top.update_idletasks()
         self._show_page("pos", animate=False)
         self._place_near_pointer()
+        # 摆好位置、内容齐了才显示——顺序反了就是"每次打开面板都在左上角闪一下"
+        top.deiconify()
         self._st_refresh()          # 状态区先填一次，别让用户看到四行 —
         # 面板开着时用户就是在操作悬浮条，别让 hide_when_inactive 把条藏了
         self._own_hwnd = register_own_window(top)
