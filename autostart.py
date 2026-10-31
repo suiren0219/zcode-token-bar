@@ -13,6 +13,12 @@
 
 用 pythonw.exe 而不是 python.exe：后者会闪一个控制台窗口。找不到
 pythonw.exe 时退回 python.exe（功能一样，只是有窗）。
+
+命令带 --wait-zcode：开机起的不是条面本身，而是一个待命进程——每秒
+看一眼 ZCode 主窗口（单次枚举约 0.26ms，几乎不占 CPU），ZCode 出现的
+瞬间原地变成条面。效果是"跟 ZCode 一起启动"：ZCode 不开就一直安静
+待着，不弹任何窗口；已经有一条在跑时待命进程自己退出，不会把设置
+面板叫到前台。
 """
 from __future__ import annotations
 
@@ -35,8 +41,9 @@ def _pythonw() -> Path:
 
 
 def command() -> str:
-    """将要写入 Run 项的命令行（带引号，路径含空格也能跑）。"""
-    return '"%s" "%s"' % (_pythonw(), BAR)
+    """将要写入 Run 项的命令行（带引号，路径含空格也能跑）。
+    --wait-zcode：开机待命，ZCode 出现才开条——见模块 docstring。"""
+    return '"%s" "%s" --wait-zcode' % (_pythonw(), BAR)
 
 
 def read() -> str | None:

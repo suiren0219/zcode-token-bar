@@ -16,6 +16,7 @@
     python hoverbar.py --once       # 只在终端打印一次数据，不开窗（排查用）
     python hoverbar.py --check-update   # 只问 GitHub 有没有新版，不动文件
     python hoverbar.py --update     # 拉取最新版（工作区干净时才拉）
+    python hoverbar.py --wait-zcode # 待命直到 ZCode 出现再开条（自启用）
     python hoverbar.py --debug      # 开窗并打印定位/取数过程
 
 打开设置（三种等价入口）：点条面最右端的切角方块（悬停变酸黄）、双击条面、
@@ -32,6 +33,7 @@ GitHub，有新版本只在设置面板「06 更新」和右键菜单里提示�
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -425,8 +427,10 @@ class HoverBar:
         # 不重建图元也不进签名门控——动画期间既不闪也不被门控拦住
         self._loading = False
         self._spin_id = None       # 弧线的 canvas item id
+        self._spin_track = None    # 暗色整圆轨道的 item id
         self._spin_job = None      # after 定时任务；None = 没在转
         self._spin_angle = 0
+        self._spin_phase = 0       # 弧长呼吸的相位
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -724,8 +728,13 @@ class HoverBar:
                     x += twidth(txt) + GAP
                 elif op[0] == "spin":
                     d = self._spin_size()
+                    # 暗色整圆轨道 + 酸黄弧线：GitHub 那类转圈指示的构图，
+                    # 轨道给出"这里有个圈"的预期，弧线在上面转才读得顺
+                    self._spin_track = cv.create_oval(
+                        x + 1, cy - d / 2.0, x + 1 + d, cy + d / 2.0,
+                        outline="#272c36", width=2)
                     # 酸黄弧线：终末地语义里 acid yellow = 当前活动，
-                    # 读作"正在取数"。start 角度由 _spin_tick 转动
+                    # 读作"正在取数"。start/extent 由 _spin_tick 驱动
                     self._spin_id = cv.create_arc(
                         x + 1, cy - d / 2.0, x + 1 + d, cy + d / 2.0,
                         start=self._spin_angle, extent=270, style="arc",
@@ -768,6 +777,7 @@ class HoverBar:
         else:
             self._loading = False
             self._spin_id = None
+            self._spin_track = None
             if self._spin_job:
                 try:
                     self.root.after_cancel(self._spin_job)
@@ -783,15 +793,22 @@ class HoverBar:
         return max(10, int(self._px * 0.7))
 
     def _spin_tick(self):
-        """转一格。只 itemconfig 改 start 角度——不重建图元、不动几何、
-        不经过签名门控，所以动画期间条面既不闪也不会被"没变就不重画"拦住。"""
+        """转一格。只 itemconfig 改角度和弧长——不重建图元、不动几何、
+        不经过签名门控，所以动画期间条面既不闪也不会被"没变就不重画"拦住。
+
+        丝滑的关键是"追逐"式构图（Material 转圈那套）：弧长随相位呼吸
+        （100°↔260°），叠加匀速旋转，视觉上弧头在追弧尾，比一根 270° 的
+        硬弧匀速转顺滑得多。30fps（33ms）——tkinter 事件循环下再快反而抖。"""
         self._spin_job = None
         if not self._loading or not self._spin_id:
             return
         try:
-            self._spin_angle = (self._spin_angle + 40) % 360
-            self.canvas.itemconfigure(self._spin_id, start=self._spin_angle)
-            self._spin_job = self.root.after(110, self._spin_tick)
+            self._spin_angle = (self._spin_angle + 6.0) % 360
+            self._spin_phase += 0.09
+            ext = 100 + 80 * (1 + math.sin(self._spin_phase))   # 100°~260°
+            self.canvas.itemconfigure(self._spin_id, start=self._spin_angle,
+                                      extent=ext)
+            self._spin_job = self.root.after(33, self._spin_tick)
         except tk.TclError:
             pass              # 画布没了（退出中），静默收场
 
@@ -2400,7 +2417,9 @@ class SettingsDialog:
             except (IndexError, OSError):
                 alive_path = False
             if alive_path:
-                self._st_set("auto", "已开", OK)
+                # 命令里带 --wait-zcode 说明是待命模式：ZCode 出现才开条
+                self._st_set("auto", "已开（随 ZCode 启动）" if "--wait-zcode" in cmd
+                             else "已开", OK)
             else:
                 self._st_set("auto", "已开，但解释器路径失效", HOT)
         except (OSError, ImportError, TypeError):
@@ -2708,6 +2727,32 @@ def cli_update() -> int:
     return 0 if ok else 1
 
 
+ZCODE_WAIT_POLL = 1.0      # 待命模式的看窗口间隔（秒）
+
+
+def wait_zcode() -> int:
+    """--wait-zcode：待命直到 ZCode 主窗口出现，然后原地变成悬浮条。
+
+    自启用这个模式，实现的是"跟 ZCode 一起启动"：开机只有几 MB 的
+    pythonw 在每秒看一眼（实测单次枚举 0.26ms，几乎不占 CPU），ZCode
+    没开就什么都不画；ZCode 一来，同一个进程直接开条——不起第二个
+    进程，也没有先后竞争。之后 ZCode 关了再开，条面自己会藏/现，
+    不依赖这个待命逻辑。
+
+    已经有一条在跑就安静退出：否则开机会把设置面板叫到前台。这个检查要
+    放在轮询**之前**——已有一条时根本不该进入待命循环，否则 ZCode 没开的
+    机器上它会永远空转。
+    """
+    if running_pid():
+        return 0
+    while not zcode_hwnd():
+        time.sleep(ZCODE_WAIT_POLL)
+    if running_pid():                  # 待命期间用户手动开了一条
+        return 0
+    HoverBar(load_settings()).run()
+    return 0
+
+
 # ---------------------------------------------------------------- CLI
 def alive(pid: int) -> bool:
     try:
@@ -2792,6 +2837,8 @@ def main(argv):
         return cli_check_update()
     if "--update" in argv:
         return cli_update()
+    if "--wait-zcode" in argv:
+        return wait_zcode()
 
     if running_pid():
         if not send("settings"):
