@@ -434,8 +434,15 @@ def t_truth():
     check("无 _verify_t", "_verify_t" not in src)
     check("无 _visible 赋值", "self._visible = " not in src)
 
-    bar.root.withdraw(); bar.root.update()
-    check("外部 withdraw 后立刻读到 False", bar._visible is False)
+    bar.root.withdraw()
+    settled = False
+    for _ in range(10):            # unmap 事件偶尔要一两拍才到，别当时序断言
+        bar.root.update()
+        if bar._visible is False:
+            settled = True
+            break
+        time.sleep(0.02)
+    check("外部 withdraw 后读到 False（等 unmap 事件）", settled)
     bar._place(); bar.root.update()
     check("下一拍自动恢复", bar._visible is True)
 
@@ -636,6 +643,91 @@ def t_tip():
     kill(bar)
 
 
+def t_follow():
+    """跟会话走：顶层快照跟「用户正在打的会话」，不被后台完成拽走。"""
+    import sqlite3
+    import zusage as zu
+
+    def ins(mem, table, **vals):
+        """按真实 schema 插行：没给的 NOT NULL 列按类型填空串/0。
+        ZCode 的表约束一大把（project_id/slug/directory/logical_request_id…），
+        逐列手补是打地鼠，让 pragma 说话。"""
+        info = list(mem.execute(f"pragma table_info({table})"))
+        use = dict(vals)
+        for _cid, name, ctype, notnull, dflt, pk in info:
+            if name in use or (notnull and (dflt is not None or pk)):
+                continue
+            if notnull:
+                use[name] = "" if "text" in (ctype or "").lower() else 0
+        q = ",".join(use)
+        mem.execute(f"insert into {table}({q}) values({','.join('?' * len(use))})",
+                    list(use.values()))
+
+    real = sqlite3.connect(
+        f"file:{Path.home() / '.zcode/cli/db/db.sqlite'}?mode=ro", uri=True)
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row       # _session_snapshot 按列名取值（真实行为）
+    for (sql,) in real.execute(
+            "select sql from sqlite_master where type='table' and sql is not null"):
+        if "sqlite_" in sql:
+            continue
+        mem.execute(sql)
+
+    now = int(time.time() * 1000)
+    ins(mem, "session", id="sess_aaa", project_id="proj", slug="a",
+        directory="C:/demo/aaa", title="会话A（正在打字）",
+        time_created=now - 600000, time_updated=now - 600000)
+    ins(mem, "session", id="sess_bbb", project_id="proj", slug="b",
+        directory="C:/demo/bbb", title="会话B（后台完成）",
+        time_created=now - 1200000, time_updated=now - 1200000)
+    # B 的请求完成得比 A 晚：旧逻辑会把条面拽向 B
+    ins(mem, "model_usage", session_id="sess_bbb", completed_at=now - 30000,
+        status="completed", input_tokens=1000, computed_total_tokens=1000)
+    ins(mem, "model_usage", session_id="sess_aaa", completed_at=now - 300000,
+        status="completed", input_tokens=2000, computed_total_tokens=2000)
+    # A 的用户输入最新：这才是「正在看的会话」
+    ins(mem, "input_history", session_id="sess_aaa", time_created=now - 10000,
+        kind="prompt")
+    mem.commit()
+
+    d = zu._snapshot_with(mem)
+    check("打字会话优先于最近完成（A 而非 B）", d["session"]["sid"] == "sess_aaa")
+
+    # 新会话：发了一条消息但还没有任何 usage 行 → 也跟，而不是留在旧会话
+    ins(mem, "session", id="sess_ccc", project_id="proj", slug="c",
+        directory="C:/demo/ccc", title="会话C（刚发出第一条）",
+        time_created=now - 5000, time_updated=now - 5000)
+    ins(mem, "input_history", session_id="sess_ccc", time_created=now - 4000,
+        kind="prompt")
+    # 发消息后、首请求落库前：最新 message 是用户说的 → 生成中而不是空闲
+    ins(mem, "message", session_id="sess_ccc", time_created=now - 3000,
+        sequence=1, data=json.dumps({"role": "user"}))
+    mem.commit()
+    d = zu._snapshot_with(mem)
+    check("新会话零请求也立刻跟上", d["session"]["sid"] == "sess_ccc"
+          and d["session"]["requests"] == 0)
+    check("这个窗口期显示生成中", d["session"]["active"] is True)
+
+    # input_history 指向已删除会话 → 忽略，回退到最近完成
+    mem.execute("update session set time_deleted=? where id=?",
+                (now, "sess_ccc"))
+    mem.commit()
+    d = zu._snapshot_with(mem)
+    check("已删除会话的打字记录被忽略",
+          d["session"]["sid"] in ("sess_aaa", "sess_bbb"))
+
+    # input_history 空表 → 回退旧逻辑（最近完成 = B）
+    mem.execute("delete from input_history")
+    mem.commit()
+    d = zu._snapshot_with(mem)
+    check("无打字记录回退最近完成", d["session"]["sid"] == "sess_bbb")
+
+    # helper 自身的边界
+    check("_latest_typed_sid 空表返回 None",
+          zu._latest_typed_sid(mem) is None)
+    mem.close()
+
+
 def t_flash():
     """启动闪屏：一律先定位再显示。"""
     src = (ROOT / "hoverbar.py").read_text(encoding="utf-8")
@@ -684,7 +776,7 @@ def t_flash():
 GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
-    "pages": t_pages, "tip": t_tip, "flash": t_flash,
+    "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
 }
 
 

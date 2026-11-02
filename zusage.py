@@ -121,6 +121,30 @@ def _scan_session_ids(con):
     return _cached_agg("scan", run)
 
 
+def _latest_typed_sid(con):
+    """用户最后一次打字的会话（input_history 末行）。
+
+    「跟会话走」的真正信号是它，不是 model_usage.completed_at：
+    - 切到另一个会话发消息 → input_history 立刻指向它，条面马上跟上；
+      旧逻辑要等那个会话的请求完成才跟，期间显示的还是别的会话的数字。
+    - 新开一个会话 → 首条消息发出就跟上（此时它还没有任何 usage 行，
+      旧逻辑会一直显示上一个会话直到新会话第一次完成请求）。
+    - 后台会话 / 子代理完成请求 → 不会把条面拽走（用户正在打的会话优先）。
+
+    只认未删除的会话；表空（全新安装）返回 None，调用方回退旧逻辑。
+    input_history 本身有界（~100 行），全扫 <0.1ms。"""
+    try:
+        r = con.execute(
+            """select h.session_id from input_history h
+                 join session s on s.id = h.session_id
+                where s.time_deleted is null
+                order by h.time_created desc, h.id desc limit 1""").fetchone()
+    except Exception:
+        return None
+    sid = (r[0] if r else "") or ""
+    return sid if re.fullmatch(r"[A-Za-z0-9_-]+", sid) else None
+
+
 def session_usage(con, sid):
     # last_request_input 取最近一次 completed 请求的 input_tokens（= 当前上下文容量）。
     # 不能用 max(input_tokens)：会话压缩后 input 骤降，峰值永远不回落（v28 修复）。
@@ -191,10 +215,19 @@ def model_usage(con, days=7):
 # ---------- 展示 ----------
 
 def render_current(con):
-    """当前会话 = _scan_session_ids 最近活跃的会话（子代理会话也在候选内）。"""
+    """当前会话 = 用户正在打的会话（input_history 末行，v70）；
+    没有打字记录才回退到 _scan_session_ids 最近活跃的会话。
+    子代理会话在旧逻辑里也能当选——但用户不会"打字"进子代理，
+    新逻辑下后台子代理跑得再欢也拽不走条面。"""
+    typed_sid = _latest_typed_sid(con)
     rows = _scan_session_ids(con)
     sess, last_at = None, 0
-    if rows:
+    if typed_sid:
+        sid, last_at = typed_sid, (con.execute(
+            "select max(completed_at) from model_usage where session_id=?",
+            (typed_sid,)).fetchone() or [0])[0] or 0
+        sess = con.execute("select * from session where id=?", (sid,)).fetchone()
+    elif rows:
         sid, last_at = max(rows, key=lambda r: r[1])
         sess = con.execute("select * from session where id=?", (sid,)).fetchone()
     lines = []
@@ -786,7 +819,22 @@ def _session_snapshot(con, sid, cfg):
                   "input": r[1], "output": r[2], "reasoning": r[6], "cache_read": r[5],
                   "cache_write": r[7], "total": r[3], "duration_ms": r[4], "ttft_ms": 0}
     lr = con.execute("select max(completed_at) from model_usage where session_id=?", (sid,)).fetchone()
-    active = bool(lr and lr[0] and int(time.time() * 1000) - lr[0] < SESSION_TIMEOUT_MS)
+    now_ms = int(time.time() * 1000)
+    active = bool(lr and lr[0] and now_ms - lr[0] < SESSION_TIMEOUT_MS)
+    if not active:
+        # v70：刚发出消息、第一个请求还没落库的窗口期，completed_at 还是上一轮
+        # 的——条面会显示旧数据 + "空闲"，用户看起来就是"发出去没反应"。
+        # 最新一条 message 还是用户说的（助手回复会立刻追加 message 行）→ 生成中。
+        # 15 分钟上限兜底：客户端崩溃留下的孤儿用户消息不会让条面永远"生成中"。
+        try:
+            mr = con.execute(
+                "select time_created, data from message where session_id=?"
+                " order by time_created desc limit 1", (sid,)).fetchone()
+            if mr and mr[0] and now_ms - mr[0] < 15 * 60_000:
+                if str((json.loads(mr[1]) or {}).get("role") or "") == "user":
+                    active = True
+        except Exception:
+            pass
     ctx_auto = lookup_context_window(last["model_id"]) if last else None
     # 生成速度：输出 token ÷ 生成耗时（首 token 之后到完成；无 first_token_at 时退化为总耗时）
     tps = 0
@@ -1044,6 +1092,12 @@ def _snapshot_with(con, force_sid="", pin_sid=""):
     pin_ok = bool(re.fullmatch(r"[A-Za-z0-9_-]+", pin_sid))
     if pin_ok and pin_sid not in force_sids:
         force_sids.append(pin_sid)
+    # v70：用户正在打的会话也按 force 待遇进池。它可能还没有任何 usage 行
+    # （新会话第一条消息刚发出），也可能只在远端（SSH 会话）——进池才能
+    # 走远端补齐和"不在本地库"提示，而不是被 6+6 池挤掉。
+    typed_sid = _latest_typed_sid(con)
+    if typed_sid and typed_sid not in force_sids:
+        force_sids.append(typed_sid)
     today = _cached_agg("today", lambda: range_usage(
         con, _epoch_ms(_day_start()), _epoch_ms(_day_start() + timedelta(days=1))))
     rows = _scan_session_ids(con)
@@ -1068,7 +1122,9 @@ def _snapshot_with(con, force_sid="", pin_sid=""):
     # 本地库里没有的 force 会话（远端/他机会话，或数据还没落库）。渲染端据此给提示：
     # 零值不再只能靠用户猜"插件坏了"（issue #14），也区分"远端也没查到"（issue #10）。
     not_local = [s for s in force_sids if s not in have_local] if force_sids else []
-    latest_sid = max(rows, key=lambda r: r[1])[0] if rows else None
+    # 顶层快照跟「用户正在打的会话」（v70）；没有打字记录（全新安装）才回退
+    # 到「最近完成请求的会话」。pin 的优先级更高（pin 在上面已单独处理）。
+    latest_sid = typed_sid or (max(rows, key=lambda r: r[1])[0] if rows else None)
     if latest_sid:
         base = _session_snapshot(con, latest_sid, cfg)
     else:
