@@ -2473,6 +2473,14 @@ class SettingsDialog:
             cur.pack(side="left", padx=(10, 0))
 
             self._wp_label = cur
+            # 刷新壁纸：不换图，只让插件把已存的壁纸/配色重新注入一次。
+            # 典型场景是"图设过了但界面没变"（CDP 断过、ZCode 重启过）。
+            r_re = self._row(p, "刷新壁纸",
+                               "图没换但界面没生效时，手动重新注入一次")
+            _EfButton(r_re, "立即刷新", self._wp_reinject).pack(side="left")
+            self._wp_msg = tk.Label(p, text="", bg=EF_PAPER, fg=EF_INK2,
+                                    font=_ef_font(EF_UI, 8))
+            self._wp_msg.pack(anchor="w", pady=(2, 4))
 
             self._note(p, "壁纸由 zcode-beautify 插件接管，这里改的是同一份配置。")
 
@@ -2722,11 +2730,13 @@ class SettingsDialog:
         self._scroll_cv.coords(self._body_id, 0, 0)
 
     def _animate_page_height(self, target, animate=True):
-        """切页时高度补间（120ms ease-out）。各页高度差可以上百像素，
-        硬跳会让面板"啪"地抽一下；补间是手风琴那种展开感。
+        """切页高度**直接到位**，不做补间。
 
-        高度是布局属性，本来不该动——但面板只有一屏、只在切页时变一次，
-        不是列表滚动那种高频场景；tkinter 里也只有这条路径能给出展开感。
+        试过 120ms 的 height 补间，但每帧改 canvas 高度都会触发一次窗口
+        resize + 整块面板重绘（Tk 的 layout 是同步的），实测一次切页要
+        260ms 才跑完、一帧都没画出来——观感是"卡住"而不是"展开"。
+        height 属于布局属性，本来就不该动（emil 规则里唯一的例外是手风琴，
+        而这里收益抵不上掉帧）。位移交给页面滑入动画。
         """
         job = getattr(self, "_h_job", None)
         if job and job.get("job"):
@@ -2735,23 +2745,8 @@ class SettingsDialog:
             except Exception:
                 pass
             self._h_job = None
-        try:
-            start = self._scroll_cv.winfo_height()
-        except tk.TclError:
-            return
-        if not animate or not motion_ok() or start <= 1 or start == target:
-            self._set_page_height(target)
-            self._sync_scroll()
-            return
-
-        def frame(p):
-            self._set_page_height(round(start + (target - start) * p))
-
-        def done():
-            self._set_page_height(target)
-            self._sync_scroll()
-
-        self._h_job = tween(self.top, 120, frame, done)
+        self._set_page_height(target)
+        self._sync_scroll()
 
     def _show_page(self, key, animate=True):
         """切到某一页：换页 + 按该页高度收放画布 + 滑入动画。
@@ -3138,6 +3133,34 @@ class SettingsDialog:
             self.bar.quit()
         else:
             self._upd_say("起不来新实例，手动重启一下悬浮条。", EF_DANGER)
+
+    def _wp_reinject(self):
+        """不换图，只重注入：后台线程跑插件 CLI，结果回主线程显示。
+
+        _wp_refresh 会起 subprocess 走 CDP，最长 30s——放主线程会把面板
+        冻住，所以丢后台；结果仍走对话框那条 200ms 泵回主线程。
+        """
+        msg = getattr(self, "_wp_msg", None)
+        if msg is None or self._wp is None:
+            return
+        self._say(msg, "正在注入…")
+        port = self._wp.get("port")
+
+        def work():
+            ok = _wp_refresh(port)
+            self._upd_q.put((self._wp_reinject_done, (ok,)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _wp_reinject_done(self, ok):
+        msg = getattr(self, "_wp_msg", None)
+        if msg is None:
+            return
+        if ok:
+            self._say(msg, "已重新注入，ZCode 应该已经换上了。", OK)
+        else:
+            self._say(msg, "注入失败：ZCode 的调试端口（CDP）没开。"
+                           "重启一次 ZCode（从快捷方式启动）再试。", EF_DANGER)
 
     def _collect(self):
         c = self.cfg

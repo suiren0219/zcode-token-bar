@@ -584,28 +584,15 @@ def t_pages():
             break
     check("动画落定在 y=0",
           int(dlg._pages["look"].place_info().get("y", -1)) == 0)
-    # 高度补间：跟踪 configure(height=) 的中间值（winfo_height 有滞后，采样不可靠）
-    seq = []
+    # 高度直接到位（不做补间）：补间每帧都要 resize 窗口 + 整窗重绘，
+    # 实测一次切页 260ms 才跑完、一帧没画出来，观感是"卡住"。位移交给滑入。
     cv = dlg._scroll_cv
-    real_cfg = cv.configure
-
-    def traced(*a, **k):
-        if "height" in k:
-            seq.append(int(k["height"]))
-        return real_cfg(*a, **k)
-
-    cv.configure = traced
     target = min(dlg._page_h["items"], dlg._cap_h)
     dlg._show_page("items", animate=True)
-    for _ in range(60):
-        dlg.top.update(); time.sleep(0.01)
-        if not (dlg._h_job and dlg._h_job.get("job")):
-            break
-    cv.configure = real_cfg
-    check("切页高度连续过渡（%d 帧，%s…）" % (len(seq), seq[:4]),
-          len(seq) >= 3 and seq[-1] == target)
-    check("最终高度等于该页 reqheight",
+    check("切页高度立刻到位（不做补间）",
           int(cv.cget("height")) == target)
+    hj = getattr(dlg, "_h_job", None)
+    check("高度到位后没有悬挂的高度任务", not (hj and hj.get("job")))
 
     dlg._show_page("items", animate=False)
     dlg.v_show["speed"].set(False)
@@ -791,10 +778,55 @@ def t_flash():
     kill(bar)
 
 
+
+
+
+def t_wallpaper():
+    """壁纸页的「刷新壁纸」：不换图、后台注入、结果回主线程着色。"""
+    bar = new_bar()
+    real_read = hb._wp_read
+    real_refresh = hb._wp_refresh
+    hb._wp_read = lambda: {"wallpaperPath": "C:/demo/w.png",
+                           "wallpaperVisible": True, "dim": 25, "blur": 0,
+                           "monet": True, "port": 9222}
+    try:
+        dlg = hb.SettingsDialog(bar)
+        dlg.top.update()
+        dlg._show_page("panel", animate=False)
+        dlg.top.update()
+        check("壁纸页有刷新状态行", hasattr(dlg, "_wp_msg"))
+
+        hb._wp_refresh = lambda port: True
+        dlg._wp_reinject()
+        for _ in range(50):
+            dlg.top.update()
+            time.sleep(0.02)
+            if "已重新注入" in dlg._wp_msg.cget("text"):
+                break
+        check("成功时提示已注入", "已重新注入" in dlg._wp_msg.cget("text"))
+        check("成功用绿色", str(dlg._wp_msg.cget("fg")) == hb.OK)
+
+        hb._wp_refresh = lambda port: False
+        dlg._wp_reinject()
+        for _ in range(50):
+            dlg.top.update()
+            time.sleep(0.02)
+            if "注入失败" in dlg._wp_msg.cget("text"):
+                break
+        check("失败时说明端口没开", "注入失败" in dlg._wp_msg.cget("text"))
+        check("失败用红色", str(dlg._wp_msg.cget("fg")) == hb.EF_DANGER)
+        dlg.close()
+    finally:
+        hb._wp_read = real_read
+        hb._wp_refresh = real_refresh
+        kill(bar)
+
+
 GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
+    "wallpaper": t_wallpaper,
 }
 
 
