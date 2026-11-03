@@ -733,6 +733,44 @@ def t_follow():
     mem.close()
 
 
+def t_attach():
+    """面板贴在条面上：零间隙、右边缘对齐齿轮、下面放不下翻上面、跟着条面走。"""
+    bar = new_bar()
+    bar._place(); bar.root.update()
+    bx, by = bar.root.winfo_x(), bar.root.winfo_y()
+    bw, bh = bar.root.winfo_width(), bar.root.winfo_height()
+    dlg = hb.SettingsDialog(bar)
+    dlg.top.update(); time.sleep(0.25); dlg.top.update()
+    x, y = dlg.top.winfo_x(), dlg.top.winfo_y()
+    w, h = dlg.top.winfo_width(), dlg.top.winfo_height()
+    sh = dlg.top.winfo_screenheight()
+
+    below = by + bh + h <= sh - 8
+    if below:
+        check("贴在条面下沿（间距 0，实测 %d）" % (y - (by + bh)),
+              y == by + bh and dlg._drop == "down")
+    else:
+        check("下面放不下 → 贴上沿（间距 0，实测 %d）" % (by - (y + h)),
+              y + h == by and dlg._drop == "up")
+    check("右边缘对齐齿轮（差 %d）" % ((bx + bw) - (x + w)),
+          (bx + bw) - (x + w) == 0)
+    check("面板夹在屏内", 8 <= x and x + w <= dlg.top.winfo_screenwidth() - 8)
+
+    # 条面移动 → 面板跟着重贴（_follow_panel 由 _settle 调用）
+    ENV["win"] = (400, 300, 900, 700)
+    bar._place(); bar.root.update(); time.sleep(0.1)
+    bx2, by2 = bar.root.winfo_x(), bar.root.winfo_y()
+    if (bx2, by2) != (bx, by):
+        check("条面挪了，面板跟着挪", dlg.top.winfo_x() != x
+              or dlg.top.winfo_y() != y)
+
+    # 条面收起 → 面板一起关
+    bar._hide(); bar.root.update()
+    check("条面收起时面板一起关闭", getattr(bar, "_dlg", None) is None)
+    ENV["win"] = (100, 100, 900, 700)
+    kill(bar)
+
+
 def t_flash():
     """启动闪屏：一律先定位再显示。"""
     src = (ROOT / "hoverbar.py").read_text(encoding="utf-8")
@@ -746,14 +784,14 @@ def t_flash():
     i = src.index("top = tk.Toplevel(bar.root)")
     j = src.index("top.overrideredirect(True)", i)
     check("面板创建后立刻 withdraw", "top.withdraw()" in src[i:j])
-    k = src.index("self._place_near_pointer()", j)
+    k = src.index("self._place_off_bar()", j)
     seg2 = src[k:k + 200]
     check("面板摆位之后才走入场动画", "self._animate_open()" in seg2)
     ai = src.index("def _animate_open(")
     aseg = src[ai:ai + 1600]
     # 只查动画分支：geometry(y+12) 之后的第一个 deiconify 才是入场用的；
     # reduced-motion 分支里直接 deiconify 是对的（无位移，无需先定位）
-    gi = aseg.find('top.geometry("+%d+%d" % (x, y + 12))')
+    gi = aseg.find('top.geometry("+%d+%d" % (x, y - dy))')
     check("入场动画内部也是先定位再 deiconify",
           gi >= 0 and aseg.find("top.deiconify()", gi) > gi)
     check("入场动画尊重系统动效开关", "motion_ok()" in aseg)
@@ -826,7 +864,7 @@ GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
-    "wallpaper": t_wallpaper,
+    "wallpaper": t_wallpaper, "attach": t_attach,
 }
 
 

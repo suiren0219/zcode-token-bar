@@ -1061,6 +1061,7 @@ class HoverBar:
         except tk.TclError:
             return
         self._bind_zorder()
+        self._follow_panel()
 
     def _real_state(self):
         """窗口真实的 (宽, 高, x, y)；查不到返回 None。
@@ -1115,10 +1116,30 @@ class HoverBar:
             pass
 
     def _hide(self):
-        """收起。已经收起就不用再动。"""
+        """收起。已经收起就不用再动。
+
+        条面收了面板必须一起收：面板是贴在条面上的一块，
+        条面没了还留着它就是一块没有归属的浮窗。
+        """
         try:
             if self.root.winfo_ismapped():
                 self.root.withdraw()
+        except tk.TclError:
+            pass
+        dlg = getattr(self, "_dlg", None)
+        if dlg is not None:
+            try:
+                dlg.close()
+            except Exception:
+                pass
+
+    def _follow_panel(self):
+        """条面位置变了 → 面板跟着重贴（两者是同一块界面）。"""
+        dlg = getattr(self, "_dlg", None)
+        if dlg is None:
+            return
+        try:
+            dlg._place_off_bar()
         except tk.TclError:
             pass
 
@@ -2068,6 +2089,9 @@ class SettingsDialog:
         self._upd_q: queue.Queue = queue.Queue()
         top = tk.Toplevel(bar.root)
         self.top = top
+        # 登记到条面上：条面移动时靠它把面板带着走、收起时一起关。
+        # open_settings 也会设，但直接构造（测试、--settings 期间）也得有。
+        bar._dlg = self
         # 先藏起来：Toplevel 一创建就按默认位置（屏幕左上）显示，等下面
         # 一堆控件建完再摆位，中间会看到它在左上角闪一下。建完、
         # 摆好位置之后才 deiconify（见 __init__ 末尾）。
@@ -2252,7 +2276,7 @@ class SettingsDialog:
             height=min(self._max_h, cap))
         top.update_idletasks()
         self._show_page("pos", animate=False)
-        self._place_near_pointer()
+        self._place_off_bar()
         # 摆好位置、内容齐了才显示——顺序反了就是"每次打开面板都在左上角闪一下"
         self._animate_open()
         self._st_refresh()          # 状态区先填一次，别让用户看到四行 —
@@ -2269,15 +2293,20 @@ class SettingsDialog:
         panel_opacity——动画只负责"到那里"，不覆盖设置。
         """
         top = self.top
-        x, y = top.winfo_x(), top.winfo_y()
+        # 必须用 _place_off_bar 记下的坐标：Toplevel 还没映射时 winfo_x/y 读回 0，
+        # 用它当动画终点会把面板从 (0,0) 一路滑到左上角
+        x, y = getattr(self, "_anchor", (top.winfo_x(), top.winfo_y()))
         target = min(1.0, max(0.4, float(self.cfg.get("panel_opacity", 1.0))))
+        # 从贴条那一侧滑出：贴在条面下方就从上方 10px 落下，贴在上方就往上收
+        dy = 10 if getattr(self, "_drop", "down") == "down" else -10
+        self._open_dy = dy
         try:
             if not motion_ok():
                 top.attributes("-alpha", target)
                 top.deiconify()
                 return
-            # 入场起点：scale(0.95)+opacity 0 那一档——位移要小，不是从天而降
-            top.geometry("+%d+%d" % (x, y + 12))
+            # 入场起点：位移要小（10px），不是从天而降
+            top.geometry("+%d+%d" % (x, y - dy))
             top.attributes("-alpha", 0.0)
             top.deiconify()
         except tk.TclError:
@@ -2293,7 +2322,9 @@ class SettingsDialog:
                     top.attributes("-alpha", target)
                     self._open_job = None
                     return
-                top.geometry("+%d+%d" % (x, y + max(0, round(12 * (1 - e)))))
+                off = getattr(self, "_open_dy", 10)
+                top.geometry("+%d+%d" % (
+                    x, y - round(off * (1 - e))))
                 top.attributes("-alpha", round(target * e, 3))
                 self._open_job = top.after(16, step)
             except tk.TclError:
@@ -2855,15 +2886,50 @@ class SettingsDialog:
         cv.yview_scroll(int(-1 * (e.delta / 120)) * 3, "units")
         self.top.after_idle(self._sync_scroll)
 
-    def _place_near_pointer(self):
-        """把面板摆在鼠标附近，但不许出屏（125% 缩放下很容易掉底边）。"""
+    def _place_off_bar(self):
+        """把面板贴在条面上：正下方或正上方，零间隙、左边缘对齐。
+
+        以前是按鼠标位置随便飘，跟条面看不出关系。现在它是"从条面长出来"
+        的一块：紧贴条面下沿（下面放不下就翻到上沿），x 对齐条面左边缘并
+        夹在屏内。开合动画也从贴条那一侧滑出/滑回，读起来是一个整体。
+        条面不可见时（--settings 冷启动）退回指针附近。
+        """
         top = self.top
+        # 先落定布局再量：切页刚改过 canvas 高度，reqheight 还是旧值，
+        # 拿旧高度算贴边会留下一大截空隙
+        top.update_idletasks()
         w, h = top.winfo_reqwidth(), top.winfo_reqheight()
-        px, py = top.winfo_pointerx(), top.winfo_pointery()
         sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
-        x = min(max(8, px - w // 2), max(8, sw - w - 8))
-        y = min(max(8, py - 40), max(8, sh - h - 48))
+        bar = self.bar
+        bx, by, bw, bh, shown = 0, 0, 0, 0, False
+        try:
+            shown = bool(bar._visible) and bar.root.winfo_width() > 4
+            if shown:
+                bx, by = bar.root.winfo_x(), bar.root.winfo_y()
+                bw, bh = bar.root.winfo_width(), bar.root.winfo_height()
+        except tk.TclError:
+            shown = False
+        if not shown:
+            px, py = top.winfo_pointerx(), top.winfo_pointery()
+            x = min(max(8, px - w // 2), max(8, sw - w - 8))
+            y = min(max(8, py - 40), max(8, sh - h - 48))
+            self._drop = "down"
+            self._anchor = (x, y)
+            top.geometry("+%d+%d" % (x, y))
+            return x, y
+        # 触发点是条面最右端的齿轮，所以面板右边缘对齐条面右边缘
+        # （"从触发处展开"）；右边放不下才退回左对齐并夹在屏内。
+        x = bx + bw - w
+        if x < 8:
+            x = max(8, bx)
+        x = min(x, max(8, sw - w - 8))
+        if by + bh + h <= sh - 8:
+            y, self._drop = by + bh, "down"      # 贴条面下沿
+        else:
+            y, self._drop = max(8, by - h), "up"  # 下面放不下 → 贴上沿
+        self._anchor = (x, y)
         top.geometry("+%d+%d" % (x, y))
+        return x, y
 
     def _preview(self):
         """只实时预览外观两项，不落盘；其余项点"应用"才生效。"""
