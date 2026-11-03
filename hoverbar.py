@@ -19,9 +19,10 @@
     python hoverbar.py --wait-zcode # 待命直到 ZCode 出现再开条（自启用）
     python hoverbar.py --debug      # 开窗并打印定位/取数过程
 
-打开设置（三种等价入口）：点条面最右端的切角方块（悬停变酸黄）、双击条面、
-右键菜单「设置…」，或命令行 --settings。设置面板用终末地（endfield-ui）风格：
-acid yellow #FFFA00 唯一强调色、切角=可点、展示容器直角、1px 细线分区。
+打开设置（三种等价入口）：点条面最右端的方框按钮（悬停反白）、双击条面、
+右键菜单「设置…」，或命令行 --settings。界面用 Codex 风格：近黑中性底、
+全等宽字体、1px 细边、直角、无阴影无渐变；"当前/选中"靠反白表示，
+绿/琥珀/红只表示数据健康度。
 
 设置项：位置 / 跟随窗口还是整块屏幕 / 偏移 / 透明度 / 字号 / 显示哪些项 /
 失焦是否隐藏 / 是否置顶 / 是否启动时检查更新。拖动条面可直接改位置。
@@ -55,34 +56,33 @@ LOCK = Path(os.environ.get("TEMP", ".")) / "zusage-hoverbar.lock"
 DUMP = Path(os.environ.get("TEMP", ".")) / "zusage-hoverbar-dump.json"
 IPC_PORT = 47615          # --settings 唤起已在运行实例的控制端口
 
-# 注入版状态条的配色（overlay.js 同名变量）
-BG = "#0f1219"
-KEY = "#010203"           # -transparentcolor 键色：胶囊外的直角区域
-BORDER = "#2b2f39"
-FG = "#e9edf4"
-DIM = "#7e8899"
-LABEL = "#8791a3"
-OK = "#3ecf8e"
-WARM = "#f5b944"
-HOT = "#ff6b57"
-BADGE = "#ff8a73"
+# Codex 风格配色：近黑中性底、灰阶为主、只在状态上用色。
+# 没有高饱和强调色——"当前 / 选中"靠**反白**表达（浅底黑字），
+# 跟 Codex CLI 的选中态一致；绿/琥珀/红只表示数据健康度。
+BG = "#0d0d0d"
+KEY = "#010203"           # -transparentcolor 键色：条面外的直角区域
+BORDER = "#2e2e2e"
+FG = "#e6e6e6"
+DIM = "#8a8a8a"
+LABEL = "#6e6e6e"
+OK = "#3fb950"
+WARM = "#d29922"
+HOT = "#f85149"
+BADGE = "#f85149"
+TRACK = "#242424"         # 进度条 / 加载弧线的暗色轨道
 
-# 终末地（endfield-ui）配色：设置面板用。唯一强调色 acid yellow 只做填充，
-# 只表示"当前 / 可点 / 注意"；切角=可点，展示容器一律直角；radius 全程 0；
-# 1px 细线分区，无阴影无发光无渐变。
-EF_PAPER = "#191919"
-EF_PANEL = "#222222"
-EF_INK = "#EDEDED"
-EF_INK2 = "#A3A3A3"
-EF_RULE = "#353535"
-EF_CHIP = "#2E2E2E"
-EF_SIGNAL = "#FFFA00"
-EF_ON_SIGNAL = "#161616"
-EF_DANGER = "#FF8A7A"
-EF_TRI_A = "#FF00F0"
-EF_TRI_B = "#FFFA00"
-EF_TRI_C = "#00FFA2"
-EF_CMD = "#161616"        # 顶部命令栏（两套主题都深色）
+# 设置面板：同一套 Codex 语言——直角、1px 细线、等宽字体、无阴影无渐变。
+# EF_SIGNAL 是"反白色块"：选中/当前 = 浅底黑字，不用高饱和强调色。
+EF_PAPER = "#0d0d0d"
+EF_PANEL = "#161616"
+EF_INK = "#e6e6e6"
+EF_INK2 = "#8a8a8a"
+EF_RULE = "#2e2e2e"
+EF_CHIP = "#1f1f1f"
+EF_SIGNAL = "#e6e6e6"
+EF_ON_SIGNAL = "#0d0d0d"
+EF_DANGER = "#f85149"
+EF_CMD = "#111111"        # 顶部命令栏
 
 ANCHORS = ("bottom-left", "bottom-center", "bottom-right",
            "top-left", "top-center", "top-right", "free")
@@ -301,6 +301,47 @@ def ease_out(t: float) -> float:
     return 1.0 - (1.0 - t) ** 3
 
 
+def _rgb(c: str) -> tuple:
+    c = c.lstrip("#")
+    return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+
+def mix(c1: str, c2: str, t: float) -> str:
+    """两色线性插值。悬停过渡用——直接换色是硬切，插值才连得上。"""
+    t = min(1.0, max(0.0, t))
+    a, b = _rgb(c1), _rgb(c2)
+    return "#%02x%02x%02x" % tuple(round(a[i] + (b[i] - a[i]) * t)
+                                  for i in range(3))
+
+
+def tween(widget, ms: float, frame, done=None, step_ms: int = 16):
+    """时间基补间循环。frame(p) 每帧拿到 0→1 的缓动后进度。
+
+    时间基（不是固定帧数）的好处：掉帧时终点照样准。回调里抛 TclError
+    （控件已销毁）就静默收场。返回 {"job": after_id} 供取消。
+    """
+    t0 = time.perf_counter()
+    span = max(0.001, ms / 1000.0)
+    state = {"job": None}
+
+    def step():
+        state["job"] = None
+        try:
+            t = (time.perf_counter() - t0) / span
+            if t >= 1.0:
+                frame(1.0)
+                if done:
+                    done()
+                return
+            frame(ease_out(t))
+            state["job"] = widget.after(step_ms, step)
+        except tk.TclError:
+            return
+
+    step()
+    return state
+
+
 def _autostart_command() -> str:
     """自启命令串的唯一来源，统一走 autostart.py。
 
@@ -471,7 +512,7 @@ class HoverBar:
         self._upd_new = False      # 启动静默检查：发现新版就是 True
         self._upd_ver = ""         # "本地 → 远端"，右键菜单里直接显示
         self._upd_q: queue.Queue = queue.Queue()   # 后台检查结果回主线程
-        # 加载动画：等待首包时旋转的酸黄弧线。帧更新走 itemconfig 只改角度，
+        # 加载动画：等待首包时旋转的亮弧线。帧更新走 itemconfig 只改角度，
         # 不重建图元也不进签名门控——动画期间既不闪也不被门控拦住
         self._loading = False
         self._spin_id = None       # 弧线的 canvas item id
@@ -741,8 +782,9 @@ class HoverBar:
         # 每 1.5s 一次的轮询里大多数时候数字确实没动（空闲时速度/本轮
         # 都不更新），重画一遍纯属白闪。
         # 注意 ops 必须物化成元组：生成器对象每次新建，拿它比等于永远不相等。
+        # 悬停态**不进签名**：悬停只改两个方块的填色，走 _tween_affordance
+        # 就地补间。以前悬停会触发整条 delete+重建，既慢又容易闪一帧。
         sig = (total, h, self._px, bool(self.cfg["pinned"]),
-               self._hover,
                tuple(tuple(tuple(o) for o in ops) for _, ops in blocks))
         if sig == self._draw_key:
             self._last_draw = (total, h)
@@ -754,17 +796,13 @@ class HoverBar:
         self.canvas.delete("all")
         cv = self.canvas
 
-        r = 9
-        x1, y1, x2, y2 = 0.5, 0.5, total - 1.0, h - 1.0
-        pts = [x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
-               x2, y2 - r, x2, y2, x2, y2 - r, x2 - r, y2, x1 + r, y2,
-               x1, y2, x1, y2 - r, x1, y1 + r, x1, y1, x1 + r, y1]
-        cv.create_polygon(pts, smooth=True, splinesteps=20,
-                          fill=BG, outline=BORDER, width=1)
+        # Codex 没有圆角：整条是一个 1px 细边的直角方框
+        cv.create_rectangle(0.5, 0.5, total - 1.0, h - 1.0,
+                            fill=BG, outline=BORDER, width=1)
 
         cy = h / 2.0
-        # 左端图钉方块：内容从它右侧起。钉住时整块反 acid yellow——
-        # 终末地语义里"填充=当前状态"，读作"这根条被钉住了"
+        # 左端图钉方块：内容从它右侧起。钉住时整块反白——
+        # "反白=当前状态"，读作"这根条被钉住了"
         self._draw_pin(pad, cy, h)
         x = pad + pin_s + pin_gap
         for i, (w, ops) in enumerate(blocks):
@@ -776,13 +814,13 @@ class HoverBar:
                     x += twidth(txt) + GAP
                 elif op[0] == "spin":
                     d = self._spin_size()
-                    # 暗色整圆轨道 + 酸黄弧线：GitHub 那类转圈指示的构图，
+                    # 暗色整圆轨道 + 亮弧：转圈指示的常见构图，
                     # 轨道给出"这里有个圈"的预期，弧线在上面转才读得顺
                     self._spin_track = cv.create_oval(
                         x + 1, cy - d / 2.0, x + 1 + d, cy + d / 2.0,
-                        outline="#272c36", width=2)
-                    # 酸黄弧线：终末地语义里 acid yellow = 当前活动，
-                    # 读作"正在取数"。start/extent 由 _spin_tick 驱动
+                        outline=TRACK, width=2)
+                    # 前景弧线：亮灰在暗轨道上转，读作"正在取数"。
+                    # start/extent 由 _spin_tick 驱动
                     self._spin_id = cv.create_arc(
                         x + 1, cy - d / 2.0, x + 1 + d, cy + d / 2.0,
                         start=self._spin_angle, extent=270, style="arc",
@@ -796,7 +834,7 @@ class HoverBar:
                     cv.create_polygon(
                         [x + 2.5, by, x + bw - 2.5, by, x + bw, by + bh / 2,
                          x + bw - 2.5, by + bh, x + 2.5, by + bh, x, by + bh / 2],
-                        smooth=False, fill="#272c36", outline="")
+                        smooth=False, fill=TRACK, outline="")
                     fw = max(0.0, bw * pct / 100.0)
                     if fw > 1:
                         cv.create_polygon(
@@ -808,11 +846,10 @@ class HoverBar:
             x -= GAP
             if i < len(blocks) - 1:
                 x += gap
-                cv.create_line(x, cy - 7, x, cy + 7, fill="#2f343e")
+                cv.create_line(x, cy - 7, x, cy + 7, fill=BORDER)
                 x += sep_w + gap
 
-        # 右端 ⚙：整条最后一项，切角方块 —— 终末地语义里"切角=可点"。
-        # 悬停变 acid yellow 反白，点击开设置面板。
+        # 右端 ⚙：整条最后一项，直角方框。悬停反白，点击开设置面板。
         # 方块右边距与左边 pad 对齐，视觉上才是"紧贴末端"而不是悬在中间。
         self._draw_gear(total - pad - gear_s, cy, h)
 
@@ -874,54 +911,53 @@ class HoverBar:
         y1 = cy - s / 2.0
         y2 = cy + s / 2.0
         x2 = x + s
-        # 右下角切 4px：终末地"可点/可操作"的视觉标记，不是装饰
-        cut = 4
-        pts = [x, y1, x2, y1, x2, y2 - cut, x2 - cut, y2, x, y2]
+        # Codex 的按钮就是直角方框 + 1px 边线：悬停靠"填色反白"表示可点
         hover = isinstance(self._hover, str) and self._hover == "gear"
         cv = self.canvas
-        self.gear_bg = cv.create_polygon(
-            pts, smooth=False,
+        self.gear_bg = cv.create_rectangle(
+            x, y1, x2, y2,
             fill=EF_SIGNAL if hover else EF_CHIP,
-            outline="")
+            outline=EF_RULE if hover else "")
         gcol = EF_ON_SIGNAL if hover else EF_INK2
         c = s / 2.0
         r = max(3.0, s * 0.30)
         cv.create_oval(
             x + c - r, cy - r, x + c + r, cy + r,
-            outline=gcol, width=1.2, fill="")
+            outline=gcol, width=1.2, fill="", tags="gear_glyph")
         # 齿：四根短线，绕中心 45° 交叉，够小仍能读成齿轮
         for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
             cv.create_line(
                 x + c + dx * r * 0.72, cy + dy * r * 0.72,
                 x + c + dx * (r + 1.8), cy + dy * (r + 1.8),
-                fill=gcol, width=1.2)
+                fill=gcol, width=1.2, tags="gear_glyph")
         self._gear_box = (x, y1, x2, y2)
 
     def _draw_pin(self, x, cy, h):
-        """左端图钉方块，与右端齿轮同一套语言：切角=可点，填充=当前状态。
-        图钉图形用三笔凑：横杠帽 + 针身 + 针尖，14px 内也读得出是"钉"。"""
+        """左端图钉方块：直角方框，反白=已钉住。图钉用三笔凑——
+        横杠帽 + 针身 + 针尖，14px 内也读得出是"钉"。"""
         s = self._gear_size()
         y1 = cy - s / 2.0
         y2 = cy + s / 2.0
         x2 = x + s
-        # 左下角切 4px，与齿轮的右下切角成镜像
-        cut = 4
-        pts = [x, y1, x2, y1, x2, y2, x + cut, y2, x, y2 - cut, x, y1]
+        # 直角方框，与右端齿轮同一套：钉住时反白（浅底黑字）表示"当前状态"
         pinned = bool(self.cfg["pinned"])
         hover = isinstance(self._hover, str) and self._hover == "pin"
         hot = pinned or hover
         cv = self.canvas
-        self.pin_bg = cv.create_polygon(
-            pts, smooth=False,
-            fill=EF_SIGNAL if hot else EF_CHIP, outline="")
+        self.pin_bg = cv.create_rectangle(
+            x, y1, x2, y2,
+            fill=EF_SIGNAL if hot else EF_CHIP,
+            outline=EF_RULE if hot else "")
         gcol = EF_ON_SIGNAL if hot else EF_INK2
         c = x + s / 2.0
         cap_y = y1 + s * 0.22
         cap_h = s * 0.16
         cv.create_rectangle(c - s * 0.24, cap_y, c + s * 0.24,
-                            cap_y + cap_h, fill=gcol, outline="")
+                            cap_y + cap_h, fill=gcol, outline="",
+                            tags="pin_glyph")
         cv.create_line(c, cap_y + cap_h, c, y2 - s * 0.18,
-                       fill=gcol, width=max(1.6, s * 0.12))
+                       fill=gcol, width=max(1.6, s * 0.12),
+                       tags="pin_glyph")
         self._pin_box = (x, y1, x2, y2)
 
     def _pin_rect(self):
@@ -1174,11 +1210,60 @@ class HoverBar:
         self._tip_hide()
 
     def _set_hover(self, what):
+        """悬停切换：只把两个方块的填色补间过去，不重建整条。
+
+        目标色沿用原语义——齿轮悬停反白、图钉悬停或已钉住时反白。
+        90ms ease-out：比硬切跟手，又不会拖慢指针反馈。
+        """
         if getattr(self, "_hover", None) == what:
             return
         self._hover = what
-        if self._last_draw:
-            self._draw()
+        self._tween_affordance()
+
+    def _tween_affordance(self):
+        pin_hot = bool(self.cfg["pinned"]) or self._hover == "pin"
+        gear_hot = self._hover == "gear"
+        pairs = []
+        box = getattr(self, "pin_bg", None)
+        if box is not None:
+            pairs.append((box, EF_SIGNAL if pin_hot else EF_CHIP))
+        box = getattr(self, "gear_bg", None)
+        if box is not None:
+            pairs.append((box, EF_SIGNAL if gear_hot else EF_CHIP))
+        if not pairs:
+            return
+        # 图形（齿轮环线 / 图钉针身）跟着方块一起换色：
+        # 反白底上留深灰图形会糊，必须同步到墨色
+        for tag, hot in (("pin_glyph", pin_hot), ("gear_glyph", gear_hot)):
+            target = EF_ON_SIGNAL if hot else EF_INK2
+            try:
+                ids = self.canvas.find_withtag(tag)
+            except tk.TclError:
+                ids = ()
+            for item in ids:
+                pairs.append((item, target))
+        start = {}
+        for item, target in pairs:
+            try:
+                field = "outline" if self.canvas.type(item) == "oval" else "fill"
+                start[item] = (field, self.canvas.itemcget(item, field), target)
+            except tk.TclError:
+                return
+        job = getattr(self, "_aff_job", None)
+        if job and job.get("job"):
+            try:
+                self.root.after_cancel(job["job"])
+            except Exception:
+                pass
+
+        def frame(p):
+            for item, (field, c0, c1) in start.items():
+                try:
+                    self.canvas.itemconfigure(item, **{field: mix(c0, c1, p)})
+                except tk.TclError:
+                    return
+
+        self._aff_job = tween(self.root, 90, frame)
 
     def _on_motion(self, e):
         # 悬停在两端方块上就反白，让它们读起来像按钮；其它地方不折腾，省重绘
@@ -1300,7 +1385,7 @@ class HoverBar:
         t.configure(bg=BORDER)
         inner = tk.Frame(t, bg=BG)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
-        # 顶部 2px 酸黄：跟条面同一处强调色，读起来是"这条的展开"
+        # 顶部 2px 亮线：跟条面同一处强调色，读起来是"这条的展开"
         tk.Frame(inner, bg=EF_SIGNAL, height=2).pack(fill="x")
         f_k = _ef_font(EF_UI, 8)
         f_v = _ef_font(EF_UI, 8, bold=True)
@@ -1628,13 +1713,16 @@ class HoverBar:
 
 
 # ---------------------------------------------------------------- 设置面板
-# 风格：终末地（endfield-ui）
-#   唯一强调色 acid yellow #FFFA00，只做填充，只表示"当前 / 可点 / 注意"；
-#   切角 = 可点击（按钮、勾选项），展示容器一律直角，radius 全程 0；
-#   1px 细线分区，无阴影无发光无渐变；宽体大写拉丁眉标 + 粗体中文；
-#   数字用等宽字体。
-EF_UI = ("Saira", "Noto Sans SC", "Microsoft YaHei UI", "Microsoft YaHei")
-EF_MONO = ("Cascadia Mono", "Consolas")
+# 风格：Codex（OpenAI Codex 桌面/CLI 的视觉语言）
+#   近黑中性底（#0d0d0d）+ 灰阶文字；全等宽字体（含中文回落到等宽中文字体）；
+#   直角、1px 细边（#2e2e2e）、无圆角无阴影无渐变；
+#   "当前 / 选中"用**反白**（浅底黑字）表达，不用高饱和强调色；
+#   绿 #3fb950 / 琥珀 #d29922 / 红 #f85149 只表示数据健康度。
+# Codex 界面全等宽：连界面标签也是 mono，中文回落到系统等宽中文字体。
+EF_UI = ("JetBrains Mono", "Cascadia Mono", "Consolas",
+         "Sarasa Mono SC", "Noto Sans Mono CJK SC",
+         "Microsoft YaHei UI", "Microsoft YaHei")
+EF_MONO = ("Cascadia Mono", "JetBrains Mono", "Consolas")
 
 
 def _ef_font(fams, size, bold=False):
@@ -1644,8 +1732,8 @@ def _ef_font(fams, size, bold=False):
 
 
 class _EfButton(tk.Canvas):
-    """切角按钮。终末地里切角代表"可操作"，所以按钮必须有切角；
-    主按钮实心 acid yellow + 反白字，次按钮只有 1px 边线。"""
+    """Codex 按钮：直角方框 + 1px 边线。主按钮反白（浅底黑字），
+    次按钮只有边线，悬停填 EF_CHIP。没有切角、没有圆角。"""
 
     def __init__(self, master, text, command, primary=False, width=None):
         self.text = text
@@ -1654,8 +1742,8 @@ class _EfButton(tk.Canvas):
         self._hover = False
         f = _ef_font(EF_UI, 9, bold=primary)
         probe = tkfont.Font(root=master, font=f)
-        h, cut = 30, 8
-        w = width or (probe.measure(text) + 34)
+        h, cut = 26, 0
+        w = width or (probe.measure(text) + 30)
         super().__init__(master, width=w, height=h, bg=EF_PANEL,
                          highlightthickness=0, bd=0, cursor="hand2")
         self._font = f
@@ -1666,31 +1754,57 @@ class _EfButton(tk.Canvas):
         self._paint()
 
     def _set_hover(self, v):
-        if self._hover != v:
-            self._hover = v
-            self._paint()
+        if self._hover == v:
+            return
+        self._hover = v
+        w, h = self._cw, self._ch
+        c0, c1 = self._colors(not v)
+        t1, t2 = self._text_colors(not v)
+        job = getattr(self, "_job", None)
+        if job and job.get("job"):
+            try:
+                self.after_cancel(job["job"])
+            except Exception:
+                pass
+
+        def frame(p):
+            fill = mix(c0, c1, p)
+            self.itemconfigure(self._box, fill=fill,
+                               outline=fill if self.primary else EF_RULE)
+            self.itemconfigure(self._label, fill=mix(t1, t2, p))
+
+        self._job = tween(self, 90, frame)
+
+    def _colors(self, hover):
+        if self.primary:
+            return (EF_SIGNAL, "#ffffff") if not hover else ("#ffffff", "#ffffff")
+        return (EF_CHIP, EF_PANEL) if hover else (EF_PANEL, EF_CHIP)
+
+    def _text_colors(self, hover):
+        if self.primary:
+            return EF_ON_SIGNAL, EF_ON_SIGNAL
+        return ((EF_INK, EF_INK2) if not hover else (EF_INK2, EF_INK))
 
     def _paint(self):
         self.delete("all")
-        w, h, cut = self._cw, self._ch, self._cut
-        pts = [0.5, 0.5, w - cut, 0.5, w - 0.5, cut + 0.5, w - 0.5, h - 0.5,
-               0.5, h - 0.5]
+        w, h = self._cw, self._ch
         if self.primary:
-            fill = EF_SIGNAL if not self._hover else "#FFF86B"
-            self.create_polygon(pts, smooth=False, fill=fill,
-                                outline=fill, width=1)
+            fill = "#ffffff" if self._hover else EF_SIGNAL
+            self._box = self.create_rectangle(
+                0.5, 0.5, w - 0.5, h - 0.5, fill=fill, outline=fill, width=1)
             fg = EF_ON_SIGNAL
         else:
             fill = EF_CHIP if self._hover else EF_PANEL
-            self.create_polygon(pts, smooth=False, fill=fill,
-                                outline=EF_RULE, width=1)
+            self._box = self.create_rectangle(
+                0.5, 0.5, w - 0.5, h - 0.5, fill=fill, outline=EF_RULE,
+                width=1)
             fg = EF_INK if self._hover else EF_INK2
-        self.create_text(w / 2.0, h / 2.0, text=self.text, fill=fg,
-                         font=self._font)
+        self._label = self.create_text(w / 2.0, h / 2.0, text=self.text,
+                                       fill=fg, font=self._font)
 
 
 class _EfCheck(tk.Canvas):
-    """勾选项。未选中是 1px 空方框，选中是实心 acid yellow 方块 + 墨色 ✓；
+    """勾选项。未选中是 1px 空方框，选中是实心反白方块 + 墨色 ✓；
     文字跟着变亮——状态靠"填满/未填满"，不靠颜色区分。"""
 
     def __init__(self, master, text, var, big=False):
@@ -1738,7 +1852,7 @@ class _EfCheck(tk.Canvas):
 
 
 class _EfScale(tk.Frame):
-    """1px 轨道 + 实心方块把手。终末地不用圆点滑块，用方块。"""
+    """1px 细轨 + 实心方块把手（直角，没有圆点滑块）。"""
 
     def __init__(self, master, var, lo, hi, fmt="%g", suffix="", width=190):
         super().__init__(master, bg=EF_PANEL)
@@ -1782,7 +1896,7 @@ class _EfScale(tk.Frame):
 
 
 class _EfChips(tk.Frame):
-    """切角 chip 单选组。选中 = 实心 acid yellow（唯一"当前"表示）。"""
+    """单选 chip 组：直角小方框，选中 = 反白填充。"""
 
     def __init__(self, master, var, pairs, bg=EF_PAPER):
         super().__init__(master, bg=bg)
@@ -1796,29 +1910,49 @@ class _EfChips(tk.Frame):
             cv._hover = False
             cv.pack(side="left", padx=(0, 5))
 
+            def target(c, v):
+                """当前应显示的颜色 (底, 文字)。"""
+                if self.var.get() == v:
+                    return EF_SIGNAL, EF_ON_SIGNAL
+                if c._hover:
+                    return EF_CHIP, EF_INK
+                return bg, EF_INK2
+
             def paint(c=cv, v=val, t=txt):
                 c.delete("all")
-                w, h, cut = int(c["width"]), 24, 6
-                on = self.var.get() == v
-                hov = c._hover
-                pts = [0.5, 0.5, w - cut, 0.5, w - 0.5, cut + 0.5,
-                       w - 0.5, h - 0.5, 0.5, h - 0.5]
-                if on:
-                    c.create_polygon(pts, smooth=False, fill=EF_SIGNAL,
-                                     outline=EF_SIGNAL)
-                    fg = EF_ON_SIGNAL
-                else:
-                    c.create_polygon(pts, smooth=False,
-                                     fill=EF_CHIP if hov else bg,
-                                     outline=EF_RULE)
-                    fg = EF_INK if hov else EF_INK2
-                c.create_text(w / 2.0, h / 2.0, text=t, fill=fg,
-                              font=_ef_font(EF_UI, 8))
+                w, h = int(c["width"]), 22
+                fill, fg = target(c, v)
+                c._box = c.create_rectangle(
+                    0.5, 0.5, w - 0.5, h - 0.5, fill=fill,
+                    outline=fill if fill == EF_SIGNAL else EF_RULE)
+                c._label = c.create_text(w / 2.0, h / 2.0, text=t, fill=fg,
+                                         font=_ef_font(EF_UI, 8))
 
-            cv.bind("<Enter>",
-                    lambda e, c=cv, p=paint: (setattr(c, "_hover", True), p()))
-            cv.bind("<Leave>",
-                    lambda e, c=cv, p=paint: (setattr(c, "_hover", False), p()))
+            def hover(c=cv, v=val, on=True):
+                """悬停只补间颜色，不重建；选中态切换才走 paint。"""
+                if c._hover == on:
+                    return
+                c._hover = on
+                if self.var.get() == v:
+                    return                    # 选中项不随悬停变色
+                f0 = c.itemcget(c._box, "fill")
+                g0 = c.itemcget(c._label, "fill")
+                f1, g1 = target(c, v)
+                job = getattr(c, "_job", None)
+                if job and job.get("job"):
+                    try:
+                        c.after_cancel(job["job"])
+                    except Exception:
+                        pass
+
+                def frame(p):
+                    c.itemconfigure(c._box, fill=mix(f0, f1, p))
+                    c.itemconfigure(c._label, fill=mix(g0, g1, p))
+
+                c._job = tween(c, 90, frame)
+
+            cv.bind("<Enter>", lambda e, h=hover: h(on=True))
+            cv.bind("<Leave>", lambda e, h=hover: h(on=False))
             cv.bind("<Button-1>", lambda e, v=val: self.var.set(v))
             self.var.trace_add("write", lambda *_, p=paint: p())
             paint()
@@ -1940,11 +2074,13 @@ class SettingsDialog:
         top.withdraw()
         top.title("悬浮条设置")
         top.configure(bg=EF_PAPER)
-        # 不要系统白标题栏：它跟终末地这套暗色完全不是一路。改成无边框 + 自绘标题行，
-        # 拖动靠下面 bind 的 <B1-Motion>，关闭靠右侧的切角方块。
+        # 不要系统白标题栏：它跟这套暗色完全不是一路。改成无边框 + 自绘标题行，
+        # 拖动靠下面 bind 的 <B1-Motion>，关闭靠右侧的小方框。
         top.overrideredirect(True)
         top.attributes("-topmost", True)
-        top.resizable(False, False)
+        # 不要 resizable(False, False)：它把 min=max 锁成初始化那一刻的尺寸，
+        # 之后切页改内容高度窗口不会重算（短页下方留白、长页被裁）。
+        # overrideredirect 窗口没有边框可拖，本来也不需要这句。
         top.protocol("WM_DELETE_WINDOW", self.close)
         # 面板自己的透明度：下次打开沿用上次的值
         try:
@@ -1953,52 +2089,56 @@ class SettingsDialog:
         except tk.TclError:
             pass
 
-        # 顶部标题行：三色条 + 品牌 + 关闭。整段合成一块，不再有白色断层。
+        # 顶部标题行：Codex 是「▌ 标题  · 面包屑」，没有三色条那类装饰。
         bar_hdr = tk.Frame(top, bg=EF_CMD)
         bar_hdr.pack(fill="x")
+        tk.Frame(bar_hdr, bg=EF_RULE, height=1).pack(side="bottom", fill="x")
 
-        # 三色条贴在标题行顶边，只出现一次（终末地签名元素）
-        tri = tk.Frame(bar_hdr, bg=EF_PAPER, height=3)
-        tri.pack(fill="x")
-        for col in (EF_TRI_A, EF_TRI_B, EF_TRI_C):
-            tk.Frame(tri, bg=col, height=3).pack(side="left", fill="both",
-                                                 expand=True)
-
-        # 命令栏：品牌 + 面包屑，拉丁字母大写拉开
         cmd = tk.Frame(bar_hdr, bg=EF_CMD)
         cmd.pack(fill="x")
-        mark = tk.Canvas(cmd, width=11, height=11, bg=EF_CMD,
-                         highlightthickness=0, bd=0)
-        mark.create_polygon([0, 0, 11, 0, 11, 4.4, 4.4, 11, 0, 11],
-                            smooth=False, fill=EF_SIGNAL, outline="")
-        mark.pack(side="left", padx=(16, 8), pady=12)
-        tk.Label(cmd, text="Z C O D E   T O K E N", bg=EF_CMD, fg=EF_INK,
-                 font=_ef_font(EF_UI, 9, bold=True)).pack(side="left")
+        # "▌" 光标块：Codex TUI 的招牌符号，等宽字体下正好一格宽
+        mark = tk.Label(cmd, text="▌", bg=EF_CMD, fg=EF_SIGNAL,
+                        font=_ef_font(EF_MONO, 9))
+        mark.pack(side="left", padx=(14, 6), pady=9)
+        tk.Label(cmd, text="ZCODE TOKEN", bg=EF_CMD, fg=EF_INK,
+                 font=_ef_font(EF_MONO, 9, bold=True)).pack(side="left")
         crumb = tk.Frame(cmd, bg=EF_CMD)
-        crumb.pack(side="left", padx=(16, 0))
-        tk.Label(crumb, text="B A R", bg=EF_CMD, fg="#8b8b8b",
-                 font=_ef_font(EF_UI, 8)).pack(side="left")
-        on = tk.Frame(crumb, bg=EF_SIGNAL)
-        on.pack(side="left", padx=(10, 0))
-        tk.Label(on, text="S E T T I N G S", bg=EF_SIGNAL, fg=EF_ON_SIGNAL,
-                 font=_ef_font(EF_UI, 8, bold=True)).pack(padx=8, pady=3)
+        crumb.pack(side="left", padx=(10, 0))
+        tk.Label(crumb, text="·", bg=EF_CMD, fg=EF_INK2,
+                 font=_ef_font(EF_MONO, 9)).pack(side="left")
+        tk.Label(crumb, text="settings", bg=EF_CMD, fg=EF_INK2,
+                 font=_ef_font(EF_MONO, 9)).pack(side="left", padx=(8, 0))
 
-        # 关闭按钮：跟条面上的设置入口同一种语言——切角方块，悬停变酸黄。
-        # 系统标题栏去掉之后，这是唯一的关闭入口（Esc 也绑了）。
-        cl = tk.Canvas(cmd, width=22, height=22, bg=EF_CMD,
+        # 关闭：直角小方框，悬停反白。系统标题栏去掉后这是唯一关闭入口。
+        cl = tk.Canvas(cmd, width=20, height=20, bg=EF_CMD,
                        highlightthickness=0, bd=0, cursor="hand2")
-        cl.pack(side="right", padx=(0, 14), pady=8)
-        cut = 5
-        pts = [2, 2, 20, 2, 20, 20 - cut, 20 - cut, 20, 2, 20]
-        cl_box = cl.create_polygon(pts, smooth=False, fill=EF_CHIP, outline="")
-        cl.create_line(8, 8, 14, 14, fill=EF_INK2, width=1.4)
-        cl.create_line(14, 8, 8, 14, fill=EF_INK2, width=1.4)
+        cl.pack(side="right", padx=(0, 12), pady=7)
+        cl_box = cl.create_rectangle(1.5, 1.5, 18.5, 18.5,
+                                     fill=EF_CHIP, outline=EF_RULE)
+        cl.create_line(6.5, 6.5, 13.5, 13.5, fill=EF_INK2, width=1.3)
+        cl.create_line(13.5, 6.5, 6.5, 13.5, fill=EF_INK2, width=1.3)
 
         def cl_hover(on_):
-            cl.itemconfigure(cl_box, fill=EF_SIGNAL if on_ else EF_CHIP)
-            col = EF_ON_SIGNAL if on_ else EF_INK2
-            for i in cl.find_all()[1:]:
-                cl.itemconfigure(i, fill=col)
+            f0 = cl.itemcget(cl_box, "fill")
+            f1 = EF_SIGNAL if on_ else EF_CHIP
+            g0 = cl.itemcget(cl.find_all()[1], "fill")
+            g1 = EF_ON_SIGNAL if on_ else EF_INK2
+            job = getattr(cl, "_job", None)
+            if job and job.get("job"):
+                try:
+                    cl.after_cancel(job["job"])
+                except Exception:
+                    pass
+
+            def frame(p):
+                try:
+                    cl.itemconfigure(cl_box, fill=mix(f0, f1, p))
+                    for i in cl.find_all()[1:]:
+                        cl.itemconfigure(i, fill=mix(g0, g1, p))
+                except tk.TclError:
+                    pass
+
+            cl._job = tween(cl, 90, frame)
 
         cl.bind("<Enter>", lambda e: cl_hover(True))
         cl.bind("<Leave>", lambda e: cl_hover(False))
@@ -2030,7 +2170,11 @@ class SettingsDialog:
         # 盖住——控件、几何全对，整块正文却是一片空白。
         self._holder = tk.Frame(self._scroll_cv, bg=EF_PAPER)
         self._scroll_cv.pack(side="left", fill="both", expand=True)
-        self._scrollbar = tk.Canvas(outer, width=3, bg=EF_PAPER,
+        # height=1 是必须的：Canvas 不设 -height 时默认 7c（125% 缩放下
+        # 约 331px），会把它所在的外层请求高度顶到 331——于是无论内容多矮
+        # 窗口都缩不下来，短页下方留一截空白。pack(fill="y") 会把它拉满，
+        # 请求高度只需给一个不影响布局的最小值。
+        self._scrollbar = tk.Canvas(outer, width=3, height=1, bg=EF_PAPER,
                                     highlightthickness=0, bd=0)
         self._scrollbar.pack(side="right", fill="y", padx=(6, 8))
         self._body_id = self._scroll_cv.create_window(
@@ -2100,6 +2244,7 @@ class SettingsDialog:
         cap = max(240, int(top.winfo_screenheight() * 0.62))
         self._cap_h = cap
         self._scroll_cv.configure(width=pw, height=min(self._max_h, cap))
+
         self._holder.configure(width=pw,
                                height=min(self._max_h, cap))
         self._body_id = self._scroll_cv.create_window(
@@ -2158,7 +2303,7 @@ class SettingsDialog:
 
     def _page_pos(self, p):
         """01 位置。"""
-        self._section(p, 1, "位置", "P O S I T I O N")
+        self._section(p, 1, "位置", "position")
         self.v_anchor = tk.StringVar(value=self.cfg["anchor"])
 
         _EfChips(self._row(p, "贴靠", "相对 ZCode 窗口或整块屏幕"), self.v_anchor,
@@ -2224,7 +2369,7 @@ class SettingsDialog:
 
     def _page_look(self, p):
         """02 外观。"""
-        self._section(p, 2, "外观", "A P P E A R A N C E")
+        self._section(p, 2, "外观", "appearance")
         self.v_op = tk.DoubleVar(value=float(self.cfg["opacity"]))
 
         _EfScale(self._row(p, "透明度", "拖动即时预览，点「应用」才落盘"),
@@ -2250,7 +2395,7 @@ class SettingsDialog:
 
     def _page_items(self, p):
         """03 显示项。"""
-        self._section(p, 3, "显示项", "E L E M E N T S")
+        self._section(p, 3, "显示项", "elements")
         self.v_show = {}
 
         grid = tk.Frame(p, bg=EF_PAPER)
@@ -2276,7 +2421,7 @@ class SettingsDialog:
 
     def _page_panel(self, p):
         """04 面板与壁纸。"""
-        self._section(p, 4, "面板与壁纸", "P A N E L   +   W A L L P A P E R")
+        self._section(p, 4, "面板与壁纸", "panel")
         self.v_pop = tk.DoubleVar(value=float(self.cfg.get("panel_opacity", 1.0)))
 
         _EfScale(self._row(p, "面板透明度", "这个设置面板自己；1.00 = 纯不透明"),
@@ -2338,7 +2483,7 @@ class SettingsDialog:
 
     def _page_behav(self, p):
         """05 行为。"""
-        self._section(p, 5, "行为", "B E H A V I O U R")
+        self._section(p, 5, "行为", "behaviour")
         self.v_top = tk.BooleanVar(value=bool(self.cfg["always_on_top"]))
 
         _EfCheck(p, "总是置顶（会盖住其它程序）", self.v_top,
@@ -2360,7 +2505,7 @@ class SettingsDialog:
 
     def _page_upd(self, p):
         """06 更新。"""
-        self._section(p, 6, "更新", "U P D A T E")
+        self._section(p, 6, "更新", "update")
         # 当前版本号直接读 git：没有 tag 体系，短 hash 就是最好的版本标识
 
         self._upd_local = local_commit() or "（非 git 安装）"
@@ -2400,7 +2545,7 @@ class SettingsDialog:
 
     def _page_stat(self, p):
         """07 状态。"""
-        self._section(p, 7, "状态", "S T A T U S")
+        self._section(p, 7, "状态", "status")
         st = tk.Frame(p, bg=EF_PAPER)
 
         st.pack(fill="x", pady=(0, 2))
@@ -2469,9 +2614,9 @@ class SettingsDialog:
     # -- 面板内的通用构件（原来都是 __init__ 里的闭包） --
     def _tab_chip(self, key, cn):
         """标签栏上的一个切角小方块。存档信息供 _tab_paint 重绘。"""
-        f = _ef_font(EF_UI, 9)
-        w = tkfont.Font(root=self.top, font=f).measure(cn) + 20
-        c = tk.Canvas(self._tabs_bar, width=w, height=26, bg=EF_PAPER,
+        f = _ef_font(EF_MONO, 9)
+        w = tkfont.Font(root=self.top, font=f).measure(cn) + 22
+        c = tk.Canvas(self._tabs_bar, width=w, height=24, bg=EF_PAPER,
                       highlightthickness=0, bd=0, cursor="hand2")
         c.pack(side="left", padx=(0, 5))
         c._hover = False
@@ -2501,22 +2646,46 @@ class SettingsDialog:
 
     def _tab_hover(self, key, v):
         c = self._tab_cvs[key][0]
-        if c._hover != v:
-            c._hover = v
+        if c._hover == v:
+            return
+        c._hover = v
+        if key == self._cur_page:
+            return                       # 当前页保持反白，不随悬停变
+        try:
+            f0 = c.itemcget(c._box, "fill")
+            g0 = c.itemcget(c._label, "fill")
+            f1 = EF_CHIP if v else EF_PAPER
+            g1 = EF_INK if v else EF_INK2
+        except tk.TclError:
             self._tab_paint(key)
+            return
+        job = getattr(c, "_job", None)
+        if job and job.get("job"):
+            try:
+                c.after_cancel(job["job"])
+            except Exception:
+                pass
+
+        def frame(p):
+            try:
+                c.itemconfigure(c._box, fill=mix(f0, f1, p))
+                c.itemconfigure(c._label, fill=mix(g0, g1, p))
+            except tk.TclError:
+                pass
+
+        c._job = tween(c, 90, frame)
 
     @staticmethod
     def _section(parent, no, cn, en):
-        """分区标题：固定编号（跟标签顺序一致）+ 中文 + 拉开字距的拉丁眉标。"""
+        """分区标题（Codex 式）：dim 编号 + 中文 + 紧凑小写英文，无字距拉伸。"""
         head = tk.Frame(parent, bg=EF_PAPER)
         head.pack(fill="x")
-        tk.Label(head, text="%02d" % no, bg=EF_PAPER, fg=EF_SIGNAL,
-                 font=_ef_font(EF_MONO, 9, bold=True)
-                 ).pack(side="left", padx=(0, 10))
+        tk.Label(head, text="%02d" % no, bg=EF_PAPER, fg=EF_INK2,
+                 font=_ef_font(EF_MONO, 9)).pack(side="left", padx=(0, 9))
         tk.Label(head, text=cn, bg=EF_PAPER, fg=EF_INK,
                  font=_ef_font(EF_UI, 10, bold=True)).pack(side="left")
-        tk.Label(head, text=en, bg=EF_PAPER, fg=EF_INK2,
-                 font=_ef_font(EF_UI, 8)).pack(side="right")
+        tk.Label(head, text=en.lower(), bg=EF_PAPER, fg=EF_INK2,
+                 font=_ef_font(EF_MONO, 8)).pack(side="right")
         tk.Frame(parent, bg=EF_RULE, height=1).pack(fill="x", pady=(5, 9))
 
     @staticmethod
@@ -2540,6 +2709,50 @@ class SettingsDialog:
         tk.Label(parent, text=text, bg=EF_PAPER, fg=EF_INK2,
                  font=_ef_font(EF_UI, 8)).pack(anchor="w", pady=(2, 4))
 
+    def _set_page_height(self, h):
+        """把内容视口和 holder 一起改成 h 高。
+
+        复用一个 canvas window item——重复 create_window 会堆同名 item，
+        bbox/滚动区域都会算错；只改宽高并把坐标归零。
+        """
+        self._scroll_cv.configure(height=h)
+        self._holder.configure(width=self._page_w, height=h)
+        self._scroll_cv.itemconfigure(self._body_id, width=self._page_w,
+                                      height=h)
+        self._scroll_cv.coords(self._body_id, 0, 0)
+
+    def _animate_page_height(self, target, animate=True):
+        """切页时高度补间（120ms ease-out）。各页高度差可以上百像素，
+        硬跳会让面板"啪"地抽一下；补间是手风琴那种展开感。
+
+        高度是布局属性，本来不该动——但面板只有一屏、只在切页时变一次，
+        不是列表滚动那种高频场景；tkinter 里也只有这条路径能给出展开感。
+        """
+        job = getattr(self, "_h_job", None)
+        if job and job.get("job"):
+            try:
+                self.top.after_cancel(job["job"])
+            except Exception:
+                pass
+            self._h_job = None
+        try:
+            start = self._scroll_cv.winfo_height()
+        except tk.TclError:
+            return
+        if not animate or not motion_ok() or start <= 1 or start == target:
+            self._set_page_height(target)
+            self._sync_scroll()
+            return
+
+        def frame(p):
+            self._set_page_height(round(start + (target - start) * p))
+
+        def done():
+            self._set_page_height(target)
+            self._sync_scroll()
+
+        self._h_job = tween(self.top, 120, frame, done)
+
     def _show_page(self, key, animate=True):
         """切到某一页：换页 + 按该页高度收放画布 + 滑入动画。
 
@@ -2558,15 +2771,7 @@ class SettingsDialog:
                 f.place_forget()
         page = self._pages[key]
         h = min(self._page_h.get(key, self._max_h), self._cap_h)
-        self._scroll_cv.configure(height=h)
-        # 复用一个 canvas window item（重复 create 会堆一堆同名 item，
-        # bbox/滚动区域都会算错）；只改它的宽高。
-        self._holder.configure(width=self._page_w, height=h)
-        self._scroll_cv.itemconfigure(self._body_id, width=self._page_w,
-                                      height=h)
-        if self._scroll_cv.bbox(self._body_id) != (0, 0, self._page_w, h):
-            self._scroll_cv.coords(self._body_id, 0, 0)
-        self._scroll_cv.yview_moveto(0)
+        self._animate_page_height(h, animate)
         for k in self._tab_cvs:
             self._tab_paint(k)
         if not animate or not motion_ok():

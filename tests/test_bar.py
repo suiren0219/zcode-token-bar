@@ -436,7 +436,7 @@ def t_truth():
 
     bar.root.withdraw()
     settled = False
-    for _ in range(10):            # unmap 事件偶尔要一两拍才到，别当时序断言
+    for _ in range(40):            # unmap 事件偶尔要一两拍才到，别当时序断言
         bar.root.update()
         if bar._visible is False:
             settled = True
@@ -476,7 +476,7 @@ def t_spin():
           and bar.canvas.itemcget(bar._spin_id, "outline") == hb.EF_SIGNAL)
     check("暗色轨道存在",
           bar._spin_track is not None
-          and bar.canvas.itemcget(bar._spin_track, "outline") == "#272c36")
+          and bar.canvas.itemcget(bar._spin_track, "outline") == hb.TRACK)
 
     a0 = float(bar.canvas.itemcget(bar._spin_id, "start"))
     n0 = len(bar.canvas.find_all())
@@ -574,20 +574,38 @@ def t_pages():
     check("七页宽度一致（不左右跳）", len(widths) == 1)
 
     dlg._show_page("look", animate=True)
-    ys = set()
-    for _ in range(10):
-        dlg.top.update()
-        p = dlg._pages["look"]
-        if p.winfo_ismapped():
-            ys.add(int(p.place_info().get("y", 0)))
-        time.sleep(0.02)
-    check("滑入动画 y 在变化", len(ys) > 1)
-    for _ in range(30):
-        dlg.top.update(); time.sleep(0.02)
+    # 第一帧是同步发出的：y 立刻在偏移位，定时器已排好
+    y0 = int(dlg._pages["look"].place_info().get("y", 0))
+    check("切页动画已排队且首帧有位移（y=%d）" % y0,
+          dlg._slide_job is not None and y0 > 0)
+    for _ in range(60):
+        dlg.top.update(); time.sleep(0.01)
         if dlg._slide_job is None:
             break
     check("动画落定在 y=0",
           int(dlg._pages["look"].place_info().get("y", -1)) == 0)
+    # 高度补间：跟踪 configure(height=) 的中间值（winfo_height 有滞后，采样不可靠）
+    seq = []
+    cv = dlg._scroll_cv
+    real_cfg = cv.configure
+
+    def traced(*a, **k):
+        if "height" in k:
+            seq.append(int(k["height"]))
+        return real_cfg(*a, **k)
+
+    cv.configure = traced
+    target = min(dlg._page_h["items"], dlg._cap_h)
+    dlg._show_page("items", animate=True)
+    for _ in range(60):
+        dlg.top.update(); time.sleep(0.01)
+        if not (dlg._h_job and dlg._h_job.get("job")):
+            break
+    cv.configure = real_cfg
+    check("切页高度连续过渡（%d 帧，%s…）" % (len(seq), seq[:4]),
+          len(seq) >= 3 and seq[-1] == target)
+    check("最终高度等于该页 reqheight",
+          int(cv.cget("height")) == target)
 
     dlg._show_page("items", animate=False)
     dlg.v_show["speed"].set(False)
