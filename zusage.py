@@ -544,15 +544,16 @@ def _find_catalog():
     return None
 
 
-def _rules_window(model_id):
-    """新版目录：modelRules 按 modelMatch 正则匹配，后面命中的覆盖前面的。"""
+def _rules_window_ex(model_id):
+    """新版目录：modelRules 按 modelMatch 正则匹配，后面命中的覆盖前面的。
+    返回 (contextWindow, 命中正则长度)；正则越短越像通配兜底。"""
     path = _find_catalog()
     if not path:
-        return None
+        return None, 0
     try:
         cat = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return None
+        return None, 0
 
     rules = (((cat.get("config") or {}).get("modelConfigRules") or {})
              .get("modelRules") or [])
@@ -573,7 +574,12 @@ def _rules_window(model_id):
         # 越具体的规则越可信（正则越长）；同分取后出现的（后者覆盖前者）
         if len(pat) >= hit_specific:
             hit, hit_specific = int(cw), len(pat)
-    return hit
+    return hit, hit_specific
+
+
+def _rules_window(model_id):
+    """新版目录：modelRules 按 modelMatch 正则匹配，后面命中的覆盖前面的。"""
+    return _rules_window_ex(model_id)[0]
 
 
 def _legacy_window(model_id):
@@ -593,14 +599,78 @@ def _legacy_window(model_id):
     return None
 
 
+_V2_WIN_CACHE = (0.0, {})
+
+
+def _v2_config_windows():
+    """~/.zcode/v2/config.json 里用户配置的模型窗口。
+
+    provider.<id>.models.<modelId>.limit.context 是 ZCode 自己在用的权威值，
+    覆盖自定义反代模型（builtin 目录里根本没有）。缓存 60s。
+    """
+    global _V2_WIN_CACHE
+    now = time.time()
+    ts, val = _V2_WIN_CACHE
+    if now - ts < 60 and val:
+        return val
+
+    def run():
+        out = {}
+        try:
+            p = Path.home() / ".zcode/v2/config.json"
+            c = json.loads(p.read_text(encoding="utf-8"))
+            for pc in (c.get("provider") or {}).values():
+                models = (pc or {}).get("models") or {}
+                if not isinstance(models, dict):
+                    continue
+                for mid, mc in models.items():
+                    cw = (((mc or {}).get("limit") or {}).get("context"))
+                    if isinstance(cw, int) and cw > 0:
+                        out[str(mid).strip().lower()] = cw
+        except Exception:
+            pass
+        return out
+
+    val = run()
+    _V2_WIN_CACHE = (now, val)
+    return val
+
+
+# 用量超过目录窗口时，按标准档位向上推断（窗口一定不小于装下的用量）
+_WINDOW_TIERS = (128000, 200000, 256000, 400000, 512000, 1000000, 2000000)
+
+
+def _infer_window(used, known=None):
+    """用量超过已知窗口时，推断为「装得下用量的最小标准档」。
+
+    反代/自定义模型的窗口在目录里查不到，但用量不会骗人：最近一次请求
+    装下了 250K，窗口就一定 ≥ 250K，200K 的目录值必错。推断值随会话
+    增长自动上档，所以上下文百分比永远不会再出现 >100%。
+    """
+    if not used:
+        return known
+    floor = max(used, known or 0)
+    for t in _WINDOW_TIERS:
+        if t >= floor:
+            return t
+    return int((used + 999_999) // 1_000_000) * 1_000_000
+
+
 def lookup_context_window(model_id):
-    """按模型 id 查 contextWindow；查不到返回 None。带缓存。"""
+    """按模型 id 查 contextWindow；查不到返回 None。带缓存。
+    优先级：运行期 rules → v2/config.json（用户自配）→ 旧版目录。"""
     want = (model_id or "").strip().lower()
     if not want:
         return None
     if want in _CTX_WINDOW_CACHE:
         return _CTX_WINDOW_CACHE[want]
-    result = _rules_window(want)
+    hit, specific = _rules_window_ex(want)
+    catch_all = hit is not None and specific <= 4     # .* 这类通配兜底
+    result = hit if (hit is not None and not catch_all) else None
+    if result is None:
+        result = _v2_config_windows().get(want)
+    if result is None:
+        result = hit                                   # 通配兜底也总比没有强
     if result is None:
         result = _legacy_window(want)
     _CTX_WINDOW_CACHE[want] = result
@@ -836,6 +906,13 @@ def _session_snapshot(con, sid, cfg):
         except Exception:
             pass
     ctx_auto = lookup_context_window(last["model_id"]) if last else None
+    used = u["last_request_input"] if u else 0
+    # v71：目录窗口装不下已观测的用量 → 目录必错，按用量推断并标记
+    window = ctx_auto
+    ctx_inferred = False
+    if used and (window is None or used > window):
+        window = _infer_window(used, window)
+        ctx_inferred = True
     # 生成速度：输出 token ÷ 生成耗时（首 token 之后到完成；无 first_token_at 时退化为总耗时）
     tps = 0
     if last and last["output_tokens"]:
@@ -936,8 +1013,9 @@ def _session_snapshot(con, sid, cfg):
                from model_usage where session_id=? and context_exceeded=1""",
             (sid,),
         ).fetchone()[0],
-        "context_window": ctx_auto or cfg["context_window"],
-        "context_auto": ctx_auto is not None,
+        "context_window": (window or cfg["context_window"]),
+        "context_auto": ctx_auto is not None or ctx_inferred,
+        "context_inferred": ctx_inferred,
         "last_at": (lr[0] if lr and lr[0] else 0),
         "is_sub": sid.startswith("sess_subagent"),
         "parent": (srow["parent_id"] if srow is not None else None),
@@ -1252,6 +1330,7 @@ def _snapshot_with(con, force_sid="", pin_sid=""):
         "pin_lost": pin_lost,                 # 钉住的会话本地远端都查无 → 悬浮条自动解钉
         "context_window": base["context_window"],
         "context_auto": base["context_auto"],
+        "context_inferred": base.get("context_inferred", False),
         "code": base["code"],
         "ctx_exc": base["ctx_exc"],
         "tools": base["tools"],

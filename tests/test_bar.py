@@ -819,6 +819,88 @@ def t_flash():
 
 
 
+def t_ctxwin():
+    """上下文窗口：v2/config 新数据源 + 用量推断（>100% 的根治）。"""
+    import zusage as zu
+
+    # 纯函数：档位推断
+    check("用量 250.5K、已知 200K → 推断 256K",
+          zu._infer_window(250500, 200000) == 256000)
+    check("无已知值 → 装得下用量的最小档",
+          zu._infer_window(250500, None) == 256000)
+    check("已知 1M 更大时不缩小",
+          zu._infer_window(250500, 1000000) == 1000000)
+    check("用量 3M → 向上取整到 3M",
+          zu._infer_window(3_000_000, None) == 3_000_000)
+    check("用量没超窗 → 不改", zu._infer_window(100000, 200000) == 200000)
+    check("用量 0 → 不改", zu._infer_window(0, 200000) == 200000)
+
+    # 查找链：v2/config 数据源参与（打桩避免依赖本机文件内容）。
+    # hy4free 会被运行期 rules 的通配规则命中 200K——那正是 bug 现场，
+    # 用量推断（下面的端到端）才是它的解；v2 数据源服务 rules 没覆盖的模型。
+    real_v2 = zu._v2_config_windows
+    zu._CTX_WINDOW_CACHE.clear()
+    try:
+        check("rules 通配命中 hy4free = 200K（bug 现场记录在案）",
+              zu.lookup_context_window("hy4free") == 200000)
+        zu._v2_config_windows = lambda: {"mystery-model": 400000}
+        zu._CTX_WINDOW_CACHE.clear()
+        check("rules 没覆盖时走 v2/config",
+              zu.lookup_context_window("mystery-model") == 400000)
+        zu._v2_config_windows = lambda: {}
+        zu._CTX_WINDOW_CACHE.clear()
+        check("v2/config 也没有 → 回退旧目录/None",
+              zu.lookup_context_window("mystery-model") in (None,)
+              or isinstance(zu.lookup_context_window("mystery-model"), int))
+    finally:
+        zu._v2_config_windows = real_v2
+        zu._CTX_WINDOW_CACHE.clear()
+
+    # 端到端：目录查不到的模型，用量超过窗口 → 推断 + 标记
+    real_lookup = zu.lookup_context_window
+    import sqlite3
+    real = sqlite3.connect(
+        f"file:{Path.home() / '.zcode/cli/db/db.sqlite'}?mode=ro", uri=True)
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    for (sql,) in real.execute(
+            "select sql from sqlite_master where type='table' and sql is not null"):
+        if "sqlite_" in sql:
+            continue
+        mem.execute(sql)
+    now = int(time.time() * 1000)
+
+    def ins(mem_, table, **vals):
+        info = list(mem_.execute(f"pragma table_info({table})"))
+        use = dict(vals)
+        for _c, name, ctype, notnull, dflt, pk in info:
+            if name in use or (notnull and (dflt is not None or pk)):
+                continue
+            if notnull:
+                use[name] = "" if "text" in (ctype or "").lower() else 0
+        q = ",".join(use)
+        mem_.execute(f"insert into {table}({q}) values({','.join('?' * len(use))})",
+                     list(use.values()))
+
+    ins(mem, "session", id="sess_ctx", project_id="p", slug="c",
+        directory="C:/demo", title="ctx 测试", time_created=now,
+        time_updated=now)
+    ins(mem, "model_usage", session_id="sess_ctx", completed_at=now - 10000,
+        status="completed", model_id="mystery-model", input_tokens=250500,
+        computed_total_tokens=250500)
+    mem.commit()
+    zu.lookup_context_window = lambda mid: None      # 目录查不到
+    d = zu._snapshot_with(mem)
+    check("查不到的模型 + 用量 250.5K → 窗口推断 256K",
+          d["context_window"] == 256000)
+    check("标记为推断", d.get("context_inferred") is True
+          and d.get("context_auto") is True)
+    check("百分比不再超过 100",
+          d["session"]["ctx"] / d["context_window"] <= 1.0)
+    zu.lookup_context_window = real_lookup
+    mem.close()
+
+
 def t_wallpaper():
     """壁纸页的「刷新壁纸」：不换图、后台注入、结果回主线程着色。"""
     bar = new_bar()
@@ -864,7 +946,7 @@ GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
-    "wallpaper": t_wallpaper, "attach": t_attach,
+    "wallpaper": t_wallpaper, "attach": t_attach, "ctxwin": t_ctxwin,
 }
 
 

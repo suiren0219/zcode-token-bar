@@ -1330,7 +1330,11 @@ class HoverBar:
 
         ctx, cw = int(s.get("ctx") or 0), int(d.get("context_window") or 0)
         if ctx and cw:
-            add("上下文", "%s / %s  %s" % (fmt(ctx), fmt(cw), pct(ctx, cw)))
+            # "(推断)" = 该模型的窗口目录里查不到，按已观测用量推的标准档，
+            # 会随会话增长自动上档——数字诚实但不是官方值，标注出来
+            mark = "  (推断)" if d.get("context_inferred") else ""
+            add("上下文", "%s / %s  %s%s" % (fmt(ctx), fmt(cw), pct(ctx, cw),
+                                             mark))
 
         if s.get("input"):
             cin = int(s["input"])
