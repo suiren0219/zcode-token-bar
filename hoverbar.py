@@ -2271,13 +2271,15 @@ class SettingsDialog:
         self._max_h = max(self._page_h.values())
         cap = max(240, int(top.winfo_screenheight() * 0.62))
         self._cap_h = cap
-        self._scroll_cv.configure(width=pw, height=min(self._max_h, cap))
-
-        self._holder.configure(width=pw,
-                               height=min(self._max_h, cap))
+        # v73：所有页共用**同一个**视口高度（最高页，再封顶），切页不再
+        # 忽大忽小。短页内容顶部对齐，下面留出的空处是稳定的，比每页
+        # 换一次窗口尺寸舒服得多；面板窗口也因此只算一次尺寸。
+        self._fixed_h = min(self._max_h, cap)
+        self._scroll_cv.configure(width=pw, height=self._fixed_h)
+        self._holder.configure(width=pw, height=self._fixed_h)
         self._body_id = self._scroll_cv.create_window(
             (0, 0), window=self._holder, anchor="nw", width=pw,
-            height=min(self._max_h, cap))
+            height=self._fixed_h)
         top.update_idletasks()
         self._show_page("pos", animate=False)
         self._place_off_bar()
@@ -2494,6 +2496,12 @@ class SettingsDialog:
             _EfScale(self._row(p, "壁纸模糊", "px；界面会更糊但更安静"),
 
                      self.v_wp_blur, 0, 40, fmt="%.0f").pack(anchor="e")
+            # v73：压暗/模糊/显示开关拖动即时生效，不必点「应用」。
+            # debounce 600ms 是因为 _wp_refresh 要起 subprocess 走 CDP，
+            # 鼠标每动一格都跑一次会把面板拖垮；松手后一拍写盘 + 注入。
+            self._wp_job = None
+            for v in (self.v_wp_vis, self.v_wp_dim, self.v_wp_blur):
+                v.trace_add("write", lambda *_: self._wp_changed())
 
             r_pick = self._row(p, "换壁纸", "jpg / png，选完立刻生效")
 
@@ -2758,6 +2766,8 @@ class SettingsDialog:
         复用一个 canvas window item——重复 create_window 会堆同名 item，
         bbox/滚动区域都会算错；只改宽高并把坐标归零。
         """
+        if getattr(self, "_body_id", None) is None:
+            return
         self._scroll_cv.configure(height=h)
         self._holder.configure(width=self._page_w, height=h)
         self._scroll_cv.itemconfigure(self._body_id, width=self._page_w,
@@ -2765,22 +2775,12 @@ class SettingsDialog:
         self._scroll_cv.coords(self._body_id, 0, 0)
 
     def _animate_page_height(self, target, animate=True):
-        """切页高度**直接到位**，不做补间。
+        """切页**不改视口高度**：所有页共用 _fixed_h（v73）。
 
-        试过 120ms 的 height 补间，但每帧改 canvas 高度都会触发一次窗口
-        resize + 整块面板重绘（Tk 的 layout 是同步的），实测一次切页要
-        260ms 才跑完、一帧都没画出来——观感是"卡住"而不是"展开"。
-        height 属于布局属性，本来就不该动（emil 规则里唯一的例外是手风琴，
-        而这里收益抵不上掉帧）。位移交给页面滑入动画。
+        以前按页改高度，忽大忽小不说，上翻定位还会被旧高度算错；
+        补间版本更糟——每帧触发一次窗口 resize + 整窗重绘，一次切页
+        260ms 才跑完、一帧没画出来。现在面积恒定，只由页面滑入给反馈。
         """
-        job = getattr(self, "_h_job", None)
-        if job and job.get("job"):
-            try:
-                self.top.after_cancel(job["job"])
-            except Exception:
-                pass
-            self._h_job = None
-        self._set_page_height(target)
         self._sync_scroll()
 
     def _show_page(self, key, animate=True):
@@ -2894,9 +2894,9 @@ class SettingsDialog:
         """把面板贴在条面上：正下方或正上方，零间隙、左边缘对齐。
 
         以前是按鼠标位置随便飘，跟条面看不出关系。现在它是"从条面长出来"
-        的一块：紧贴条面下沿（下面放不下就翻到上沿），x 对齐条面左边缘并
-        夹在屏内。开合动画也从贴条那一侧滑出/滑回，读起来是一个整体。
-        条面不可见时（--settings 冷启动）退回指针附近。
+        的一块：紧贴条面下沿（下面放不下就翻到上沿并**底边**贴住），
+        右边缘对齐齿轮、夹在屏内。上下都不够时压缩内容视口到可用高度，
+        标签栏和页脚永远可点。条面不可见时（--settings 冷启动）退回指针附近。
         """
         top = self.top
         # 先落定布局再量：切页刚改过 canvas 高度，reqheight 还是旧值，
@@ -2927,10 +2927,27 @@ class SettingsDialog:
         if x < 8:
             x = max(8, bx)
         x = min(x, max(8, sw - w - 8))
-        if by + bh + h <= sh - 8:
+        below = sh - (by + bh) - 8               # 条面下方的可用高度
+        above = by - 8                           # 条面上方的可用高度
+        if h <= below:
             y, self._drop = by + bh, "down"      # 贴条面下沿
+        elif h <= above:
+            # 上翻必须是**底边**贴条面顶沿。以前用 by-h（顶对齐）在
+            # 面板比可用空间高时，底部标签栏会伸到条面下面被盖住——
+            # 用户点不到标签就是"无法切换"。
+            y, self._drop = by - h, "up"
         else:
-            y, self._drop = max(8, by - h), "up"  # 下面放不下 → 贴上沿
+            # 上下都不够：选较宽的一侧，并把内容视口压缩到那一侧的高度。
+            # 面板整体高度 = 视口 + chrome，压缩后一定放得下，绝不遮挡。
+            side = "down" if below >= above else "up"
+            chrome = max(0, h - self._scroll_cv.winfo_reqheight())
+            avail = max(180, (below if side == "down" else above) - chrome)
+            self._set_page_height(min(getattr(self, "_fixed_h", avail), avail))
+            top.update_idletasks()
+            h = top.winfo_reqheight()
+            y = by + bh if side == "down" else by - h
+            self._drop = side
+        y = min(max(8, y), max(8, sh - h - 8))
         self._anchor = (x, y)
         top.geometry("+%d+%d" % (x, y))
         return x, y
@@ -3203,6 +3220,38 @@ class SettingsDialog:
             self.bar.quit()
         else:
             self._upd_say("起不来新实例，手动重启一下悬浮条。", EF_DANGER)
+
+    def _wp_changed(self):
+        """壁纸控件变了：600ms 内合并成一次写盘 + 后台重注入。"""
+        if self._wp is None or getattr(self, "_wp_msg", None) is None:
+            return
+        job = getattr(self, "_wp_job", None)
+        if job:
+            try:
+                self.top.after_cancel(job)
+            except Exception:
+                pass
+
+        def flush():
+            self._wp_job = None
+            patch = {"wallpaperVisible": bool(self.v_wp_vis.get()),
+                     "dim": round(float(self.v_wp_dim.get())),
+                     "blur": round(float(self.v_wp_blur.get()))}
+            if not _wp_write(patch):
+                self._say(self._wp_msg, "配置写失败，改动未生效。", EF_DANGER)
+                return
+            self._wp.update(patch)
+            self._wp = _wp_read() or self._wp
+            self._say(self._wp_msg, "已保存，正在注入…")
+            port = self._wp.get("port")
+
+            def work():
+                ok = _wp_refresh(port)
+                self._upd_q.put((self._wp_reinject_done, (ok,)))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        self._wp_job = self.top.after(600, flush)
 
     def _wp_reinject(self):
         """不换图，只重注入：后台线程跑插件 CLI，结果回主线程显示。

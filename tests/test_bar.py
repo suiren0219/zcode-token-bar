@@ -570,7 +570,10 @@ def t_pages():
         widths.add(dlg.top.winfo_reqwidth())
         shown = [kk for kk, f in dlg._pages.items() if f.winfo_ismapped()]
         check("切到 %s：只有它在显示" % k, shown == [k])
-    check("各页高度不同（真按页收放）", len(set(heights.values())) > 1)
+    check("各页视口高度一致（统一面积，不再忽大忽小）",
+          len(set(heights.values())) == 1)
+    check("统一高度等于最高页（封顶内）",
+          all(h == min(dlg._max_h, dlg._cap_h) for h in heights.values()))
     check("七页宽度一致（不左右跳）", len(widths) == 1)
 
     dlg._show_page("look", animate=True)
@@ -584,15 +587,14 @@ def t_pages():
             break
     check("动画落定在 y=0",
           int(dlg._pages["look"].place_info().get("y", -1)) == 0)
-    # 高度直接到位（不做补间）：补间每帧都要 resize 窗口 + 整窗重绘，
-    # 实测一次切页 260ms 才跑完、一帧没画出来，观感是"卡住"。位移交给滑入。
+    # 切页完全不改高度（v73 统一面积）
     cv = dlg._scroll_cv
-    target = min(dlg._page_h["items"], dlg._cap_h)
+    fixed = getattr(dlg, "_fixed_h", None)
     dlg._show_page("items", animate=True)
-    check("切页高度立刻到位（不做补间）",
-          int(cv.cget("height")) == target)
+    check("切页高度恒定（统一面积）",
+          fixed is not None and int(cv.cget("height")) == fixed)
     hj = getattr(dlg, "_h_job", None)
-    check("高度到位后没有悬挂的高度任务", not (hj and hj.get("job")))
+    check("没有悬挂的高度任务", not (hj and hj.get("job")))
 
     dlg._show_page("items", animate=False)
     dlg.v_show["speed"].set(False)
@@ -890,15 +892,17 @@ def t_ctxwin():
         computed_total_tokens=250500)
     mem.commit()
     zu.lookup_context_window = lambda mid: None      # 目录查不到
-    d = zu._snapshot_with(mem)
-    check("查不到的模型 + 用量 250.5K → 窗口推断 256K",
-          d["context_window"] == 256000)
-    check("标记为推断", d.get("context_inferred") is True
-          and d.get("context_auto") is True)
-    check("百分比不再超过 100",
-          d["session"]["ctx"] / d["context_window"] <= 1.0)
-    zu.lookup_context_window = real_lookup
-    mem.close()
+    try:
+        d = zu._snapshot_with(mem)
+        check("查不到的模型 + 用量 250.5K → 窗口推断 256K",
+              d["context_window"] == 256000)
+        check("标记为推断", d.get("context_inferred") is True
+              and d.get("context_auto") is True)
+        check("百分比不再超过 100",
+              d["session"]["ctx"] / d["context_window"] <= 1.0)
+    finally:
+        zu.lookup_context_window = real_lookup
+        mem.close()
 
 
 def t_wallpaper():
@@ -942,11 +946,75 @@ def t_wallpaper():
         kill(bar)
 
 
+
+
+
+def t_layout():
+    """统一面积 + 任意条面位置都不遮挡 + 压暗即时生效。"""
+    # 1) 三种条面位置 × 七页：面板既不遮挡条面也不出屏，视口高度恒定
+    for desc, wr in (("顶部", (100, 40, 1100, 300)),
+                     ("中部", (100, 400, 1100, 400)),
+                     ("底部", (100, 700, 1100, 330))):
+        ENV["win"] = wr
+        bar = new_bar()
+        bar._place(); bar.root.update()
+        by, bh = bar.root.winfo_y(), bar.root.winfo_height()
+        dlg = hb.SettingsDialog(bar)
+        dlg.top.update(); time.sleep(0.15); dlg.top.update()
+        fixed, heights = dlg._fixed_h, set()
+        for k in ("pos", "look", "items", "panel", "behav", "upd", "stat"):
+            dlg._show_page(k, animate=False)
+            dlg._place_off_bar()
+            dlg.top.update()
+            heights.add(dlg._scroll_cv.winfo_height())
+            y, ph = dlg.top.winfo_y(), dlg.top.winfo_height()
+            sh = dlg.top.winfo_screenheight()
+            overlap = not (y + ph <= by or y >= by + bh)
+            check("%s/%s：不遮挡、不出屏" % (desc, k),
+                  not overlap and 0 <= y and y + ph <= sh)
+        check("%s：七页面积统一" % desc, len(heights) == 1
+              and fixed is not None)
+        dlg.close(); kill(bar)
+    ENV["win"] = (100, 100, 900, 700)
+
+    # 2) 压暗即时生效（debounce 写盘 + 后台重注入），不点「应用」
+    wp = Path(tempfile.mkdtemp(prefix="wp_")) / "data"
+    wp.mkdir()
+    (wp / "config.json").write_text(json.dumps({
+        "port": 9222, "dim": 25, "blur": 0, "wallpaperVisible": True,
+        "monet": True, "fit": "cover", "wallpaperPath": "C:/demo.png"}),
+        encoding="utf-8")
+    real_dir, real_refresh, real_read = (hb._wp_dir, hb._wp_refresh,
+                                         hb._wp_read)
+    hb._wp_dir, hb._wp_refresh = lambda: wp, lambda port: True
+    hb._wp_read = lambda: json.loads((wp / "config.json").read_text(
+        encoding="utf-8"))
+    try:
+        bar = new_bar()
+        dlg = hb.SettingsDialog(bar)
+        dlg.top.update()
+        dlg._show_page("panel", animate=False)
+        dlg.top.update()
+        dlg.v_wp_dim.set(72)
+        for _ in range(80):
+            dlg.top.update(); time.sleep(0.015)
+            if "已重新注入" in dlg._wp_msg.cget("text"):
+                break
+        cfg = json.loads((wp / "config.json").read_text(encoding="utf-8"))
+        check("拖压暗滑块立即写盘（25 → 72）", cfg["dim"] == 72)
+        check("并自动重注入", "已重新注入" in dlg._wp_msg.cget("text"))
+        dlg.close(); kill(bar)
+    finally:
+        hb._wp_dir, hb._wp_refresh = real_dir, real_refresh
+        hb._wp_read = real_read
+
+
 GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
     "wallpaper": t_wallpaper, "attach": t_attach, "ctxwin": t_ctxwin,
+    "layout": t_layout,
 }
 
 
