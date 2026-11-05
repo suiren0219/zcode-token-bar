@@ -21,7 +21,7 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
 def load_config():
-    cfg = {"context_window": 128000, "poll_ms": 2000}
+    cfg = {"context_window": 128000, "poll_ms": 700}
     if CONFIG_PATH.exists():
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
@@ -122,17 +122,58 @@ def _scan_session_ids(con):
 
 
 def _latest_typed_sid(con):
-    """用户最后一次打字的会话（input_history 末行）。
+    """用户最后"说话"的会话。
 
-    「跟会话走」的真正信号是它，不是 model_usage.completed_at：
-    - 切到另一个会话发消息 → input_history 立刻指向它，条面马上跟上；
-      旧逻辑要等那个会话的请求完成才跟，期间显示的还是别的会话的数字。
-    - 新开一个会话 → 首条消息发出就跟上（此时它还没有任何 usage 行，
-      旧逻辑会一直显示上一个会话直到新会话第一次完成请求）。
-    - 后台会话 / 子代理完成请求 → 不会把条面拽走（用户正在打的会话优先）。
+    曾经用 input_history（打字历史）当信号，但实测跟错：input_history 只记
+    composer 的输入，而被 Agent 驱动、或用快捷发消息的会话不写这张表；同时
+    Agent 自己的 steered_input 会写进来，于是条面跟着 Agent 所在的会话跑，
+    而用户其实在另一个会话里看。实测现场：用户在看 1de8c135（上下文 17.9万，
+    与 ZCode 面板的 17.6万 吻合），条面却在跟 0dacd9e7。
 
-    只认未删除的会话；表空（全新安装）返回 None，调用方回退旧逻辑。
-    input_history 本身有界（~100 行），全扫 <0.1ms。"""
+    改成 message 表里**最后一条 role=user 的消息**——用户发消息必然产生它，
+    不管走 composer、快捷方式还是别的入口。代价是一次 14ms 的索引查询
+    （message_session_time_created_id_idx 覆盖），1.5s 一拍可忽略。
+
+    注意：ZCode 不记录"当前打开哪个会话"（那是渲染进程内存态，last-session
+    键只存远端 server 会话），所以多会话同时活跃时无法 100% 精确——这个信号
+    选的是"最后被人类说了话的会话"，比"最后有请求完成的"更贴近用户视角。
+
+    只认未删除、非子代理的会话；查不到返回 None，调用方回退旧逻辑。
+
+    性能：不能直接 `json_extract(data,'$.role')='user' order by time_created`
+    ——message 表没有全局时间索引，会 SCAN 全表（3.3 万行 190ms）。改成
+    两步：先 `group by session_id` 走 (session_id, sequence, time_created)
+    索引拿最近活跃的 6 个会话（~14ms），再对每个会话做索引点查「最新一条
+    的 role」（每个 <1ms，倒序扫到 user 即停）。整轮稳定 13–15ms，
+    1.5s 一拍的轮询里可忽略；也正是这个数字让更短的轮询成为可能。
+    """
+    cands = []
+    try:
+        cands = con.execute(
+            """select m.session_id, max(m.time_created) t from message m
+                 join session s on s.id = m.session_id
+                where s.time_deleted is null
+                  and (s.parent_id is null or s.parent_id = '')
+               group by m.session_id order by t desc limit 6""").fetchall()
+    except Exception:
+        cands = []
+    best_sid, best_t = None, -1
+    for r in cands:
+        sid = (r[0] if r else "") or ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", sid):
+            continue
+        try:
+            row = con.execute(
+                """select max(time_created) from message
+                   where session_id=? and json_extract(data,'$.role')='user'""",
+                (sid,)).fetchone()
+        except Exception:
+            continue
+        if row and row[0] and row[0] > best_t:
+            best_sid, best_t = sid, row[0]
+    if best_sid:
+        return best_sid
+    # message 表不可用（老库无 data 列 / json1 扩展缺失）时退回打字历史
     try:
         r = con.execute(
             """select h.session_id from input_history h
@@ -1364,6 +1405,7 @@ def serve():
         pass
     con = None
     last_use = 0.0
+    snap_cache = {}                     # key=(force,pin,sid) t=时间 payload=str
     while True:
         line = sys.stdin.readline()
         if not line:
@@ -1391,7 +1433,24 @@ def serve():
                 con = None
             if con is None:
                 con = connect()
-            out = json.dumps(_snapshot_with(con, force, pin))
+            # v73：快照短缓存。会话 id 探测只需 ~15ms（两步索引查询），
+            # 但全量快照要 ~300ms。轮询间隔短了之后，稳态下同一会话的
+            # 重复请求会占满 CPU——这里对 (force, pin, sid) 相同且
+            # 500ms 内的请求直接回上一次的结果，会话一变立刻重建。
+            sid_now = ""
+            try:
+                sid_now = _latest_typed_sid(con) or ""
+            except Exception:
+                sid_now = ""
+            key = (force, pin, sid_now)
+            now_t = time.time()
+            if (snap_cache.get("key") == key
+                    and now_t - snap_cache.get("t", 0) < 0.5
+                    and snap_cache.get("payload") is not None):
+                out = snap_cache["payload"]      # 命中缓存也要走到下面的写出
+            else:
+                out = json.dumps(_snapshot_with(con, force, pin))
+            snap_cache.update({"key": key, "t": now_t, "payload": out})
             last_use = time.time()
         except Exception as e:
             out = json.dumps({"error": str(e)[:200]})   # 单次查询失败不杀常驻进程

@@ -715,19 +715,20 @@ def t_follow():
           and d["session"]["requests"] == 0)
     check("这个窗口期显示生成中", d["session"]["active"] is True)
 
-    # input_history 指向已删除会话 → 忽略，回退到最近完成
+    # 会话被删 → 它的 user 消息也一并出局（join 排除），回到最近的 aaa
     mem.execute("update session set time_deleted=? where id=?",
                 (now, "sess_ccc"))
     mem.commit()
     d = zu._snapshot_with(mem)
-    check("已删除会话的打字记录被忽略",
+    check("已删除会话的用户消息被忽略",
           d["session"]["sid"] in ("sess_aaa", "sess_bbb"))
 
-    # input_history 空表 → 回退旧逻辑（最近完成 = B）
+    # message/input_history 全空 → 回退旧逻辑（最近完成 = B）
     mem.execute("delete from input_history")
+    mem.execute("delete from message")
     mem.commit()
     d = zu._snapshot_with(mem)
-    check("无打字记录回退最近完成", d["session"]["sid"] == "sess_bbb")
+    check("无用户消息回退最近完成", d["session"]["sid"] == "sess_bbb")
 
     # helper 自身的边界
     check("_latest_typed_sid 空表返回 None",
@@ -891,8 +892,8 @@ def t_ctxwin():
         status="completed", model_id="mystery-model", input_tokens=250500,
         computed_total_tokens=250500)
     mem.commit()
-    zu.lookup_context_window = lambda mid: None      # 目录查不到
     try:
+        zu.lookup_context_window = lambda mid: None   # 目录查不到
         d = zu._snapshot_with(mem)
         check("查不到的模型 + 用量 250.5K → 窗口推断 256K",
               d["context_window"] == 256000)
@@ -902,6 +903,7 @@ def t_ctxwin():
               d["session"]["ctx"] / d["context_window"] <= 1.0)
     finally:
         zu.lookup_context_window = real_lookup
+        zu._CTX_WINDOW_CACHE.clear()
         mem.close()
 
 

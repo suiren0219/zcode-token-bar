@@ -107,7 +107,7 @@ DEFAULTS = {
     "show": {"speed": True, "ctx": True, "turn": True,
              "session": True, "today": True, "tools": True, "cache": True},
     "labels": True,
-    "poll_ms": 1500,
+    "poll_ms": 700,
     "panel_opacity": 1.0,     # 设置面板自身透明度；1.0=不透明
     "auto_update": False,     # 启动时静默问一次 GitHub；只提示，绝不自动安装
     "pinned": False,          # 钉住：显示停在 pinned_sid，位置锁死
