@@ -1,0 +1,15 @@
+{
+  "name": "local",
+  "owner": "suiren0219",
+  "plugins": [
+    {
+      "name": "zcode-token-bar-control",
+      "description": "悬浮条控制面板：状态查看、一键重启。",
+      "version": "0.1.0",
+      "author": "suiren0219",
+      "license": "MIT",
+      "source": "./zcode-token-bar-control"
+    }
+  ],
+  "version": "0.1.0"
+}

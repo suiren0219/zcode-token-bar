@@ -1,0 +1,36 @@
+{
+  "name": "zcode-token-bar-control",
+  "version": "0.1.0",
+  "description": "悬浮条控制面板：状态查看、一键重启。装好后点右上角「切换面板」打开 Token Bar。",
+  "description_i18n": {
+    "en": "Token bar control panel: status and one-click restart.",
+    "zh-CN": "悬浮条控制面板：状态查看、一键重启。装好后点右上角「切换面板」打开 Token Bar。"
+  },
+  "author": {
+    "name": "suiren0219"
+  },
+  "license": "MIT",
+  "mcpServers": {
+    "bar": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${ZCODE_PLUGIN_ROOT}/dist/server.mjs"
+      ]
+    }
+  },
+  "ui": {
+    "surfaces": [
+      {
+        "id": "control",
+        "title": {
+          "en": "Token Bar",
+          "zh-CN": "Token Bar"
+        },
+        "server": "bar",
+        "resourceUri": "ui://zcode-token-bar-control/panel.html",
+        "availability": "session"
+      }
+    ]
+  }
+}

@@ -96,6 +96,34 @@ python autostart.py status  # 看当前状态
 
 ---
 
+## ZCode 内嵌控制面板（可选）
+
+条面本身是个独立进程，万一它没起来（自启失效、进程被系统清理），不必开终端——
+本仓库附带一个 **ZCode MCP App 插件** `zcode-plugin/`：装好后 ZCode 侧边栏多一个
+「Token Bar」面板，里面有实时状态（运行中 / 未运行 / 残留锁）和**一键启动/重启**按钮。
+
+装法（本地目录 marketplace，不需要联网）：
+
+```bash
+# 1. 把 zcode-plugin/ 复制成一个本地 marketplace
+mkdir -p ~/.zcode/local-marketplaces/zcode-token-bar-control
+cp -r zcode-plugin/.zcode-plugin zcode-plugin/dist ~/.zcode/local-marketplaces/zcode-token-bar-control/
+cp zcode-plugin/marketplace.example.json ~/.zcode/local-marketplaces/marketplace.json
+
+# 2. 注册（写 known_marketplaces.json 与 installed_plugins.json，
+#    并把插件复制到 cache/local/zcode-token-bar-control/0.1.0/）
+python hoverbar.py --install-plugin
+
+# 3. 重启 ZCode，点右上角「切换面板」→ Token Bar
+```
+
+面板走的是官方 MCP Apps SDK（页面内联在 `dist/panel.html`，单文件无外部请求），
+工具 `bar_status` / `bar_restart` 由 `dist/server.mjs` 提供——零依赖手写 JSON-RPC，
+只用 Node 内置模块。`bar_restart` 会清掉残留锁、用 `pythonw` 后台拉起
+`hoverbar.py --wait-zcode`，不弹控制台。
+
+---
+
 ## 条面各项
 
 | 项 | 显示内容 |
@@ -265,6 +293,7 @@ python hoverbar.py --update         # 拉取（工作区干净时才拉）
 | `autostart.py` | 开机自启管理（HKCU Run 项） |
 | `tests/test_bar.py` | 回归测试，11 组、约 150 项断言，零依赖 |
 | `hoverbar.json` | 运行期配置，首次运行自动生成，不入库 |
+| `zcode-plugin/` | ZCode 内嵌控制面板插件（MCP App）：状态 + 一键重启 |
 | `docs/USAGE.md` | 逐项说明、机制细节、排查 |
 
 ---

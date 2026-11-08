@@ -3494,13 +3494,31 @@ def wait_zcode() -> int:
 
 # ---------------------------------------------------------------- CLI
 def alive(pid: int) -> bool:
+    """PID 活着**且是我们自己的条面进程**。
+
+    以前只查 tasklist 里有没有这个 PID——Windows 会复用 PID，条面退出后
+    锁文件里残留的 3892 被别的进程拿到，--wait-zcode 启动时就误判成
+    "已经在跑"直接退出，条面永远起不来（用户报的"悬浮条没启动"）。
+    所以还要核对命令行里确实有 hoverbar.py。查不到命令行（权限/时序）
+    时退回旧的 PID 存在性判断。"""
     try:
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                              capture_output=True, text=True,
                              encoding="mbcs", errors="replace").stdout
-        return str(pid) in out
+        if str(pid) not in out:
+            return False
     except Exception:
-        return False
+        return True
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Process -Filter "
+             f"'ProcessId={pid}').CommandLine"],
+            capture_output=True, text=True, timeout=15,
+            encoding="utf-8", errors="replace").stdout or ""
+        return "hoverbar" in out.lower()
+    except Exception:
+        return True      # 命令行查不到就按旧的"活着"算，宁可保守
 
 
 def running_pid() -> int | None:
@@ -3547,11 +3565,89 @@ def once():
     return 0
 
 
+def install_plugin() -> int:
+    """把 zcode-plugin/ 装成本地 MCP App 插件（复制 + 写注册表）。"""
+    import datetime
+    import json
+    import shutil
+    home = os.path.expanduser("~")
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(here, "zcode-plugin")
+    if not os.path.isdir(src):
+        print("zcode-plugin/ 不存在，这个副本没有附带插件")
+        return 1
+    reg = os.path.join(home, ".zcode", "cli", "plugins")
+    lm = os.path.join(home, ".zcode", "local-marketplaces")
+    dst = os.path.join(lm, "zcode-token-bar-control")
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    os.makedirs(dst, exist_ok=True)
+    for name in (".zcode-plugin", "dist"):
+        shutil.copytree(os.path.join(src, name), os.path.join(dst, name))
+    example = os.path.join(src, "marketplace.example.json")
+    if os.path.isfile(example):
+        shutil.copy2(example, os.path.join(lm, "marketplace.json"))
+    cache_dir = os.path.join(reg, "cache", "local",
+                             "zcode-token-bar-control", "0.1.0")
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir)
+    shutil.copytree(dst, cache_dir)
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    now_iso = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    kmp = os.path.join(reg, "known_marketplaces.json")
+    try:
+        data = json.load(open(kmp, encoding="utf-8"))
+    except Exception:
+        data = {"version": 1, "marketplaces": []}
+    shutil.copy2(kmp, kmp + ".bak-" + stamp)
+    data["marketplaces"] = [m for m in data.get("marketplaces", [])
+                            if m.get("id") != "local"]
+    data["marketplaces"].append({
+        "id": "local",
+        "source": {"source": "directory", "path": lm},
+        "name": "local",
+        "description": "本机插件（本地目录）",
+        "addedAt": now_iso,
+        "pluginCount": 1,
+        "lastUpdated": now_iso,
+    })
+    open(kmp, "w", encoding="utf-8").write(
+        json.dumps(data, ensure_ascii=False, indent=2))
+
+    ip = os.path.join(reg, "installed_plugins.json")
+    try:
+        data = json.load(open(ip, encoding="utf-8"))
+    except Exception:
+        data = {"version": 1, "plugins": []}
+    shutil.copy2(ip, ip + ".bak-" + stamp)
+    data["plugins"] = [x for x in data.get("plugins", [])
+                       if x.get("id") != "zcode-token-bar-control@local"]
+    data["plugins"].append({
+        "id": "zcode-token-bar-control@local",
+        "name": "zcode-token-bar-control",
+        "marketplace": "local",
+        "version": "0.1.0",
+        "installPath": cache_dir,
+        "installedAt": now_iso,
+        "updatedAt": now_iso,
+        "scope": "user",
+        "source": "./zcode-token-bar-control",
+    })
+    open(ip, "w", encoding="utf-8").write(
+        json.dumps(data, ensure_ascii=False, indent=2))
+    print("插件已安装：重启 ZCode，点右上角「切换面板」→ Token Bar")
+    return 0
+
+
 def main(argv):
     global DEBUG
     DEBUG = "--debug" in argv
     if "--once" in argv:
         return once()
+    if "--install-plugin" in argv:
+        return install_plugin()
     if "--quit" in argv:
         if send("quit"):
             print("已通知退出")
