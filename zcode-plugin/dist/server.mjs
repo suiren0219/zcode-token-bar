@@ -76,7 +76,11 @@ async function startBar() {
     const hit = cands.find((c) => fs.existsSync(c));
     if (hit) py = hit;
   }
-  const child = spawn(py, [BAR, "--wait-zcode"], {
+  // 从 ZCode 面板点重启时 ZCode 必然开着，不需要 --wait-zcode 待命。
+  // 待命逻辑靠 zcode_hwnd() 枚举桌面窗口；MCP server 常驻在非交互会话里，
+  // 它 spawn 的条面继承同一 window station，枚举不到 ZCode 就会永久待命
+  // （进程活着、无窗口、无锁、IPC 不通）。直接起，立刻建窗口写锁。
+  const child = spawn(py, [BAR], {
     cwd: BAR_DIR, detached: true, stdio: "ignore",
     windowsHide: true,
   });

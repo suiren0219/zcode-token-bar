@@ -119,8 +119,11 @@ python hoverbar.py --install-plugin
 
 面板走的是官方 MCP Apps SDK（页面内联在 `dist/panel.html`，单文件无外部请求），
 工具 `bar_status` / `bar_restart` 由 `dist/server.mjs` 提供——零依赖手写 JSON-RPC，
-只用 Node 内置模块。`bar_restart` 会清掉残留锁、用 `pythonw` 后台拉起
-`hoverbar.py --wait-zcode`，不弹控制台。
+只用 Node 内置模块。`bar_restart` 会清掉残留锁、用 `pythonw` 后台直接拉起
+`hoverbar.py`（不弹控制台）。注意这里**不带** `--wait-zcode`：MCP server
+常驻在非交互会话里，spawn 出来的条面枚举不到桌面窗口会永久待命；
+开机自启那条路径才需要 `--wait-zcode`。状态工具在锁尚未写出的启动空窗期
+会按命令行找进程并标 `phase: "starting"`，不误报「未运行」。
 
 ---
 
