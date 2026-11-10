@@ -47,7 +47,6 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
-from tkinter import filedialog, messagebox
 
 HERE = Path(__file__).parent.resolve()
 ZUSAGE = HERE / "zusage.py"
@@ -2031,6 +2030,162 @@ def _wp_short(p: str) -> str:
     return Path(p).name if p else "（未设置）"
 
 
+WP_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+
+def _wp_image_files(folder: str) -> list[str]:
+    """列一个目录里的图片。只给自绘选择器用，不碰系统文件对话框。"""
+    try:
+        return sorted((n for n in os.listdir(folder)
+                       if n.lower().endswith(WP_EXTS)
+                       and os.path.isfile(os.path.join(folder, n))),
+                      key=str.lower)
+    except OSError:
+        return []
+
+
+class WallpaperPicker(tk.Toplevel):
+    """自绘壁纸选择器。
+
+    Windows 的原生文件对话框由 Explorer.EXE 承载，装了第三方 Shell 扩展
+    （WPS/夸克/PrivaZer…）时它会 0xc0000374 堆损坏顺带把调用方带走。
+    这里只读目录、画个列表，全程不借 Explorer，也不弹 messagebox。
+    """
+
+    def __init__(self, dlg):
+        super().__init__(dlg.top)
+        self.dlg = dlg
+        self.picked: str | None = None
+        self._hwnd = 0
+        self.title("选择壁纸")
+        self.configure(bg=EF_PAPER)
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+
+        hdr = tk.Frame(self, bg=EF_CMD)
+        hdr.pack(fill="x")
+        tk.Frame(hdr, bg=EF_RULE, height=1).pack(side="bottom", fill="x")
+        tk.Label(hdr, text="▌ 选择壁纸", bg=EF_CMD, fg=EF_INK,
+                 font=_ef_font(EF_MONO, 9, bold=True)).pack(
+                     side="left", padx=(14, 6), pady=9)
+        _EfButton(hdr, "×", self._cancel, width=26).pack(side="right", padx=6)
+
+        # 路径行：可编辑，直接粘路径也行（完全不需要弹对话框）
+        pr = tk.Frame(self, bg=EF_PAPER)
+        pr.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Label(pr, text="目录", bg=EF_PAPER, fg=EF_INK2,
+                 font=_ef_font(EF_UI, 8)).pack(side="left")
+        self.v_dir = tk.StringVar()
+        e = tk.Entry(pr, textvariable=self.v_dir, bg=EF_CHIP, fg=EF_INK,
+                     insertbackground=EF_INK, relief="flat", bd=0,
+                     font=_ef_font(EF_UI, 9), highlightthickness=1,
+                     highlightbackground=EF_RULE, highlightcolor=EF_RULE)
+        e.pack(side="left", fill="x", expand=True, padx=(8, 6), ipady=4)
+        e.bind("<Return>", lambda ev: self._load())
+        _EfButton(pr, "读取", self._load).pack(side="left")
+
+        body = tk.Frame(self, bg=EF_PAPER)
+        body.pack(fill="both", expand=True, padx=14, pady=(4, 2))
+        self._list = tk.Listbox(body, bg=EF_CHIP, fg=EF_INK,
+                                selectbackground=EF_SIGNAL,
+                                selectforeground=EF_ON_SIGNAL,
+                                relief="flat", bd=0, highlightthickness=1,
+                                highlightbackground=EF_RULE,
+                                font=_ef_font(EF_UI, 9),
+                                activestyle="none", height=12, width=42)
+        sb = tk.Scrollbar(body, bg=EF_PAPER, troughcolor=EF_PAPER,
+                          relief="flat", bd=0, width=8)
+        self._list.configure(yscrollcommand=sb.set)
+        sb.configure(command=self._list.yview)
+        sb.pack(side="right", fill="y")
+        self._list.pack(side="left", fill="both", expand=True)
+        self._list.bind("<Double-Button-1>", lambda e: self._confirm())
+        self._list.bind("<Return>", lambda e: self._confirm())
+
+        self._msg = tk.Label(self, text="", bg=EF_PAPER, fg=EF_INK2,
+                             font=_ef_font(EF_UI, 8), anchor="w")
+        self._msg.pack(fill="x", padx=14)
+
+        foot = tk.Frame(self, bg=EF_PAPER)
+        foot.pack(fill="x", padx=14, pady=(4, 12))
+        _EfButton(foot, "取消", self._cancel).pack(side="right")
+        _EfButton(foot, "用这张", self._confirm, primary=True).pack(
+            side="right", padx=(0, 8))
+
+        # 起始目录：当前壁纸所在目录，没有就退到桌面/家目录
+        cur = (dlg._wp or {}).get("wallpaperPath", "") or ""
+        start = os.path.dirname(cur) if os.path.isfile(cur) else ""
+        if not start or not os.path.isdir(start):
+            for d in (Path.home() / "Desktop", Path.home(),
+                      Path(os.environ.get("USERPROFILE", "")) / "Desktop"):
+                if d.is_dir():
+                    start = str(d)
+                    break
+        self.v_dir.set(start)
+        self._load()
+
+        # 摆在设置面板中间偏上，别跑到屏幕外
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        px, py = dlg.top.winfo_rootx(), dlg.top.winfo_rooty()
+        pw, ph = dlg.top.winfo_width(), dlg.top.winfo_height()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = min(max(8, px + (pw - w) // 2), max(8, sw - w - 8))
+        y = min(max(8, py + max(0, (ph - h) // 3)), max(8, sh - h - 8))
+        self.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        self._hwnd = register_own_window(self)   # 视线在浮层上别把条面藏了
+        self._list.focus_set()
+
+    def _load(self):
+        folder = self.v_dir.get().strip()
+        self._list.delete(0, "end")
+        if not os.path.isdir(folder):
+            self._msg.configure(text="目录不存在", fg=EF_DANGER)
+            return
+        files = _wp_image_files(folder)
+        for n in files:
+            self._list.insert("end", n)
+        self._msg.configure(
+            text="%d 张图片 · 双击或回车选中" % len(files), fg=EF_INK2)
+        if files:
+            self._list.selection_set(0)
+            self._list.activate(0)
+
+    def _confirm(self):
+        folder = self.v_dir.get().strip()
+        sel = self._list.curselection()
+        if not sel:
+            self._msg.configure(text="先选一张图片", fg=EF_DANGER)
+            return
+        name = self._list.get(sel[0])
+        full = os.path.join(folder, name).replace("\\", "/")
+        if not os.path.isfile(full):
+            self._msg.configure(text="文件不见了，点「读取」刷新", fg=EF_DANGER)
+            self._load()
+            return
+        self.picked = full
+        self._finish()
+
+    def _cancel(self):
+        self.picked = None
+        self._finish()
+
+    def _finish(self):
+        picked = self.picked
+        dlg = self.dlg
+        unregister_own_window(self._hwnd)
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        if picked:
+            dlg._wp_apply(picked)
+
+
 BEAUTIFY_CLI = [
     Path(os.environ.get("APPDATA", "")) / ".zcode/cli/plugins/cache/zcode-beautify",
     Path.home() / ".zcode/cli/plugins/cache/zcode-beautify",
@@ -2503,9 +2658,9 @@ class SettingsDialog:
             for v in (self.v_wp_vis, self.v_wp_dim, self.v_wp_blur):
                 v.trace_add("write", lambda *_: self._wp_changed())
 
-            r_pick = self._row(p, "换壁纸", "jpg / png，选完立刻生效")
+            r_pick = self._row(p, "换壁纸", "从目录里挑，选完立刻生效")
 
-            _EfButton(r_pick, "选择图片…", self._pick_wallpaper).pack(side="left")
+            _EfButton(r_pick, "从目录里挑…", self._open_wallpaper_picker).pack(side="left")
 
             cur = tk.Label(r_pick, text=_wp_short(self._wp.get("wallpaperPath", "")),
 
@@ -2525,7 +2680,7 @@ class SettingsDialog:
                                     font=_ef_font(EF_UI, 8))
             self._wp_msg.pack(anchor="w", pady=(2, 4))
 
-            self._note(p, "壁纸由 zcode-beautify 插件接管，这里改的是同一份配置。")
+            self._note(p, "壁纸由 zcode-beautify 插件接管；这里用自绘目录选择，不弹系统文件对话框。")
 
         else:
 
@@ -2980,29 +3135,62 @@ class SettingsDialog:
         except (tk.TclError, ValueError):
             pass
 
-    def _pick_wallpaper(self):
-        """选一张图交给 zcode-beautify，写完立刻让它重注入，不用重启客户端。"""
-        from tkinter import filedialog
-        p = filedialog.askopenfilename(
-            parent=self.top, title="选择壁纸",
-            filetypes=[("图片", "*.jpg *.jpeg *.png *.webp *.bmp"),
-                       ("全部文件", "*.*")])
-        if not p:
-            return
+    def _open_wallpaper_picker(self):
+        """打开自绘选择器。不碰 Windows 原生文件对话框——它的宿主
+        Explorer.EXE 在第三方 Shell 扩展下会堆损坏（0xc0000374），
+        把整个调用链一起带走。"""
+        if getattr(self, "_wp_picker", None) is not None:
+            try:
+                if self._wp_picker.winfo_exists():
+                    self._wp_picker.lift()
+                    return
+            except tk.TclError:
+                pass
+        try:
+            self._wp_picker = WallpaperPicker(self)
+        except Exception as e:
+            log("打开壁纸选择器失败", e)
+            self._wp_picker = None
+            msg = getattr(self, "_wp_msg", None)
+            if msg is not None:
+                self._say(msg, "选择器打不开：%s" % e, EF_DANGER)
+
+    def _wp_apply(self, p: str):
+        """把选好的图写进 beautify 配置并后台重注入。
+
+        全程只改我们自己面板上的状态行，不弹 messagebox——消息框也走
+        系统窗口，没必要再借一次 Explorer。"""
+        self._wp_picker = None
         if not _wp_write({"wallpaperPath": p, "wallpaperVisible": True}):
-            messagebox.showerror("保存失败", "写不进 zcode-beautify 的配置目录。",
-                                 parent=self.top)
+            msg = getattr(self, "_wp_msg", None)
+            if msg is not None:
+                self._say(msg, "写不进插件配置，壁纸没换。", EF_DANGER)
             return
         try:
             self._wp_label.configure(text=_wp_short(p))
         except tk.TclError:
             pass
         self._wp = _wp_read() or self._wp
-        if not _wp_refresh(self._wp.get("port")):
-            messagebox.showwarning(
-                "已保存，但没能立刻生效",
-                "壁纸路径已写入配置。要让 ZCode 立刻换图，重启一次客户端，"
-                "或在插件设置里再点一次应用。", parent=self.top)
+        msg = getattr(self, "_wp_msg", None)
+        if msg is not None:
+            self._say(msg, "已保存，正在注入…")
+        port = self._wp.get("port")
+
+        def work():
+            ok = _wp_refresh(port)
+            self._upd_q.put((self._wp_apply_done, (ok,)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _wp_apply_done(self, ok: bool):
+        msg = getattr(self, "_wp_msg", None)
+        if msg is None:
+            return
+        if ok:
+            self._say(msg, "已重新注入，壁纸生效。", OK)
+        else:
+            self._say(msg, "注入失败：CDP 端口没开？点「立即刷新」再试。",
+                      EF_DANGER)
 
     # -- 状态 / 自启 --
     def _st_autostart_on(self) -> bool:

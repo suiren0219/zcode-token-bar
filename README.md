@@ -124,6 +124,21 @@ python hoverbar.py --install-plugin
 
 ---
 
+## 关于「打开文件夹闪退」
+
+ZCode 自带的「打开文件夹」（工作区选择）走 Electron 原生文件对话框，宿主是
+Windows 的 `Explorer.EXE`。装了第三方 Shell 扩展（WPS / 夸克 / PrivaZer /
+NVIDIA 右键菜单等）时，Explorer 会 `0xc0000374` 堆损坏——这个崩溃属于系统，
+ZCode 和悬浮条都没崩，但点按钮的那一下会被带走。这是 Windows 层面的问题，
+不是本仓库能修的；要根治得逐个禁用可疑的 Shell 扩展。
+
+**悬浮条这边已经绕开**：壁纸页的「从目录里挑…」用自绘目录列表（纯 tkinter），
+不调用 `filedialog`、不弹 `messagebox`，也不借 Explorer。可编辑目录框 + 图片
+列表，双击或回车选中，写完配置后台重注入。测试组 `picker` 会盯着这件事——
+谁要是改回系统对话框，用例立刻失败。
+
+---
+
 ## 条面各项
 
 | 项 | 显示内容 |

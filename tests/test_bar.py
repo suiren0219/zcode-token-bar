@@ -860,6 +860,10 @@ def t_ctxwin():
         zu._CTX_WINDOW_CACHE.clear()
 
     # 端到端：目录查不到的模型，用量超过窗口 → 推断 + 标记
+    # _AGG_CACHE 是模块级 2s 缓存，前面的组可能用别的库填过 "scan"；
+    # 不清的话 latest_sid 会指向上一条库的会话，ctx=0，用例偶发失败。
+    zu._AGG_CACHE.clear()
+    zu._TASK_CACHE.clear()
     real_lookup = zu.lookup_context_window
     import sqlite3
     real = sqlite3.connect(
@@ -893,6 +897,7 @@ def t_ctxwin():
         computed_total_tokens=250500)
     mem.commit()
     try:
+        zu._CTX_WINDOW_CACHE.clear()
         zu.lookup_context_window = lambda mid: None   # 目录查不到
         d = zu._snapshot_with(mem)
         check("查不到的模型 + 用量 250.5K → 窗口推断 256K",
@@ -904,6 +909,7 @@ def t_ctxwin():
     finally:
         zu.lookup_context_window = real_lookup
         zu._CTX_WINDOW_CACHE.clear()
+        zu._AGG_CACHE.clear()
         mem.close()
 
 
@@ -1011,12 +1017,122 @@ def t_layout():
         hb._wp_read = real_read
 
 
+
+def t_picker():
+    """壁纸选择器：不弹系统文件对话框、列目录、选图、写配置、后台注入。"""
+    import tkinter as tk
+    bar = new_bar()
+    real_read = hb._wp_read
+    real_write = hb._wp_write
+    real_refresh = hb._wp_refresh
+
+    folder = TMP / "wp_pics"
+    folder.mkdir(exist_ok=True)
+    for n in ("b_wall.png", "a_wall.jpg", "note.txt", "c_wall.webp", "d_wall.bmp"):
+        (folder / n).write_text("x", encoding="utf-8")
+
+    wrote = []
+    hb._wp_read = lambda: {
+        "wallpaperPath": str(folder / "b_wall.png").replace("\\", "/"),
+        "wallpaperVisible": True, "dim": 25, "blur": 0, "monet": True,
+        "port": 9222}
+    hb._wp_write = lambda patch: (wrote.append(patch), True)[1]
+    hb._wp_refresh = lambda port: True
+
+    # 关键断言：真要是有人偷偷改回 filedialog/messagebox，立刻抓出来
+    called = []
+    class _Boom:
+        def __getattr__(self, name):
+            def boom(*a, **k):
+                called.append(name)
+                raise AssertionError("碰了系统对话框: " + name)
+            return boom
+    real_filedialog = getattr(hb.tk, "filedialog", None)
+    real_messagebox = getattr(hb.tk, "messagebox", None)
+    hb.tk.filedialog = _Boom()
+    hb.tk.messagebox = _Boom()
+
+    try:
+        dlg = hb.SettingsDialog(bar)
+        dlg.top.update()
+        dlg._show_page("panel", animate=False)
+        dlg.top.update()
+        check("壁纸页不再有「选择图片」按钮",
+              not any(getattr(w, "text", "") == "选择图片…"
+                      for w in _all_widgets(dlg.top)
+                      if isinstance(w, hb._EfButton)))
+
+        dlg._open_wallpaper_picker()
+        dlg.top.update()
+        pk = dlg._wp_picker
+        check("选择器是 Toplevel 且已弹出", isinstance(pk, tk.Toplevel)
+              and bool(pk.winfo_ismapped()))
+        check("起始目录 = 当前壁纸所在目录",
+              pk.v_dir.get().replace("\\", "/").lower()
+              == str(folder).replace("\\", "/").lower())
+        names = list(pk._list.get(0, "end"))
+        check("只列图片且按名字排序",
+              names == ["a_wall.jpg", "b_wall.png", "c_wall.webp", "d_wall.bmp"])
+        check("没有碰系统对话框", not called)
+
+        # 选第三张并确认
+        pk._list.selection_clear(0, "end")
+        pk._list.selection_set(2)
+        pk._confirm()
+        dlg.top.update()
+        want = str(folder / "c_wall.webp").replace("\\", "/")
+        check("选中路径写进配置",
+              bool(wrote) and wrote[-1]["wallpaperPath"].lower() == want.lower()
+              and wrote[-1]["wallpaperVisible"] is True)
+        check("选择器已关闭", not pk.winfo_exists())
+
+        # 后台注入结果回主线程
+        for _ in range(50):
+            dlg.top.update()
+            time.sleep(0.02)
+            if "已重新注入" in dlg._wp_msg.cget("text"):
+                break
+        check("注入结果回显在状态行",
+              "已重新注入" in dlg._wp_msg.cget("text"))
+
+        # 目录不存在时给提示，不崩
+        dlg._open_wallpaper_picker()
+        dlg.top.update()
+        pk2 = dlg._wp_picker
+        pk2.v_dir.set(str(TMP / "no_such_dir"))
+        pk2._load()
+        dlg.top.update()
+        check("目录不存在有提示且不崩",
+              "目录不存在" in pk2._msg.cget("text"))
+        pk2._cancel()
+        dlg.top.update()
+        dlg.close()
+    finally:
+        hb._wp_read, hb._wp_write, hb._wp_refresh = real_read, real_write, real_refresh
+        hb.tk.filedialog = real_filedialog
+        hb.tk.messagebox = real_messagebox
+        kill(bar)
+
+
+def _all_widgets(w):
+    """递归列出子控件，给按钮文字断言用。"""
+    out = []
+    try:
+        kids = w.winfo_children()
+    except Exception:
+        return out
+    for k in kids:
+        out.append(k)
+        out.extend(_all_widgets(k))
+    return out
+
+
 GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
     "wallpaper": t_wallpaper, "attach": t_attach, "ctxwin": t_ctxwin,
-    "layout": t_layout,
+    "layout": t_layout, "picker": t_picker,
 }
 
 
