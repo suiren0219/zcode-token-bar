@@ -556,11 +556,117 @@ class HoverBar:
         self.src.start()
 
         self._start_ipc()
+        # 条面本身就是拖放目标：图片往条上一丢就换壁纸，不用点开任何菜单。
+        # DragAcceptFiles 认顶层 HWND，此时 root 还没映射但句柄已存在。
+        self._drop_ok = False
+        self.root.after(120, self._install_bar_drop)
         self.root.after(60, self._tick_data)
         self.root.after(80, self._tick_anchor)
         # 启动 5 秒后才问，避开开机那一阵的网络拥塞；没勾自动检查就什么都不做
         if self.cfg.get("auto_update"):
             self.root.after(5000, self._upd_silent)
+
+    # -- 拖放换壁纸 --
+    def _drop_toast_howto(self):
+        self._drop_toast("图片直接拖到条面上就能换壁纸（jpg / png / webp / bmp）",
+                         EF_INK)
+
+    def _install_bar_drop(self):
+        """注册条面拖放。只看句柄在不在，不看映射——条面可能因为
+        hide_when_inactive 暂时 withdraw，那时 HWND 还在，DragAcceptFiles
+        照样能挂；等窗口重新映射时拖放就能用，不需要等下一次安装。"""
+        try:
+            if not getattr(self, "_drop_ok", False):
+                self._drop_ok = _drop_install(self.root, self._on_bar_files)
+        except Exception as e:
+            log("条面安装拖放失败", e)
+
+    def _on_bar_files(self, files: list[str]):
+        """图片拖到条面上 → 直接换壁纸。多文件只取第一张图片。"""
+        for f in files:
+            p = f.replace("\\", "/")
+            if not p.lower().endswith(WP_EXTS) or not os.path.isfile(p):
+                continue
+            ok, detail = _wp_pick_file(p)
+            if not ok:
+                self._drop_toast(detail, EF_DANGER)
+                return
+            p = detail
+            if not _wp_write({"wallpaperPath": p, "wallpaperVisible": True}):
+                self._drop_toast("写不进插件配置，壁纸没换。", EF_DANGER)
+                return
+            self._drop_toast("壁纸换成 %s，正在注入…" % _wp_short(p), OK)
+            port = (_wp_read() or {}).get("port")
+
+            def work(pp=port):
+                good = _wp_refresh(pp)
+                self._upd_q.put((self._drop_done, (good, _wp_short(p))))
+
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._drop_toast("拖进来的不是图片（jpg / png / webp / bmp）",
+                         EF_DANGER)
+
+    def _drop_done(self, good: bool, name: str):
+        # HoverBar 没有设置面板那条 200ms 泵，这里直接在主线程回调里改 UI
+        if good:
+            self._drop_toast("壁纸已生效：%s" % name, OK)
+        else:
+            self._drop_toast("注入失败：CDP 端口没开？点「立即刷新」再试",
+                             EF_DANGER)
+
+    def _drop_toast(self, text: str, color: str):
+        """条面上方一行短提示，2.6 秒自己收。不弹系统消息框。"""
+        t = getattr(self, "_drop_tip", None)
+        if t is None or not t.winfo_exists():
+            t = tk.Toplevel(self.root)
+            t.overrideredirect(True)
+            try:
+                t.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            t.configure(bg=BORDER)
+            inner = tk.Frame(t, bg=BG)
+            inner.pack(fill="both", expand=True, padx=1, pady=1)
+            tk.Frame(inner, bg=EF_SIGNAL, height=2).pack(fill="x")
+            lbl = tk.Label(inner, text=text, bg=BG, fg=color,
+                           font=_ef_font(EF_UI, 9), padx=12, pady=7)
+            lbl.pack()
+            self._drop_tip = t
+            self._drop_lbl = lbl
+            register_own_window(t)
+        else:
+            try:
+                self._drop_lbl.configure(text=text, fg=color)
+            except tk.TclError:
+                return
+        try:
+            t.update_idletasks()
+            w, h = t.winfo_reqwidth(), t.winfo_reqheight()
+            bx, by = self.root.winfo_rootx(), self.root.winfo_rooty()
+            bw = self.root.winfo_width()
+            sw, sh = t.winfo_screenwidth(), t.winfo_screenheight()
+            x = min(max(8, bx + (bw - w) // 2), max(8, sw - w - 8))
+            y = by - h - 6 if by - h - 6 >= 8 else by + self.root.winfo_height() + 6
+            t.geometry("%dx%d+%d+%d" % (w, h, x, min(y, max(8, sh - h - 8))))
+            t.deiconify()
+        except tk.TclError:
+            return
+        job = getattr(self, "_drop_job", None)
+        if job:
+            try:
+                t.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+        self._drop_job = t.after(2600, self._drop_toast_hide)
+
+    def _drop_toast_hide(self):
+        t = getattr(self, "_drop_tip", None)
+        if t is not None and t.winfo_exists():
+            unregister_own_window(t)
+            t.destroy()
+        self._drop_tip = None
+        self._drop_job = None
 
     # -- 启动时静默检查更新 --
     def _upd_silent(self):
@@ -581,13 +687,24 @@ class HoverBar:
         threading.Thread(target=work, daemon=True).start()
 
     def _upd_drain(self):
-        """把后台检查的结果收进主线程。数据轮询同一个节拍上顺便做，
-        不另起定时器。"""
+        """把后台结果收进主线程。数据轮询同一个节拍上顺便做，不另起定时器。
+
+        队列里两种东西：版本检查的 (remote, local) 字符串对，和拖放换壁纸
+        的 (回调, 参数元组)。后者要真的调回去，不能当成版本比较。"""
+        import queue as _q
         while True:
             try:
-                remote, local = self._upd_q.get_nowait()
-            except queue.Empty:
+                item = self._upd_q.get_nowait()
+            except _q.Empty:
                 return
+            if callable(item[0]):
+                fn, args = item
+                try:
+                    fn(*args)
+                except Exception as e:
+                    log("后台回调失败", e)
+                continue
+            remote, local = item
             self._upd_new = bool(remote) and remote != local
             if self._upd_new:
                 self._upd_ver = "%s → %s" % (local, remote)
@@ -1600,6 +1717,8 @@ class HoverBar:
         m.add_command(label="解除钉住" if self.cfg["pinned"] else "钉住当前",
                       command=self._toggle_pin)
         m.add_command(label="设置…", command=self.open_settings)
+        m.add_command(label="把图片拖到条上可直接换壁纸",
+                      command=self._drop_toast_howto)
         m.add_command(label="重置位置", command=self._reset_pos)
         if getattr(self, "_upd_new", False):
             m.add_separator()
@@ -1721,6 +1840,8 @@ class HoverBar:
         self._draw()
 
     def quit(self):
+        _drop_uninstall(self.root)
+        self._drop_toast_hide()
         try:
             self.src.stop()
             LOCK.unlink()
@@ -2030,6 +2151,18 @@ def _wp_short(p: str) -> str:
     return Path(p).name if p else "（未设置）"
 
 
+def _wp_pick_file(path: str) -> tuple[bool, str]:
+    """校验一张壁纸。返回 (通过, 归一化路径 或 错误说明)。
+
+    只做判定**不写盘**：条面直接拖放和面板选择器共用这份规则，但各自
+    有各自的写盘/刷新流程，合在一起会写两次。不弹系统消息框（消息框
+    也借 Explorer）。"""
+    p = (path or "").strip().strip('"').replace("\\", "/")
+    if not p.lower().endswith(WP_EXTS) or not os.path.isfile(p):
+        return False, "不是图片或文件不存在：%s" % Path(p).name
+    return True, p
+
+
 # ---------------------------------------------------------------- 文件拖拽（WM_DROPFILES）
 # Tk 8.6 不带 tkdnd，也不想为一张图装第三方包。Windows 自己的
 # DragAcceptFiles + WM_DROPFILES 就够了：把顶层窗口注册成拖放目标，
@@ -2264,15 +2397,16 @@ class WallpaperPicker(tk.Toplevel):
 
     def _use_path(self, raw: str):
         """拖进来的文件 / 粘进来的路径，统一走这里。"""
-        p = (raw or "").strip().strip('"').replace("\\", "/")
-        if not p:
+        if not (raw or "").strip():
             self._msg.configure(text="先给个文件路径", fg=EF_DANGER)
             return
-        if not p.lower().endswith(WP_EXTS) or not os.path.isfile(p):
-            self._msg.configure(text="不是图片或文件不存在：%s" % _wp_short(p),
-                                fg=EF_DANGER)
+        ok, detail = _wp_pick_file(raw)
+        if not ok:
+            self._msg.configure(text=detail, fg=EF_DANGER)
             return
-        self.picked = p
+        # 校验通过但写盘交给 dlg._wp_apply 统一做（还要更新标签、起后台注入），
+        # 这里只把归一化路径传下去。
+        self.picked = detail
         self._finish()
 
     def _on_files(self, files: list[str]):

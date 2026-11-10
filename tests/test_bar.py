@@ -1157,12 +1157,81 @@ def _all_widgets(w):
     return out
 
 
+
+def t_bardrop():
+    """条面本身就是拖放目标：图片一丢就换壁纸，零点击。"""
+    bar = new_bar()
+    real_read = hb._wp_read
+    real_write = hb._wp_write
+    real_refresh = hb._wp_refresh
+    folder = TMP / "bar_drop"
+    folder.mkdir(exist_ok=True)
+    pic = folder / "sky.png"
+    pic.write_text("x", encoding="utf-8")
+    (folder / "readme.txt").write_text("x", encoding="utf-8")
+
+    wrote = []
+    hb._wp_read = lambda: {"wallpaperPath": str(pic).replace("\\", "/"),
+                           "wallpaperVisible": True, "port": 9222}
+    hb._wp_write = lambda patch: (wrote.append(patch), True)[1]
+    hb._wp_refresh = lambda port: True
+    try:
+        # 校验函数：只判定不写盘
+        ok, norm = hb._wp_pick_file('"%s"' % str(pic).replace("/", "\\"))
+        check("校验返回归一化路径且不写盘",
+              ok and norm.lower() == str(pic).replace("\\", "/").lower()
+              and not wrote)
+        bad, why = hb._wp_pick_file(str(folder / "readme.txt"))
+        check("非图片被拒", not bad and "不是图片" in why)
+
+        # 直接调拖放回调（等价于 WM_DROPFILES 派发回主线程）
+        bar._on_bar_files([str(pic).replace("\\", "/")])
+        check("拖到条面直接写配置",
+              bool(wrote) and wrote[-1]["wallpaperPath"].lower()
+              == str(pic).replace("\\", "/").lower())
+        check("立即给出绿色提示",
+              bar._drop_lbl.cget("text").startswith("壁纸换成")
+              and str(bar._drop_lbl.cget("fg")) == hb.OK)
+        check("提示浮层已登记为自家窗口",
+              bool(bar._drop_tip.winfo_ismapped()))
+
+        # 后台注入结果走 _upd_drain（可调用对象分支）
+        for _ in range(60):
+            bar.root.update()
+            time.sleep(0.02)
+            if "已生效" in bar._drop_lbl.cget("text"):
+                break
+        check("注入结果回主线程显示",
+              "已生效" in bar._drop_lbl.cget("text"))
+
+        # 非图片：提示，不写盘
+        wrote.clear()
+        bar._on_bar_files([str(folder / "readme.txt")])
+        check("拖非图片提示且不写盘",
+              "不是图片" in bar._drop_lbl.cget("text") and not wrote)
+
+        # 版本检查的二元组仍照常工作（别被新分支吃掉）
+        bar._upd_q.put(("v2.0", "v1.0"))
+        bar._upd_drain()
+        check("版本二元组仍走旧分支", bar._upd_new is True)
+
+        # 收提示 + 卸载
+        bar._drop_toast_hide()
+        check("提示可收起", getattr(bar, "_drop_tip", None) is None)
+        hb._drop_uninstall(bar.root)
+        check("条面拖放可卸载",
+              getattr(bar.root, "_drop_state", None) is None)
+    finally:
+        hb._wp_read, hb._wp_write, hb._wp_refresh = real_read, real_write, real_refresh
+        kill(bar)
+
+
 GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
     "wallpaper": t_wallpaper, "attach": t_attach, "ctxwin": t_ctxwin,
-    "layout": t_layout, "picker": t_picker,
+    "layout": t_layout, "picker": t_picker, "bardrop": t_bardrop,
 }
 
 
