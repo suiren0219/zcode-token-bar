@@ -2030,6 +2030,92 @@ def _wp_short(p: str) -> str:
     return Path(p).name if p else "（未设置）"
 
 
+# ---------------------------------------------------------------- 文件拖拽（WM_DROPFILES）
+# Tk 8.6 不带 tkdnd，也不想为一张图装第三方包。Windows 自己的
+# DragAcceptFiles + WM_DROPFILES 就够了：把顶层窗口注册成拖放目标，
+# 系统拖进来时给一条 HDROP，用 DragQueryFile/DragFinish 读出路径。
+# 全程不借 Explorer 的文件对话框，也就绕开了那个 0xc0000374 堆损坏。
+_WM_DROPFILES = 0x0233
+_GWL_WNDPROC = -4
+
+
+def _drop_install(win, on_files) -> bool:
+    """给一个 Tk 顶层窗口装拖放接收。成功返回 True，失败静默返回 False
+    （拖拽是加法，装不上还得能照常用目录列表）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        sh = ctypes.WinDLL("shell32", use_last_error=True)
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND,
+                                     ctypes.c_uint, wintypes.WPARAM,
+                                     wintypes.LPARAM)
+        u32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        u32.GetAncestor.restype = wintypes.HWND
+        u32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, WNDPROC]
+        u32.SetWindowLongPtrW.restype = WNDPROC
+        u32.CallWindowProcW.argtypes = [WNDPROC, wintypes.HWND, ctypes.c_uint,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        u32.CallWindowProcW.restype = ctypes.c_ssize_t
+        sh.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        sh.DragQueryFileW.argtypes = [wintypes.HANDLE, ctypes.c_uint,
+                                      wintypes.LPWSTR, ctypes.c_uint]
+        sh.DragQueryFileW.restype = ctypes.c_uint
+        sh.DragFinish.argtypes = [wintypes.HANDLE]
+
+        hwnd = u32.GetAncestor(win.winfo_id(), 2)   # GA_ROOT
+        if not hwnd:
+            return False
+
+        def _read_drop(hdrop):
+            n = sh.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+            out = []
+            for i in range(min(n, 32)):
+                size = sh.DragQueryFileW(hdrop, i, None, 0)
+                buf = ctypes.create_unicode_buffer(size + 1)
+                sh.DragQueryFileW(hdrop, i, buf, size + 1)
+                if buf.value:
+                    out.append(buf.value)
+            sh.DragFinish(hdrop)
+            return out
+
+        @WNDPROC
+        def proc(h, msg, wp, lp):
+            if msg == _WM_DROPFILES:
+                # 回调必须保持对 WNDPROC 对象的引用，别让 GC 收走
+                try:
+                    files = _read_drop(wp)
+                    if files:
+                        win.after(0, lambda f=files: on_files(f))
+                except Exception as e:
+                    log("读取拖放文件失败", e)
+                return 0
+            return u32.CallWindowProcW(old, h, msg, wp, lp)
+
+        old = u32.SetWindowLongPtrW(hwnd, _GWL_WNDPROC, proc)
+        if not old:
+            return False
+        sh.DragAcceptFiles(hwnd, True)
+        win._drop_state = (hwnd, old, proc, u32, sh)   # 防 GC + 恢复用
+        return True
+    except Exception as e:
+        log("安装拖放失败", e)
+        return False
+
+
+def _drop_uninstall(win):
+    st = getattr(win, "_drop_state", None)
+    if not st:
+        return
+    hwnd, old, proc, u32, sh = st
+    try:
+        sh.DragAcceptFiles(hwnd, False)
+        u32.SetWindowLongPtrW(hwnd, _GWL_WNDPROC, old)
+    except Exception:
+        pass
+    win._drop_state = None
+
+
 WP_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
 
@@ -2049,7 +2135,8 @@ class WallpaperPicker(tk.Toplevel):
 
     Windows 的原生文件对话框由 Explorer.EXE 承载，装了第三方 Shell 扩展
     （WPS/夸克/PrivaZer…）时它会 0xc0000374 堆损坏顺带把调用方带走。
-    这里只读目录、画个列表，全程不借 Explorer，也不弹 messagebox。
+    这里只读目录、画个列表，还接 Win32 WM_DROPFILES 直接拖文件进来；
+    全程不借 Explorer 的文件对话框，也不弹 messagebox。
     """
 
     def __init__(self, dlg):
@@ -2086,6 +2173,37 @@ class WallpaperPicker(tk.Toplevel):
         e.pack(side="left", fill="x", expand=True, padx=(8, 6), ipady=4)
         e.bind("<Return>", lambda ev: self._load())
         _EfButton(pr, "读取", self._load).pack(side="left")
+
+        # 拖拽落区：把图片从资源管理器直接拖到这条上就能用。
+        # 窗口级接收（DragAcceptFiles 认的是顶层 HWND），所以落区本身只是提示。
+        self._dropzone = tk.Frame(self, bg=EF_PANEL, height=46,
+                                  highlightthickness=1,
+                                  highlightbackground=EF_RULE,
+                                  highlightcolor=EF_RULE)
+        self._dropzone.pack(fill="x", padx=14, pady=(8, 2))
+        self._dropzone.pack_propagate(False)
+        self._drop_lbl = tk.Label(
+            self._dropzone, bg=EF_PANEL, fg=EF_INK2,
+            text="把图片拖到这里  ·  或粘贴完整路径后回车",
+            font=_ef_font(EF_UI, 9))
+        self._drop_lbl.pack(expand=True)
+        for w in (self._dropzone, self._drop_lbl):
+            w.bind("<Button-1>", lambda e: self._drop_lbl.focus_set())
+
+        # 单文件路径：粘一行绝对路径按回车，等于拖进来
+        fr = tk.Frame(self, bg=EF_PAPER)
+        fr.pack(fill="x", padx=14, pady=(2, 4))
+        tk.Label(fr, text="文件", bg=EF_PAPER, fg=EF_INK2,
+                 font=_ef_font(EF_UI, 8)).pack(side="left")
+        self.v_file = tk.StringVar()
+        fe = tk.Entry(fr, textvariable=self.v_file, bg=EF_CHIP, fg=EF_INK,
+                      insertbackground=EF_INK, relief="flat", bd=0,
+                      font=_ef_font(EF_UI, 9), highlightthickness=1,
+                      highlightbackground=EF_RULE, highlightcolor=EF_RULE)
+        fe.pack(side="left", fill="x", expand=True, padx=(8, 6), ipady=4)
+        fe.bind("<Return>", lambda ev: self._use_path(self.v_file.get()))
+        _EfButton(fr, "用这个", lambda: self._use_path(
+            self.v_file.get())).pack(side="left")
 
         body = tk.Frame(self, bg=EF_PAPER)
         body.pack(fill="both", expand=True, padx=14, pady=(4, 2))
@@ -2137,7 +2255,38 @@ class WallpaperPicker(tk.Toplevel):
         y = min(max(8, py + max(0, (ph - h) // 3)), max(8, sh - h - 8))
         self.geometry("%dx%d+%d+%d" % (w, h, x, y))
         self._hwnd = register_own_window(self)   # 视线在浮层上别把条面藏了
+        self._drop_ok = _drop_install(self, self._on_files)
+        if self._drop_ok:
+            self._drop_lbl.configure(
+                text="把图片拖到这里  ·  或粘贴完整路径后回车",
+                fg=EF_INK)
         self._list.focus_set()
+
+    def _use_path(self, raw: str):
+        """拖进来的文件 / 粘进来的路径，统一走这里。"""
+        p = (raw or "").strip().strip('"').replace("\\", "/")
+        if not p:
+            self._msg.configure(text="先给个文件路径", fg=EF_DANGER)
+            return
+        if not p.lower().endswith(WP_EXTS) or not os.path.isfile(p):
+            self._msg.configure(text="不是图片或文件不存在：%s" % _wp_short(p),
+                                fg=EF_DANGER)
+            return
+        self.picked = p
+        self._finish()
+
+    def _on_files(self, files: list[str]):
+        """拖放回调（已在主线程）。多文件只取第一张图片。"""
+        for f in files:
+            p = f.replace("\\", "/")
+            if p.lower().endswith(WP_EXTS) and os.path.isfile(p):
+                self.v_file.set(p)
+                self._drop_lbl.configure(text="已接到：%s" % _wp_short(p),
+                                         fg=OK)
+                self._use_path(p)
+                return
+        self._drop_lbl.configure(text="拖进来的不是图片", fg=EF_DANGER)
+        self._msg.configure(text="只收 jpg / png / webp / bmp", fg=EF_DANGER)
 
     def _load(self):
         folder = self.v_dir.get().strip()
@@ -2174,9 +2323,14 @@ class WallpaperPicker(tk.Toplevel):
         self._finish()
 
     def _finish(self):
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
         picked = self.picked
         dlg = self.dlg
+        dlg._wp_picker = None       # 让下次点按钮能重新打开
         unregister_own_window(self._hwnd)
+        _drop_uninstall(self)
         try:
             self.grab_release()
         except tk.TclError:

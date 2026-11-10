@@ -1106,7 +1106,37 @@ def t_picker():
               "目录不存在" in pk2._msg.cget("text"))
         pk2._cancel()
         dlg.top.update()
+        # --- 拖放：模拟 WM_DROPFILES 回调，验证直接选图不靠目录列表 ---
+        dlg._open_wallpaper_picker()
+        dlg.top.update()
+        pk3 = dlg._wp_picker
+        pic = folder / "a_wall.jpg"
+        pk3._on_files([str(pic).replace("\\", "/")])
+        dlg.top.update()
+        want = str(pic).replace("\\", "/")
+        check("拖入图片直接写配置",
+              bool(wrote) and wrote[-1]["wallpaperPath"].lower() == want.lower())
+        check("拖入后选择器已关闭", not pk3.winfo_exists())
+
+        # 非图片被拒
+        dlg._open_wallpaper_picker()
+        dlg.top.update()
+        pk4 = dlg._wp_picker
+        pk4._on_files([str(folder / "note.txt")])
+        dlg.top.update()
+        check("拖入非图片不写入也不关闭",
+              pk4.winfo_exists() and "不是图片" in pk4._drop_lbl.cget("text"))
+
+        # 粘路径（带引号、反斜杠）也能用
+        pk4.v_file.set('"%s"' % str(folder / "d_wall.bmp").replace("/", "\\"))
+        pk4._use_path(pk4.v_file.get())
+        dlg.top.update()
+        check("粘贴带引号反斜杠路径可选图",
+              wrote[-1]["wallpaperPath"].lower()
+              == str(folder / "d_wall.bmp").replace("\\", "/").lower())
+        check("全程仍未碰系统对话框", not called)
         dlg.close()
+
     finally:
         hb._wp_read, hb._wp_write, hb._wp_refresh = real_read, real_write, real_refresh
         hb.tk.filedialog = real_filedialog
