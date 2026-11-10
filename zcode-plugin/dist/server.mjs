@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -27,11 +27,32 @@ function pidAlive(pid) {
   // 只查存在性；命令行核对在 python 侧做，这里尽力而为
   try { process.kill(Number(pid), 0); return true; } catch { return false; }
 }
+function findBarPid() {
+  // 锁文件只在 HoverBar.run() 里写；--wait-zcode 待命期间（ZCode 没开、
+  // 或刚启动还没建窗口）进程活着但没锁。这时按命令行找，别误报"未运行"。
+  try {
+    const out = execFileSync("powershell", ["-NoProfile", "-Command",
+      "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' OR Name='python.exe'\" | " +
+      "Where-Object CommandLine -like '*hoverbar.py*' | Select-Object -First 1 -ExpandProperty ProcessId"],
+      { encoding: "utf8", windowsHide: true, timeout: 10000 });
+    const n = Number(String(out).trim());
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
 function barStatus() {
   const pid = readLock();
-  if (!pid) return { running: false, stale: false };
+  if (!pid) {
+    const found = findBarPid();
+    return found
+      ? { running: true, stale: false, pid: found, phase: "starting" }
+      : { running: false, stale: false };
+  }
   const alive = pidAlive(pid);
-  return { running: alive, stale: !alive, pid: Number(pid) };
+  return alive
+    ? { running: true, stale: false, pid: Number(pid) }
+    : { running: false, stale: true, pid: Number(pid) };
 }
 async function startBar() {
   if (!fs.existsSync(BAR)) throw new Error("hoverbar.py not found: " + BAR);

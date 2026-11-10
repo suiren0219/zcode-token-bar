@@ -176,7 +176,9 @@ async function doStatus() {
     const st = await call("bar_status");
     const el = document.getElementById("state");
     el.className = "v " + (st.running ? "ok" : "bad");
-    el.textContent = st.running ? "运行中" : (st.stale ? "残留锁（未运行）" : "未运行");
+    el.textContent = st.running
+      ? (st.phase === "starting" ? "启动中…" : "运行中")
+      : (st.stale ? "残留锁（未运行）" : "未运行");
     document.getElementById("pid").textContent = st.pid ?? "—";
   } catch (e) {
     document.getElementById("msg").textContent = "查询失败: " + (e.message || e);
