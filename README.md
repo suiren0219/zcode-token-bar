@@ -127,6 +127,31 @@ python hoverbar.py --install-plugin
 
 ---
 
+## 壁纸铺法：覆盖 / 适应 / 拉伸
+
+现场诊断（CDP 实读）：插件注入的是 `background-size: contain`，图片
+1216×832（1.462）、窗口 1564×851（1.838）→ 左右一大片黑边；插件源码里
+`addEventListener('resize')` 和 `ResizeObserver` 都是 0，`fit` 合法值只有
+`cover / contain / smart`，**没有拉伸，也不随窗口大小重算**。
+
+`wallpaper_fit.py` 补上这层：通过 CDP 在 ZCode 渲染进程里挂一个自己的
+`<style>`（`!important` 覆盖 `background-size`）和 resize 钩子。零第三方
+依赖，WebSocket 帧收发手写。设置 → 面板与壁纸 → **壁纸铺法** 三个按钮：
+
+| 铺法 | CSS | 效果 |
+|---|---|---|
+| 覆盖 | `cover` | 铺满窗口，裁掉超出部分 |
+| 适应 | `contain` | 图片完整显示，可能留边 |
+| 拉伸 | `100% 100%` | 强行铺满，不留边不裁切（比例会变） |
+
+- 点一下立刻写配置并生效，不用点「应用」。
+- 窗口缩放、侧栏折叠、最大化都会自动重算（`resize` + `ResizeObserver`）。
+- 插件自己的 `colors` 重注入**删不掉**这层 style（实测），条面每次
+  `_wp_refresh` 也会补装一次；ZCode 重启后条面启动 3/5/10 秒各补一次。
+- 诊断：`python -c "import wallpaper_fit as w; print(w.current())"`。
+
+---
+
 ## 窗口层级与「条面不见了」
 
 条面以前用 `GWLP_HWNDPARENT` 把自己设成 ZCode 的**属主窗口**，指望系统

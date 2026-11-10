@@ -40,6 +40,7 @@ import hoverbar as hb
 TMP = Path(tempfile.mkdtemp(prefix="bar_test_"))
 hb.CONFIG = TMP / "hoverbar.json"
 hb._wp_read = lambda: None          # 壁纸段整体跳过
+hb._wpfit = None                    # 测试里不真连 CDP
 
 DEMO = {
     "session": {"sid": "sess_demo_0001", "title": "demo-project",
@@ -1277,13 +1278,87 @@ def t_zorder():
         kill(bar)
 
 
+
+def t_wpfit():
+    """壁纸铺法：三种 CSS、覆盖层持久、resize 钩子、设置页联动。"""
+    import wallpaper_fit as wf
+    # --- 纯逻辑：三种铺法生成的 CSS ---
+    css = {}
+    for fit in wf.FITS:
+        css[fit] = wf._css(fit)
+    check("覆盖 → background-size:cover",
+          "background-size:cover !important" in css["cover"])
+    check("适应 → contain", "background-size:contain !important" in css["contain"])
+    check("拉伸 → 100% 100%（插件本身没有这个选项）",
+          "background-size:100% 100% !important" in css["stretch"])
+    check("三种都用 !important 压过插件自己的 CSS",
+          all("!important" in v for v in css.values()))
+    js = wf._install_js("stretch")
+    check("安装脚本带 resize 监听",
+          "addEventListener('resize'" in js)
+    check("安装脚本带 ResizeObserver（侧栏折叠也重算）",
+          "ResizeObserver" in js)
+    check("安装脚本幂等且更新当前铺法",
+          "window[KEY + 'Fit'] = FIT" in js
+          and "if (!st)" in js and "if (!window[KEY])" in js)
+    check("安装脚本每次替换回调（防旧闭包写回旧值）",
+          "window[KEY + 'Apply']" in js and "const fire" in js)
+
+    # --- 设置页联动（打桩，不真连 CDP）---
+    bar = new_bar()
+    real_read = hb._wp_read
+    real_write = hb._wp_write
+    real_install = hb._wp_fit_install
+    wrote, installed = [], []
+    hb._wp_read = lambda: {"wallpaperPath": "C:/demo/w.png",
+                           "wallpaperVisible": True, "dim": 25, "blur": 0,
+                           "monet": True, "port": 9222, "fit": "contain"}
+    hb._wp_write = lambda patch: (wrote.append(patch), True)[1]
+    hb._wp_fit_install = lambda port=None: (installed.append(port), True)[1]
+    try:
+        dlg = hb.SettingsDialog(bar)
+        dlg.top.update()
+        dlg._show_page("panel", animate=False)
+        dlg.top.update()
+        check("铺法初值取自插件配置", dlg.v_wp_fit.get() == "contain")
+        check("三个铺法按钮都在", len(dlg._wp_fit_btns) == 3)
+        check("当前项反白", dlg._wp_fit_btns["contain"].selected is True
+              and dlg._wp_fit_btns["cover"].selected is False)
+
+        dlg._wp_fit_set("stretch")
+        for _ in range(50):
+            dlg.top.update()
+            time.sleep(0.02)
+            if "铺法已生效" in dlg._wp_msg.cget("text"):
+                break
+        check("点拉伸写进配置", bool(wrote) and wrote[-1]["fit"] == "stretch")
+        check("点拉伸装覆盖层", bool(installed))
+        check("选中态跟着变", dlg._wp_fit_btns["stretch"].selected is True
+              and dlg._wp_fit_btns["contain"].selected is False)
+        check("结果回主线程显示",
+              "铺法已生效：拉伸" in dlg._wp_msg.cget("text"))
+        check("成功用绿色", str(dlg._wp_msg.cget("fg")) == hb.OK)
+
+        # 应用设置不把 fit 冲回旧值：fit 存在插件配置里，apply() 的 patch
+        # 必须带上当前选中的值
+        src = (ROOT / "hoverbar.py").read_text(encoding="utf-8")
+        i = src.index("    def apply(self):")
+        ab = src[i:i + 1600]
+        check("apply 的壁纸 patch 带上 fit", '"fit": self.v_wp_fit.get()' in ab)
+        dlg.close()
+    finally:
+        hb._wp_read, hb._wp_write = real_read, real_write
+        hb._wp_fit_install = real_install
+        kill(bar)
+
+
 GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
     "wallpaper": t_wallpaper, "attach": t_attach, "ctxwin": t_ctxwin,
     "layout": t_layout, "picker": t_picker, "bardrop": t_bardrop,
-    "zorder": t_zorder,
+    "zorder": t_zorder, "wpfit": t_wpfit,
 }
 
 

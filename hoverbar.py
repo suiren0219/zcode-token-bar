@@ -48,6 +48,11 @@ import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 
+try:
+    import wallpaper_fit as _wpfit
+except Exception:                       # 模块缺失不影响条面其它功能
+    _wpfit = None
+
 HERE = Path(__file__).parent.resolve()
 ZUSAGE = HERE / "zusage.py"
 CONFIG = HERE / "hoverbar.json"
@@ -582,6 +587,10 @@ class HoverBar:
         # 启动 5 秒后才问，避开开机那一阵的网络拥塞；没勾自动检查就什么都不做
         if self.cfg.get("auto_update"):
             self.root.after(5000, self._upd_silent)
+        # ZCode 渲染进程重启后覆盖层会没，等 CDP 起来了补装一次。
+        # 放后台线程：CDP 连接最长 12s，不能挡住条面首帧。
+        if _wpfit is not None:
+            threading.Thread(target=self._wp_fit_boot, daemon=True).start()
 
     # -- 拖放换壁纸 --
     def _drop_toast_howto(self):
@@ -684,6 +693,19 @@ class HoverBar:
             t.destroy()
         self._drop_tip = None
         self._drop_job = None
+
+    def _wp_fit_boot(self):
+        """条面起来后给 ZCode 补一次壁纸铺法覆盖层。
+
+        ZCode 可能比条面晚起、或中途重启过，所以延迟几秒再试，失败
+        也不吵——面板里的「立即刷新」随时能手动补。"""
+        for delay in (3.0, 5.0, 10.0):
+            time.sleep(delay)
+            try:
+                if _wp_fit_install():
+                    return
+            except Exception as e:
+                log("启动补装壁纸铺法失败", e)
 
     # -- 启动时静默检查更新 --
     def _upd_silent(self):
@@ -1923,10 +1945,12 @@ class _EfButton(tk.Canvas):
     """Codex 按钮：直角方框 + 1px 边线。主按钮反白（浅底黑字），
     次按钮只有边线，悬停填 EF_CHIP。没有切角、没有圆角。"""
 
-    def __init__(self, master, text, command, primary=False, width=None):
+    def __init__(self, master, text, command, primary=False, width=None,
+                 selected=False):
         self.text = text
         self.command = command
         self.primary = primary
+        self.selected = selected       # 三选一之类：当前项反白
         self._hover = False
         f = _ef_font(EF_UI, 9, bold=primary)
         probe = tkfont.Font(root=master, font=f)
@@ -1942,7 +1966,7 @@ class _EfButton(tk.Canvas):
         self._paint()
 
     def _set_hover(self, v):
-        if self._hover == v:
+        if self._hover == v or getattr(self, "selected", False):
             return
         self._hover = v
         w, h = self._cw, self._ch
@@ -1976,7 +2000,12 @@ class _EfButton(tk.Canvas):
     def _paint(self):
         self.delete("all")
         w, h = self._cw, self._ch
-        if self.primary:
+        if self.selected:
+            self._box = self.create_rectangle(
+                0.5, 0.5, w - 0.5, h - 0.5, fill=EF_SIGNAL,
+                outline=EF_SIGNAL, width=1)
+            fg = EF_ON_SIGNAL
+        elif self.primary:
             fill = "#ffffff" if self._hover else EF_SIGNAL
             self._box = self.create_rectangle(
                 0.5, 0.5, w - 0.5, h - 0.5, fill=fill, outline=fill, width=1)
@@ -2545,6 +2574,24 @@ def _node_exe() -> str | None:
     return shutil.which("node")
 
 
+def _wp_fit_install(port: int | None = None) -> bool:
+    """把铺法覆盖层（含 resize 钩子）装进 ZCode。
+
+    插件 `colors` 重注入不会删我们的 style 节点，但 ZCode 重启后渲染进程
+    是新的，所以要每次注入后补一次。CDP 不通就返回 False，绝不假装成功。
+    """
+    if _wpfit is None:
+        return False
+    cfg = _wp_read() or {}
+    try:
+        r = _wpfit.install(port or cfg.get("port"),
+                           str(cfg.get("fit") or "cover"))
+        return bool(r.get("ok"))
+    except Exception as e:
+        log("安装壁纸铺法失败", e)
+        return False
+
+
 def _wp_refresh(port: int | None = None) -> bool:
     """让 zcode-beautify 立刻把壁纸/配色重新注入 ZCode。
 
@@ -2565,7 +2612,12 @@ def _wp_refresh(port: int | None = None) -> bool:
                            cwd=str(cli.parent.parent),
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = ((r.stdout or "") + (r.stderr or "")).lower()
-        return r.returncode == 0 and "error" not in out and "fail" not in out
+        ok = r.returncode == 0 and "error" not in out and "fail" not in out
+        if ok:
+            # 插件只重建它自己的 style；我们的覆盖层要补装一次，
+            # 否则窗口里会短暂回到 contain 留黑边。
+            _wp_fit_install(port)
+        return ok
     except (OSError, subprocess.SubprocessError) as e:
         log("重注入壁纸失败", e)
         return False
@@ -2989,6 +3041,20 @@ class SettingsDialog:
             for v in (self.v_wp_vis, self.v_wp_dim, self.v_wp_blur):
                 v.trace_add("write", lambda *_: self._wp_changed())
 
+            # 铺法：插件只认 cover/contain/smart，没有拉伸，也不随窗口重算。
+            # 我们走 CDP 挂一层覆盖 CSS + resize 钩子（见 wallpaper_fit.py）。
+            r_fit = self._row(p, "壁纸铺法", "窗口缩放时自动跟着变")
+            self.v_wp_fit = tk.StringVar(
+                value=str(self._wp.get("fit", "cover")))
+            self._wp_fit_btns = {}
+            for _key, _txt in (("cover", "覆盖"), ("contain", "适应"),
+                               ("stretch", "拉伸")):
+                _b = _EfButton(r_fit, _txt,
+                               lambda k=_key: self._wp_fit_set(k))
+                _b.pack(side="left", padx=(0, 6))
+                self._wp_fit_btns[_key] = _b
+            self._wp_fit_paint()
+
             r_pick = self._row(p, "换壁纸", "从目录里挑，选完立刻生效")
 
             _EfButton(r_pick, "从目录里挑…", self._open_wallpaper_picker).pack(side="left")
@@ -3011,7 +3077,7 @@ class SettingsDialog:
                                     font=_ef_font(EF_UI, 8))
             self._wp_msg.pack(anchor="w", pady=(2, 4))
 
-            self._note(p, "壁纸由 zcode-beautify 插件接管；这里用自绘目录选择，不弹系统文件对话框。")
+            self._note(p, "覆盖=铺满裁切 / 适应=完整不裁 / 拉伸=强行铺满；缩放窗口自动重算。壁纸由 zcode-beautify 接管，这里用自绘目录选择，不弹系统文件对话框。")
 
         else:
 
@@ -3772,6 +3838,49 @@ class SettingsDialog:
 
         self._wp_job = self.top.after(600, flush)
 
+    def _wp_fit_paint(self):
+        """三个铺法按钮的选中态。"""
+        cur = self.v_wp_fit.get()
+        for key, btn in getattr(self, "_wp_fit_btns", {}).items():
+            btn.selected = (key == cur)
+            btn._paint()
+
+    def _wp_fit_set(self, key: str):
+        """点铺法：立刻写配置 + 后台装覆盖层，不点「应用」也生效。"""
+        if key not in ("cover", "contain", "stretch"):
+            return
+        self.v_wp_fit.set(key)
+        self._wp_fit_paint()
+        if self._wp is None:
+            return
+        self._wp["fit"] = key
+        if not _wp_write({"fit": key}):
+            self._say(getattr(self, "_wp_msg", None),
+                      "铺法写不进插件配置。", EF_DANGER)
+            return
+        self._say(getattr(self, "_wp_msg", None),
+                  "铺法：%s，正在应用…" %
+                  ("覆盖" if key == "cover" else
+                   "适应" if key == "contain" else "拉伸"))
+        port = self._wp.get("port")
+
+        def work():
+            ok = _wp_fit_install(port)
+            self._upd_q.put((self._wp_fit_done, (ok, key)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _wp_fit_done(self, ok: bool, key: str):
+        msg = getattr(self, "_wp_msg", None)
+        if msg is None:
+            return
+        label = {"cover": "覆盖", "contain": "适应",
+                 "stretch": "拉伸"}.get(key, key)
+        if ok:
+            self._say(msg, "铺法已生效：%s（缩放窗口自动重算）" % label, OK)
+        else:
+            self._say(msg, "铺法应用失败：CDP 调试端口没开？", EF_DANGER)
+
     def _wp_reinject(self):
         """不换图，只重注入：后台线程跑插件 CLI，结果回主线程显示。
 
@@ -3841,7 +3950,8 @@ class SettingsDialog:
         save_settings(self.cfg)
         self.bar.apply_settings(repin=repin)
         if self._wp is not None:
-            patch = {"wallpaperVisible": bool(self.v_wp_vis.get()),
+            patch = {"fit": self.v_wp_fit.get(),
+                     "wallpaperVisible": bool(self.v_wp_vis.get()),
                      "dim": round(float(self.v_wp_dim.get())),
                      "blur": round(float(self.v_wp_blur.get()))}
             if _wp_write(patch):
