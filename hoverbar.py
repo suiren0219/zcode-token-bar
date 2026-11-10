@@ -25,7 +25,7 @@
 绿/琥珀/红只表示数据健康度。
 
 设置项：位置 / 跟随窗口还是整块屏幕 / 偏移 / 透明度 / 字号 / 显示哪些项 /
-失焦是否隐藏 / 是否置顶 / 是否启动时检查更新。拖动条面可直接改位置。
+ZCode 关掉时是否收起 / 是否置顶 / 是否启动时检查更新。拖动条面可直接改位置。
 
 更新：默认**不自动安装**。勾上「启动时自动检查」后，每次启动 5 秒悄悄问一次
 GitHub，有新版本只在设置面板「06 更新」和右键菜单里提示；拉不拉、什么时候拉
@@ -101,8 +101,8 @@ DEFAULTS = {
     "opacity": 0.92,
     "font_px": 13,
     "font_family": "",
-    "always_on_top": False,   # 默认靠"属主窗口"绑定：只浮在 ZCode 之上，不盖别的程序
-    "hide_when_inactive": False,  # 属主绑定已随 ZCode 最小化/切换自动让路
+    "always_on_top": False,   # 默认普通工具窗口；勾上走 HWND_TOPMOST
+    "hide_when_inactive": False,  # 只在 ZCode 窗口真的不存在/最小化时收起
     "show": {"speed": True, "ctx": True, "turn": True,
              "session": True, "today": True, "tools": True, "cache": True},
     "labels": True,
@@ -221,6 +221,23 @@ def monitor_work(hwnd: int):
     r = wintypes.RECT()
     u32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)   # SPI_GETWORKAREA
     return r.left, r.top, r.right - r.left, r.bottom - r.top
+
+
+def zcode_available(hwnd: int) -> bool:
+    """ZCode 主窗口现在还在、且没最小化吗？
+
+    以前 hide_when_inactive 直接拿 foreground_is() 判断"ZCode 在不在前台"。
+    但 EnumWindows / GetForegroundWindow 在非交互会话（开机自启、MCP 面板
+    拉起的进程）里看不到桌面窗口，前台是 QQ 或别的程序时 zcode_hwnd()
+    干脆返回 0 —— 条面就永远判"该藏"，miss 一路涨到十几。用户体感就是
+    "条又丢了"。
+
+    改成只看事实：ZCode 窗口存在且有可用矩形就显示。切到资源管理器、
+    切到别的应用都不再把它收起来（那本来就是置顶条该有的行为）。
+    """
+    if not hwnd:
+        return False
+    return win_state(hwnd) is not None
 
 
 def foreground_is(hwnd: int) -> bool:
@@ -712,10 +729,31 @@ class HoverBar:
     # -- 窗口属性 --
     def _apply_winprops(self):
         self.root.attributes("-alpha", min(1.0, max(0.25, float(self.cfg["opacity"]))))
+        self._apply_topmost()
+
+    def _apply_topmost(self):
+        """置顶勾一改就立刻生效，不用等重启。
+
+        Tk 的 attributes("-topmost") 只在启动时设一次，运行期改配置不会
+        重新调用；而且它跟属主绑定打架时表现不稳定。这里直接调 Win32
+        SetWindowPos(HWND_TOPMOST / HWND_NOTOPMOST)，带 SWP_NOACTIVATE |
+        SWP_NOMOVE | SWP_NOSIZE，不抢焦点也不动位置。"""
+        self.root.attributes("-topmost", bool(self.cfg.get("always_on_top")))
+        if not self._bar_hwnd:
+            return
         try:
-            self.root.attributes("-topmost", bool(self.cfg["always_on_top"]))
-        except tk.TclError:
-            pass
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.WinDLL("user32", use_last_error=True)
+            u32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                         ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_uint]
+            after = wintypes.HWND(-1 if self.cfg.get("always_on_top") else -2)
+            u32.SetWindowPos(self._bar_hwnd, after, 0, 0, 0, 0,
+                             0x0010 | 0x0002 | 0x0001)   # NOACTIVATE|NOMOVE|NOSIZE
+        except Exception as e:
+            log("设置层级失败", e)
 
     def _pick_font(self):
         fams = set(tkfont.families())
@@ -1098,7 +1136,7 @@ class HoverBar:
             self._hwnd = zcode_hwnd()
             wr = win_state(self._hwnd)
             if not wr or (cfg["hide_when_inactive"]
-                          and not foreground_is(self._hwnd)):
+                          and not zcode_available(self._hwnd)):
                 self._maybe_hide()
                 return
             self._win_rect = wr
@@ -1110,7 +1148,7 @@ class HoverBar:
 
         self._hwnd = zcode_hwnd()
         wr = win_state(self._hwnd)
-        if not wr or (cfg["hide_when_inactive"] and not foreground_is(self._hwnd)):
+        if not wr or (cfg["hide_when_inactive"] and not zcode_available(self._hwnd)):
             self._maybe_hide()
             return
         self._win_rect = wr
@@ -1269,31 +1307,23 @@ class HoverBar:
             return False
 
     def _bind_zorder(self):
-        """把条设成 ZCode 的「属主窗口」(GWLP_HWNDPARENT)。
-        Windows 原生绑定：属主窗口恒浮在属主之上、随属主最小化一起隐藏、不抢焦点、
-        不进任务栏——不用 -topmost 也不会盖住别的程序，这才是真"绑在 ZCode 上"。"""
-        if self._hwnd <= 0:
-            return
-        import ctypes
-        u32 = _u32()
+        """只维护工具窗口属性和置顶层级，**不再把条面设成 ZCode 的属主窗口**。
+
+        以前用 SetWindowLongPtrW(GWLP_HWNDPARENT) 把条绑在 ZCode 上，
+        Windows 会强制"属主窗口恒浮在属主之上"——结果是切到资源管理器、
+        或 ZCode 自己切换子窗口时层级被系统来回重排，用户看到的就是条面
+        跟文件管理器/ZCode 打架。改成普通工具窗口，层级只由 -topmost /
+        SetWindowPos 管，谁在前台都不影响它。"""
         if not self._bar_hwnd:
+            u32 = _u32()
             self._bar_hwnd = u32.GetAncestor(self.root.winfo_id(), 2)   # GA_ROOT
             if not self._bar_hwnd:
                 return
-            # 登记给 foreground_is：用户在拖条面/点图钉时前台是我们自己，
-            # 那种时候绝不能判成"ZCode 不在前台"而把条藏了
             _OWN_HWNDS["bar"] = self._bar_hwnd
             ex = u32.GetWindowLongW(self._bar_hwnd, -20)               # GWL_EXSTYLE
             u32.SetWindowLongW(self._bar_hwnd, -20,
                                ex | 0x00000080 | 0x08000000)           # TOOLWINDOW|NOACTIVATE
-        if getattr(self, "_owner", None) == self._hwnd:
-            return
-        try:
-            set_owner = ctypes.windll.user32.SetWindowLongPtrW
-        except AttributeError:
-            set_owner = u32.SetWindowLongW
-        set_owner(self._bar_hwnd, -8, self._hwnd)                      # GWLP_HWNDPARENT
-        self._owner = self._hwnd
+            self._apply_topmost()
 
     def _tick_anchor(self):
         # 拖动中不定位：_place() 会 set_owner 重排窗口，拖起来一抖一抖。
@@ -1827,6 +1857,19 @@ class HoverBar:
             "session": ((self.data or {}).get("session") or {}).get("sid", "")[-8:],
             "anchor": self.cfg.get("anchor"),
             "scope": self.cfg.get("scope"),
+            # 诊断「条面被藏 / 层级冲突」：把判断链上的每个中间量都摊开
+            "hide_when_inactive": bool(self.cfg.get("hide_when_inactive")),
+            "always_on_top": bool(self.cfg.get("always_on_top")),
+            "topmost": bool(self.root.attributes("-topmost")),
+            "bar_hwnd": self._bar_hwnd,
+            "owner": getattr(self, "_owner", 0),
+            "own_hwnds": {"bar": _OWN_HWNDS.get("bar", 0),
+                          "extra": sorted(_OWN_HWNDS.get("extra", ()))},
+            "fg_now": _u32().GetForegroundWindow(),
+            "foreground_is": foreground_is(self._hwnd),
+            "win_state_now": win_state(self._hwnd),
+            "zcode_available": zcode_available(self._hwnd),
+            "drop_ok": getattr(self, "_drop_ok", False),
         }
         return d
 
@@ -2980,21 +3023,21 @@ class SettingsDialog:
         self._section(p, 5, "行为", "behaviour")
         self.v_top = tk.BooleanVar(value=bool(self.cfg["always_on_top"]))
 
-        _EfCheck(p, "总是置顶（会盖住其它程序）", self.v_top,
+        _EfCheck(p, "总是置顶（盖住其它程序）", self.v_top,
 
                  big=True).pack(anchor="w", pady=2)
 
-        self._note(p, "默认不勾：靠 Windows 属主窗口绑定，只浮在 ZCode 上，随它最小化让路。")
+        self._note(p, "勾上立刻生效，不用重启。条面不再绑成 ZCode 的属主窗口，切换窗口时层级不会被系统重排。")
 
 
 
         self.v_hide = tk.BooleanVar(value=bool(self.cfg["hide_when_inactive"]))
 
-        _EfCheck(p, "ZCode 不在前台时隐藏", self.v_hide,
+        _EfCheck(p, "ZCode 最小化/关闭时收起", self.v_hide,
 
                  big=True).pack(anchor="w", pady=(6, 2))
 
-        self._note(p, "开着时切到别的程序条面就收起，看起来很像「条丢了」——一般不建议勾。")
+        self._note(p, "只在 ZCode 窗口真的没了才收；切到资源管理器或别的程序不藏，不会再「条丢了」。")
 
 
     def _page_upd(self, p):
@@ -3560,7 +3603,7 @@ class SettingsDialog:
         else:
             self._st_set("data", "断开（serve 子进程没起来）", HOT)
         # 3) ZCode 窗口：找不到窗口条面会主动隐藏，最常见的"条不见了"原因。
-        #    还要区分"窗口在但条面被故意藏了"——那是失焦隐藏生效，
+        #    还要区分"窗口在但条面被故意藏了"——那是收起逻辑生效，
         #    不是丢了；不写清楚用户会以为是 bug。
         try:
             hwnd = zcode_hwnd()
@@ -3569,7 +3612,7 @@ class SettingsDialog:
         hidden = not self.bar._visible
         if hwnd and hidden and self.bar.cfg.get("hide_when_inactive"):
             self._st_set("zcode",
-                         "已找到，但条面因失焦隐藏（见「05 行为」那项）", WARM)
+                         "已找到，但条面因窗口不可见而收起（见「05 行为」）", WARM)
         elif hwnd and hidden:
             self._st_set("zcode", "已找到 HWND %d，条面当前不可见" % hwnd, WARM)
         elif hwnd:

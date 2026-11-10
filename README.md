@@ -127,6 +127,28 @@ python hoverbar.py --install-plugin
 
 ---
 
+## 窗口层级与「条面不见了」
+
+条面以前用 `GWLP_HWNDPARENT` 把自己设成 ZCode 的**属主窗口**，指望系统
+自动"只浮在 ZCode 上"。实际副作用是切换窗口时系统来回重排层级，跟
+资源管理器、ZCode 子窗口打架；同时 `hide_when_inactive` 靠
+`GetForegroundWindow` 判断前台，开机自启/面板拉起的进程在非交互会话里
+枚举不到桌面窗口 → 永远判"该藏" → 条面时隐时现。
+
+现在改成：
+
+- **不设属主窗口**，只是普通工具窗口（`WS_EX_TOOLWINDOW | NOACTIVATE`），
+  不抢焦点、不进任务栏。层级只由「总是置顶」一项管，切到哪个程序都不重排。
+- **「总是置顶」即时生效**：直接 `SetWindowPos(HWND_TOPMOST / NOTOPMOST)`，
+  带 `SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE`，不用重启条面。
+- **「ZCode 最小化/关闭时收起」**只看 ZCode 窗口是否真的存在、没最小化，
+  不再看前台是谁。切到文件管理器、QQ 或别的应用都不藏。
+
+诊断用 `python hoverbar.py --dump` 之外，也可以直接对运行中的实例发 `dump`
+指令，`zcode_available` / `topmost` / `own_hwnds` 会把判断链摊开。
+
+---
+
 ## 关于「打开文件夹闪退」
 
 ZCode 自带的「打开文件夹」（工作区选择）走 Electron 原生文件对话框，宿主是

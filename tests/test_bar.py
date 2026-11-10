@@ -1226,12 +1226,64 @@ def t_bardrop():
         kill(bar)
 
 
+
+def t_zorder():
+    """层级：不做属主绑定、置顶即时生效、隐藏只看窗口是否存在。"""
+    bar = new_bar()
+    real_state = hb.win_state
+    real_fg = hb.foreground_is
+    calls = []
+    try:
+        # 1) zcode_available 只看窗口矩形，不理前台是谁
+        hb.win_state = lambda h: (10, 10, 800, 600) if h else None
+        hb.foreground_is = lambda h: False          # 前台是 QQ / 资源管理器
+        check("窗口在就不算该藏", hb.zcode_available(4321) is True)
+        hb.win_state = lambda h: None               # 最小化 / 关掉
+        check("窗口没了才算该藏", hb.zcode_available(4321) is False)
+
+        # 2) 默认不再设 GWLP_HWNDPARENT
+        src = (ROOT / "hoverbar.py").read_text(encoding="utf-8")
+        i = src.index("def _bind_zorder(")
+        j = src.index("def _tick_anchor(", i)
+        body = src[i:j]
+        code = body[body.index('"""', body.index('"""') + 3) + 3:]  # 去掉 docstring
+        check("不再把条面设成 ZCode 属主窗口",
+              "SetWindowLongPtrW" not in code
+              and ", -8," not in code and "set_owner" not in code)
+        check("仍保留工具窗口属性", "TOOLWINDOW" in body)
+
+        # 3) 置顶走 SetWindowPos 且带不抢焦点标志
+        i = src.index("def _apply_topmost(")
+        j = src.index("def _pick_font(", i)
+        tb = src[i:j]
+        check("置顶用 HWND_TOPMOST/NOTOPMOST", "-1 if" in tb and "-2" in tb)
+        check("置顶不抢焦点也不动位置",
+              "0x0010" in tb and "0x0002" in tb and "0x0001" in tb)
+
+        # 4) 应用设置会重设层级
+        i = src.index("def apply_settings(")
+        ab = src[i:i + 500]
+        check("apply_settings 会重设窗口属性", "_apply_winprops()" in ab)
+
+        # 5) _place 两处判定改用 zcode_available
+        i = src.index("def _place(")
+        j = src.index("def _settle(", i)
+        pb = src[i:j]
+        check("定位不再依赖 foreground_is",
+              "zcode_available(self._hwnd)" in pb
+              and "not foreground_is(self._hwnd)" not in pb)
+    finally:
+        hb.win_state, hb.foreground_is = real_state, real_fg
+        kill(bar)
+
+
 GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
     "wallpaper": t_wallpaper, "attach": t_attach, "ctxwin": t_ctxwin,
     "layout": t_layout, "picker": t_picker, "bardrop": t_bardrop,
+    "zorder": t_zorder,
 }
 
 
