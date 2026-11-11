@@ -2178,9 +2178,29 @@ class _EfChips(tk.Frame):
 # ---------------------------------------------------------------- 壁纸（zcode-beautify）
 # 壁纸是 zcode-beautify 插件在管。直接改它的 config.json，不另存一份，
 # 免得两边各记一份、谁都不知道以谁为准。插件没装就返回 None，面板隐藏这段。
+def _zcode_homes() -> list[Path]:
+    """ZCode 的数据目录可能被搬到别处（环境变量 ZCODE_HOME），
+    不能再只认 C 盘的家目录——否则壁纸配置读不到，设置页整段显示
+    「没找到插件」，铺法也会悄悄退回 cover。"""
+    out = []
+    for k in ("ZCODE_HOME", "ZCODE_CLI_HOME"):
+        v = os.environ.get(k, "").strip()
+        if v:
+            out.append(Path(v))
+    out += [Path(os.environ.get("APPDATA", "")) / ".zcode",
+            Path.home() / ".zcode"]
+    seen, uniq = set(), []
+    for d in out:
+        key = str(d).lower()
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(d)
+    return uniq
+
+
 WP_DIRS = [
-    Path(os.environ.get("APPDATA", "")) / ".zcode/cli/plugins/data/zcode-beautify@zcode-beautify",
-    Path.home() / ".zcode/cli/plugins/data/zcode-beautify@zcode-beautify",
+    h / "cli/plugins/data/zcode-beautify@zcode-beautify"
+    for h in _zcode_homes()
 ]
 
 
@@ -2547,8 +2567,7 @@ class WallpaperPicker(tk.Toplevel):
 
 
 BEAUTIFY_CLI = [
-    Path(os.environ.get("APPDATA", "")) / ".zcode/cli/plugins/cache/zcode-beautify",
-    Path.home() / ".zcode/cli/plugins/cache/zcode-beautify",
+    h / "cli/plugins/cache/zcode-beautify" for h in _zcode_homes()
 ]
 
 
@@ -2566,11 +2585,15 @@ def _beautify_cli() -> Path | None:
 
 
 def _node_exe() -> str | None:
-    """ZCode 自带 node（~/.zcode/nodejs/node），也认 PATH 上的。"""
-    for p in (Path.home() / ".zcode/nodejs/node.exe",
-              Path.home() / ".zcode/nodejs/node"):
-        if p.is_file():
-            return str(p)
+    """ZCode 自带 node。ZCODE_HOME 搬走后 nodejs/ 也跟着搬，
+    只认 ~/.zcode/nodejs 会返回 None → 壁纸重注入整条链静默失效。"""
+    homes = _zcode_homes()
+    for h in homes:
+        for name in ("node.exe", "node"):
+            p = h / "nodejs" / name
+            if p.is_file():
+                return str(p)
+    # 旧布局：~/.zcode/nodejs（_zcode_homes 已含 ~/.zcode）
     return shutil.which("node")
 
 
@@ -2606,10 +2629,17 @@ def _wp_refresh(port: int | None = None) -> bool:
     cmd = [node, str(cli), "colors"]
     if port:
         cmd += ["--port", str(port)]
+    # 插件自己的 dataDir() 只认 ~/.zcode/... 或这个环境变量；ZCODE_HOME
+    # 搬走后它读的是空目录 → loadConfig()={} → 有配色没壁纸。我们要让它
+    # 读我们刚写过的同一份 config.json，不能两边各读一份。
+    env = os.environ.copy()
+    wd = _wp_dir()
+    if wd is not None:
+        env["ZCODE_BEAUTIFY_DATA_DIR"] = str(wd)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
                            encoding="utf-8", errors="replace",
-                           cwd=str(cli.parent.parent),
+                           cwd=str(cli.parent.parent), env=env,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = ((r.stdout or "") + (r.stderr or "")).lower()
         ok = r.returncode == 0 and "error" not in out and "fail" not in out

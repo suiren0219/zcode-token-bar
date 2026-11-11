@@ -39,6 +39,7 @@ import hoverbar as hb
 
 TMP = Path(tempfile.mkdtemp(prefix="bar_test_"))
 hb.CONFIG = TMP / "hoverbar.json"
+_REAL_WP_READ = hb._wp_read          # 留一份真的，给 zhome 组用
 hb._wp_read = lambda: None          # 壁纸段整体跳过
 hb._wpfit = None                    # 测试里不真连 CDP
 
@@ -845,8 +846,22 @@ def t_ctxwin():
     real_v2 = zu._v2_config_windows
     zu._CTX_WINDOW_CACHE.clear()
     try:
-        check("rules 通配命中 hy4free = 200K（bug 现场记录在案）",
-              zu.lookup_context_window("hy4free") == 200000)
+        # 「具体规则优先于通配兜底」是纯逻辑，不该绑死某台机器上的
+        # rules.json / v2/config.json 内容（换台机器 200K 就变 1M）。
+        real_rules = zu._rules_window_ex
+        try:
+            zu._rules_window_ex = lambda mid: (1000000, 2)   # 通配 .*
+            zu._CTX_WINDOW_CACHE.clear()
+            zu._v2_config_windows = lambda: {"hy4free": 256000}
+            check("通配规则 + v2 有专属配置 → 用专属值",
+                  zu.lookup_context_window("hy4free") == 256000)
+            zu._v2_config_windows = lambda: {}
+            zu._CTX_WINDOW_CACHE.clear()
+            check("通配规则 + v2 也没有 → 才用通配兜底",
+                  zu.lookup_context_window("hy4free") == 1000000)
+        finally:
+            zu._rules_window_ex = real_rules
+            zu._CTX_WINDOW_CACHE.clear()
         zu._v2_config_windows = lambda: {"mystery-model": 400000}
         zu._CTX_WINDOW_CACHE.clear()
         check("rules 没覆盖时走 v2/config",
@@ -1352,13 +1367,60 @@ def t_wpfit():
         kill(bar)
 
 
+
+def t_zhome():
+    """ZCODE_HOME 搬走后，壁纸配置与插件 CLI 仍能找到。"""
+    real = os.environ.get("ZCODE_HOME")
+    tmp = TMP / "zcode_home"
+    data = tmp / "cli/plugins/data/zcode-beautify@zcode-beautify"
+    cache = tmp / "cli/plugins/cache/zcode-beautify/zcode-beautify/1.2.3/dist"
+    data.mkdir(parents=True, exist_ok=True)
+    cache.mkdir(parents=True, exist_ok=True)
+    (data / "config.json").write_text('{"fit":"stretch","port":9222}',
+                                      encoding="utf-8")
+    (cache / "cli.js").write_text("// stub", encoding="utf-8")
+    node_dir = tmp / "nodejs"
+    node_dir.mkdir(parents=True, exist_ok=True)
+    (node_dir / "node.exe").write_text("stub", encoding="utf-8")
+    real_dirs, real_cli = hb.WP_DIRS, hb.BEAUTIFY_CLI
+    try:
+        os.environ["ZCODE_HOME"] = str(tmp)
+        hb.WP_DIRS = [h / "cli/plugins/data/zcode-beautify@zcode-beautify"
+                      for h in hb._zcode_homes()]
+        hb.BEAUTIFY_CLI = [h / "cli/plugins/cache/zcode-beautify"
+                           for h in hb._zcode_homes()]
+        check("ZCODE_HOME 排在最前", str(hb.WP_DIRS[0]).lower()
+              == str(data).lower())
+        check("_wp_read 读到搬家后的配置",
+              (_REAL_WP_READ() or {}).get("fit") == "stretch")
+        check("_beautify_cli 找到搬家后的插件",
+              hb._beautify_cli() is not None
+              and "1.2.3" in str(hb._beautify_cli()))
+        src = (ROOT / "hoverbar.py").read_text(encoding="utf-8")
+        check("源码里不再写死 C 盘家目录作为唯一来源",
+              '"ZCODE_HOME"' in src and '"ZCODE_CLI_HOME"' in src)
+        check("_node_exe 也从 ZCODE_HOME 找",
+              hb._node_exe() is not None
+              and "zcode_home" in str(hb._node_exe()).lower())
+        i = src.index("def _wp_refresh(")
+        rb = src[i:i + 1600]
+        check("刷新时把数据目录传给插件",
+              'env["ZCODE_BEAUTIFY_DATA_DIR"]' in rb and "env=env" in rb)
+    finally:
+        hb.WP_DIRS, hb.BEAUTIFY_CLI = real_dirs, real_cli
+        if real is None:
+            os.environ.pop("ZCODE_HOME", None)
+        else:
+            os.environ["ZCODE_HOME"] = real
+
+
 GROUPS = {
     "pin": t_pin, "flicker": t_flicker, "fs": t_fs, "status": t_status,
     "ghost": t_ghost, "truth": t_truth, "spin": t_spin, "wait": t_wait,
     "pages": t_pages, "tip": t_tip, "flash": t_flash, "follow": t_follow,
     "wallpaper": t_wallpaper, "attach": t_attach, "ctxwin": t_ctxwin,
     "layout": t_layout, "picker": t_picker, "bardrop": t_bardrop,
-    "zorder": t_zorder, "wpfit": t_wpfit,
+    "zorder": t_zorder, "wpfit": t_wpfit, "zhome": t_zhome,
 }
 
 
