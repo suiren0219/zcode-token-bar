@@ -204,6 +204,7 @@ fn http_list_models(url: &str, headers: &[(String, String)]) -> Result<Option<Ve
     })?;
     match resp.status().as_u16() {
         404 | 405 => return Ok(None),
+        401 => return Err("HTTP 401：认证失败。检查 API Key（支持 {env:变量名} 引用），或 Key 是否配在自定义 headers 里。".into()),
         s if !(200..300).contains(&s) => return Err(format!("HTTP {s}。")),
         _ => {}
     }
@@ -241,7 +242,26 @@ pub fn discover_provider(pid: &str) -> Result<Discovery, String> {
         return Err("该 provider 协议暂不支持模型发现（支持 OpenAI 与 Anthropic 兼容接口）。".into());
     };
 
-    let key = text(obj(&options, "apiKey"), "");
+    // 认证解析（Python _credential 同款）：支持 {env:NAME} / ${NAME} 引用环境变量；
+    // key 落点兜底 access.apiKey 或 api.apiKey（不同 provider 配置习惯不同）。
+    let credential = |raw: &str| -> String {
+        let t = raw.trim();
+        if let Some(inner) = t.strip_prefix("{env:").and_then(|x| x.strip_suffix('}')) {
+            return std::env::var(inner).unwrap_or_default();
+        }
+        if let Some(inner) = t.strip_prefix("${").and_then(|x| x.strip_suffix('}')) {
+            return std::env::var(inner).unwrap_or_default();
+        }
+        t.to_string()
+    };
+    let key_raw = {
+        let a = text(obj(&options, "apiKey"), "");
+        if a.is_empty() { text(obj(&record, "apiKey"), "") } else { a }
+    };
+    let key = credential(&key_raw);
+    if key_raw.contains("{env:") && key.is_empty() {
+        return Err("认证所引用的环境变量未设置。".into());
+    }
     let mut headers: Vec<(String, String)> = Vec::new();
     if api_type == "anthropic" {
         headers.push(("anthropic-version".into(), "2023-06-01".into()));

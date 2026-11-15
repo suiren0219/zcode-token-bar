@@ -160,6 +160,8 @@ fn main() {
         win.set_scope_index(if cfg.scope == "screen" { 1 } else { 0 });
         win.set_opacity_pct((cfg.opacity * 100.0).round() as i32);
         win.set_font_px(cfg.font_px);
+        win.set_offset_x(cfg.offset_x);
+        win.set_offset_y(cfg.offset_y);
         win.set_show_speed(cfg.show.speed);
         win.set_show_ctx(cfg.show.ctx);
         win.set_show_turn(cfg.show.turn);
@@ -378,6 +380,60 @@ fn bind_panel_callbacks(
         win.on_set_page(move |p| {
             if let Some(w) = panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
                 w.set_page(p);
+            }
+        });
+    }
+    {
+        let cfg = cfg.clone();
+        let panel = panel.clone();
+        win.on_offset_changed(move |x, y| {
+            {
+                let mut c = cfg.lock().unwrap();
+                c.offset_x = x.max(0).min(200);
+                c.offset_y = y.max(0).min(200);
+                settings::save(&c);
+            }
+            if let Some(w) = panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
+                let c = cfg.lock().unwrap();
+                w.set_offset_x(c.offset_x);
+                w.set_offset_y(c.offset_y);
+            }
+        });
+    }
+    {
+        let cfg = cfg.clone();
+        let panel = panel.clone();
+        let free = _free_mode.clone();
+        let bar_weak = bar_weak.clone();
+        win.on_restore_defaults(move || {
+            {
+                let mut c = cfg.lock().unwrap();
+                *c = settings::Settings::default();
+                settings::save(&c);
+                free.store(c.anchor == "free", Ordering::Relaxed);
+            }
+            if let Some(w) = panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
+                let c = cfg.lock().unwrap();
+                w.set_anchor_index(1);
+                w.set_scope_index(0);
+                w.set_opacity_pct((c.opacity * 100.0).round() as i32);
+                w.set_font_px(c.font_px);
+                w.set_offset_x(c.offset_x);
+                w.set_offset_y(c.offset_y);
+                w.set_show_speed(c.show.speed);
+                w.set_show_ctx(c.show.ctx);
+                w.set_show_turn(c.show.turn);
+                w.set_show_session(c.show.session);
+                w.set_show_today(c.show.today);
+                w.set_show_tools(c.show.tools);
+                w.set_show_cache(c.show.cache);
+                w.set_show_labels(c.labels);
+            }
+            if let Some(bar) = bar_weak.upgrade() {
+                let c = cfg.lock().unwrap();
+                bar.set_opacity_level(c.opacity as f32);
+                bar.set_font_px(c.font_px);
+                bar.set_labels_on(c.labels);
             }
         });
     }

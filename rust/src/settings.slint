@@ -50,6 +50,10 @@ export component SettingsWindow inherits Window {
     callback import-clicked();
     callback import-id-clicked(string);
     callback open-python-panel();
+    callback offset-changed(int, int);
+    callback restore-defaults();
+    in property <int> offset-x: 16;
+    in property <int> offset-y: 6;
     callback drag-panel-start();
     callback drag-panel-move();
     callback drag-panel-end();
