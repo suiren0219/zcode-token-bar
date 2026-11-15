@@ -55,11 +55,13 @@ export component BarWindow inherits Window {
         double-clicked => { root.dock-restore(); }
     }
 
-    width: 560px;
+    // 宽度自适应内容：绑到胶囊的 preferred-width（各数据项自然宽度之和），
+    // 下限 340 防止空数据时缩成一条缝。Python 版就是内容定宽。
+    width: max(340px, bar.preferred-width);
     height: 40px;
 
     // 胶囊底：半透明深色 + 1px 描边（对照 Python 版 EF_PAPER/EF_RULE）。
-    Rectangle {
+    bar := Rectangle {
         border-radius: self.height / 2;
         background: #e60e1014;
         border-width: 1px;
@@ -154,6 +156,7 @@ export component BarWindow inherits Window {
             }
 
             // 右端：设置按钮（悬停反白；点击回调给 Rust）。
+            // 窗口宽度已自适应内容，固定 width 不会被裁（此前是被 560 定宽裁掉的）。
             Rectangle {
                 width: 22px;
                 border-radius: 6px;

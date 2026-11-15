@@ -168,10 +168,9 @@ fn main() {
             }
             let zcode = win::zcode_hwnd();
             unsafe { win::apply_bar_styles(hwnd, zcode) };
-            let scale = bar.window().scale_factor() as f64;
-            let w = (560.0 * scale) as i32;
-            let h = (40.0 * scale) as i32;
-            let (x, y) = win::dock_position(w, h, zcode);
+            // 条面宽度自适应内容：直接用窗口真实物理尺寸做贴靠计算。
+            let (rl, rt, rr, rb) = win::window_rect(hwnd);
+            let (x, y) = win::dock_position(rr - rl, rb - rt, zcode);
             unsafe { win::move_window(hwnd, x, y) };
         },
     );
