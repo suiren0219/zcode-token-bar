@@ -124,7 +124,12 @@ fn main() {
     fn open_panel(
         panel: &Arc<Mutex<Option<slint::Weak<SettingsWindow>>>>,
         cfg: &Arc<Mutex<Settings>>,
+        bar_weak: slint::Weak<BarWindow>,
+        free_mode: Arc<AtomicBool>,
     ) {
+        // bind 只在窗口首次创建时做一次：启动时槽是空的，之前把绑定挂在
+        // 启动路径上等于从未绑定——面板所有点击都无反应（2026-11-15 实测）。
+        let is_new = !matches!(panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()), Some(_));
         let mut slot = panel.lock().unwrap();
         let win = match slot.as_ref().and_then(|w| w.upgrade()) {
             Some(w) => w,
@@ -134,6 +139,10 @@ fn main() {
                 w
             }
         };
+        drop(slot);
+        if is_new {
+            bind_panel_callbacks(panel.clone(), cfg.clone(), &bar_weak, free_mode);
+        }
         sync_panel(&win, &cfg.lock().unwrap());
         let _ = win.show();
     }
@@ -179,7 +188,9 @@ fn main() {
     {
         let panel = panel.clone();
         let cfg = cfg.clone();
-        bar.on_settings_clicked(move || open_panel(&panel, &cfg));
+        let bar_weak = bar.as_weak();
+        let free = free_mode.clone();
+        bar.on_settings_clicked(move || open_panel(&panel, &cfg, bar_weak.clone(), free.clone()));
     }
 
     // ── 条面拖动 ──
@@ -282,7 +293,10 @@ fn main() {
             // 托盘菜单事件（非阻塞 try_recv）
             while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
                 match ev.id().as_ref() {
-                    "open-settings" => open_panel(&panel_t, &cfg_t),
+                    "open-settings" => {
+                        let bw = timer_ui.clone();
+                        open_panel(&panel_t, &cfg_t, bw, free_t.clone());
+                    }
                     "restore-dock" => {
                         {
                             let mut c = cfg_t.lock().unwrap();
@@ -334,10 +348,6 @@ fn main() {
         });
     }
 
-    // ── 设置窗口回调（open_panel 时已挂一次）──
-    bind_panel_callbacks(panel.clone(), cfg.clone(), &bar, free_mode.clone());
-    // （panel/cfg/free_mode 在 timer 闭包里已各自 clone，这里再用原变量需重新借——
-    //   实际 move 已发生在闭包，因此上面用 clone 的副本）
 
 
     tracing::info!("Rust 悬浮条启动（托盘+设置面板+模型导入）");
@@ -349,7 +359,7 @@ fn main() {
 fn bind_panel_callbacks(
     panel: Arc<Mutex<Option<slint::Weak<SettingsWindow>>>>,
     cfg: Arc<Mutex<Settings>>,
-    _bar: &BarWindow,
+    bar_weak: &slint::Weak<BarWindow>,
     _free_mode: Arc<AtomicBool>,
 ) {
     let Some(win) = panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()) else { return };
@@ -411,7 +421,7 @@ fn bind_panel_callbacks(
     }
     {
         let cfg = cfg.clone();
-        let ui = _bar.as_weak();
+        let ui = bar_weak.clone();
         win.on_opacity_changed(move |v| {
             let mut c = cfg.lock().unwrap();
             c.opacity = v as f64 / 100.0;
@@ -423,7 +433,7 @@ fn bind_panel_callbacks(
     }
     {
         let cfg = cfg.clone();
-        let ui = _bar.as_weak();
+        let ui = bar_weak.clone();
         win.on_font_changed(move |v| {
             let mut c = cfg.lock().unwrap();
             c.font_px = v;
@@ -435,7 +445,7 @@ fn bind_panel_callbacks(
     }
     {
         let cfg = cfg.clone();
-        let ui = _bar.as_weak();
+        let ui = bar_weak.clone();
         win.on_show_toggled(move |name, on| {
             let name = name.to_string();
             let mut c = cfg.lock().unwrap();
