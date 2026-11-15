@@ -3,6 +3,8 @@
 // UI 只负责排版——口径集中在 data.rs，Slint 里没有业务逻辑。
 
 import { Button } from "std-widgets.slint";
+import { SettingsWindow } from "settings.slint";
+export { SettingsWindow }
 
 export component BarWindow inherits Window {
     no-frame: true;
@@ -34,6 +36,9 @@ export component BarWindow inherits Window {
     in property <string> cache-text: "";
     in property <int> cache-level: 0;
     in property <bool> has-data: false;
+    in property <float> opacity-level: 0.92;
+    in property <int> font-px: 13;
+    in property <bool> labels-on: true;
 
     callback settings-clicked();
     // 拖动：down/move 持续触发 drag-move，up 触发 drag-end，双击恢复自动贴靠。
@@ -62,6 +67,7 @@ export component BarWindow inherits Window {
 
     // 胶囊底：半透明深色 + 1px 描边（对照 Python 版 EF_PAPER/EF_RULE）。
     bar := Rectangle {
+        opacity: root.opacity-level;
         border-radius: self.height / 2;
         background: #e60e1014;
         border-width: 1px;
@@ -85,7 +91,7 @@ export component BarWindow inherits Window {
             Text {
                 text: root.session-title;
                 color: #dde3e8;
-                font-size: 12px;
+                font-size: root.font-px * 1px;
                 vertical-alignment: center;
                 overflow: elide;
                 max-width: 150px;
@@ -95,8 +101,8 @@ export component BarWindow inherits Window {
             if root.speed-text != "": HorizontalLayout {
                 spacing: 3px;
                 alignment: center;
-                Text { text: root.speed-text; color: level-color(root.speed-level); font-size: 12px; font-weight: 700; vertical-alignment: center; }
-                Text { text: "t/s"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+                Text { text: root.speed-text; color: level-color(root.speed-level); font-size: root.font-px * 1px; font-weight: 700; vertical-alignment: center; }
+                Text { text: "t/s"; color: #8892a0; font-size: (root.font-px - 2) * 1px; vertical-alignment: center; }
             }
 
             // 上下文：微进度条 + 百分比
@@ -118,41 +124,41 @@ export component BarWindow inherits Window {
                         background: level-color(root.ctx-level);
                     }
                 }
-                Text { text: root.ctx-text; color: level-color(root.ctx-level); font-size: 12px; vertical-alignment: center; }
+                Text { text: root.ctx-text; color: level-color(root.ctx-level); font-size: root.font-px * 1px; vertical-alignment: center; }
             }
 
             // 本轮
             if root.turn-text != "": HorizontalLayout {
                 spacing: 3px;
                 alignment: center;
-                Text { text: "本轮"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
-                Text { text: root.turn-text; color: #dde3e8; font-size: 12px; vertical-alignment: center; }
-                if root.turn-sub != "": Text { text: root.turn-sub; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+                Text { text: "本轮"; color: #8892a0; font-size: (root.font-px - 2) * 1px; visible: root.labels-on; vertical-alignment: center; }
+                Text { text: root.turn-text; color: #dde3e8; font-size: root.font-px * 1px; vertical-alignment: center; }
+                if root.turn-sub != "": Text { text: root.turn-sub; color: #8892a0; font-size: (root.font-px - 2) * 1px; vertical-alignment: center; }
             }
 
             // 会话
             if root.session-text != "": HorizontalLayout {
                 spacing: 3px;
                 alignment: center;
-                Text { text: "会话"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
-                Text { text: root.session-text; color: #dde3e8; font-size: 12px; vertical-alignment: center; }
-                if root.session-sub != "": Text { text: root.session-sub; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+                Text { text: "会话"; color: #8892a0; font-size: (root.font-px - 2) * 1px; visible: root.labels-on; vertical-alignment: center; }
+                Text { text: root.session-text; color: #dde3e8; font-size: root.font-px * 1px; vertical-alignment: center; }
+                if root.session-sub != "": Text { text: root.session-sub; color: #8892a0; font-size: (root.font-px - 2) * 1px; vertical-alignment: center; }
             }
 
             // 今日
             if root.today-text != "": HorizontalLayout {
                 spacing: 3px;
                 alignment: center;
-                Text { text: "今日"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
-                Text { text: root.today-text; color: #dde3e8; font-size: 12px; vertical-alignment: center; }
+                Text { text: "今日"; color: #8892a0; font-size: (root.font-px - 2) * 1px; visible: root.labels-on; vertical-alignment: center; }
+                Text { text: root.today-text; color: #dde3e8; font-size: root.font-px * 1px; vertical-alignment: center; }
             }
 
             // 缓存率
             if root.cache-text != "": HorizontalLayout {
                 spacing: 3px;
                 alignment: center;
-                Text { text: "缓存"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
-                Text { text: root.cache-text; color: level-color(root.cache-level); font-size: 12px; vertical-alignment: center; }
+                Text { text: "缓存"; color: #8892a0; font-size: (root.font-px - 2) * 1px; visible: root.labels-on; vertical-alignment: center; }
+                Text { text: root.cache-text; color: level-color(root.cache-level); font-size: root.font-px * 1px; vertical-alignment: center; }
             }
 
             // 右端：设置按钮（悬停反白；点击回调给 Rust）。

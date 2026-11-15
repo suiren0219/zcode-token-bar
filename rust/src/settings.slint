@@ -1,0 +1,299 @@
+// 设置面板：无边框暗色窗口，左侧页签 + 右侧内容。
+// 与 Python 版设置面板同构（位置/外观/显示/模型/状态），壁纸页暂由
+// Python 面板承担（--panel 桥接保留）。全部状态由 Rust 持有，Slint 纯展示。
+
+import { ComboBox, CheckBox, ListView, LineEdit, Slider } from "std-widgets.slint";
+
+export component SettingsWindow inherits Window {
+    no-frame: true;
+    always-on-top: true;
+    default-font-family: "Microsoft YaHei UI";
+    background: transparent;
+    width: 660px;
+    height: 470px;
+
+    in property <int> page: 0;
+    in property <[string]> page-names: ["01 位置", "02 外观", "03 显示", "08 模型", "09 状态"];
+    in property <[string]> provider-names;
+    in property <int> provider-index: 0;
+    in property <[string]> model-ids;
+    in property <string> models-status: "选 provider 后点「发现模型」。";
+    in property <string> status-lines: "";
+    in property <bool> models-busy: false;
+    // 当前值回显（Rust → UI）
+    in property <int> anchor-index: 1;
+    in property <int> scope-index: 0;
+    in property <int> opacity-pct: 92;
+    in property <int> font-px: 13;
+    in property <bool> show-speed: true;
+    in property <bool> show-ctx: true;
+    in property <bool> show-turn: true;
+    in property <bool> show-session: true;
+    in property <bool> show-today: true;
+    in property <bool> show-tools: true;
+    in property <bool> show-cache: true;
+    in property <bool> show-labels: true;
+
+    callback close-panel();
+    callback set-page(int);
+    callback anchor-set(int);
+    callback scope-set(int);
+    callback restore-dock();
+    callback opacity-changed(int);
+    callback font-changed(int);
+    callback show-toggled(string, bool);
+    callback labels-toggled(bool);
+    callback discover-clicked();
+    callback provider-changed(string);
+    callback import-clicked();
+    callback import-id-clicked(string);
+    callback drag-panel-start();
+    callback drag-panel-move();
+    callback drag-panel-end();
+
+    // 面板拖动（标题行按住拖动；逻辑同条面：Rust 侧 GetCursorPos）。
+    TouchArea {
+        pointer-event(p) => {
+            if (p.kind == PointerEventKind.down) { root.drag-panel-start(); }
+            if (p.kind == PointerEventKind.up) { root.drag-panel-end(); }
+        }
+        moved => { root.drag-panel-move(); }
+    }
+
+    Rectangle {
+        border-radius: 10px;
+        background: #f00e1014;
+        border-width: 1px;
+        border-color: #40ffffff;
+
+        VerticalLayout {
+            padding: 1px;
+
+            // ── 标题行 ──
+            Rectangle {
+                height: 40px;
+                border-radius: 9px;
+                background: #22000000;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    Text {
+                        text: "ZCODE TOKEN · settings (rust)";
+                        color: #dde3e8; font-size: 13px; font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { vertical-stretch: 0; }
+                    Rectangle {
+                        width: 26px; height: 22px; border-radius: 6px;
+                        y: 9px;
+                        background: close.pressed ? #44ff6b6b : (close.has-hover ? #33ff8888 : transparent);
+                        close := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.close-panel(); }
+                        }
+                        Text { text: "✕"; color: close.has-hover ? #ffb0b0 : #8892a0; font-size: 12px;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+            }
+
+            // ── 主体：左页签 + 右内容 ──
+            HorizontalLayout {
+                spacing: 0px;
+
+                VerticalLayout {
+                    width: 120px;
+                    padding: 10px;
+                    spacing: 6px;
+                    alignment: start;
+
+                    for pn[i] in root.page-names: Rectangle {
+                        height: 30px;
+                        border-radius: 7px;
+                        background: root.page == i ? #33ffffff : (tab.has-hover ? #22ffffff : transparent);
+                        tab := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.set-page(i); }
+                        }
+                        Text {
+                            text: pn;
+                            color: root.page == i ? #ffffff : #a8b2bd;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
+
+                    // ── 01 位置 ──
+                    if root.page == 0: VerticalLayout {
+                        spacing: 10px;
+                        Text { text: "锚点（跟随 ZCode 窗口 / 整块屏幕）"; color: #8892a0; font-size: 11px; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            for an[i] in ["左下", "下中", "右下", "左上", "上中", "右上"]: Rectangle {
+                                height: 30px;
+                                border-radius: 7px;
+                                background: root.anchor-index == (i < 3 ? i : i + 1) ? #337ddb8a : (a.has-hover ? #22ffffff : #22ffffff);
+                                a := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.anchor-set(i < 3 ? i : i + 1); }
+                                }
+                                Text { text: an; color: root.anchor-index == (i < 3 ? i : i + 1) ? #eaffee : #a8b2bd;
+                                       font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text { text: "基准:"; color: #8892a0; font-size: 12px; vertical-alignment: center; }
+                            for sc[i] in ["跟随 ZCode 窗口", "整块屏幕"]: Rectangle {
+                                height: 28px;
+                                border-radius: 7px;
+                                background: root.scope-index == i ? #337ddb8a : #22ffffff;
+                                st := TouchArea { mouse-cursor: pointer; clicked => { root.scope-set(i); } }
+                                Text { text: sc; color: root.scope-index == i ? #eaffee : #a8b2bd;
+                                       font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                height: 30px; width: 150px; border-radius: 7px;
+                                background: rd.has-hover ? #337ddb8a : #29444b;
+                                rd := TouchArea { mouse-cursor: pointer; clicked => { root.restore-dock(); } }
+                                Text { text: "恢复自动贴靠"; color: #eaffee; font-size: 12px;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Text { text: "拖动条面可自由摆放（free 模式），双击条面也可恢复"; color: #6b7680; font-size: 10px; vertical-alignment: center; }
+                        }
+                    }
+
+                    // ── 02 外观 ──
+                    if root.page == 1: VerticalLayout {
+                        spacing: 14px;
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "不透明度"; color: #a8b2bd; font-size: 12px; width: 70px; vertical-alignment: center; }
+                            Slider { minimum: 55; maximum: 100; value: root.opacity-pct;
+                                     changed(v) => { root.opacity-changed(v); } }
+                            Text { text: root.opacity-pct + "%"; color: #dde3e8; font-size: 12px; width: 40px; vertical-alignment: center; }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text { text: "字号"; color: #a8b2bd; font-size: 12px; width: 70px; vertical-alignment: center; }
+                            Slider { minimum: 11; maximum: 16; value: root.font-px;
+                                     changed(v) => { root.font-changed(v); } }
+                            Text { text: root.font-px + "px"; color: #dde3e8; font-size: 12px; width: 40px; vertical-alignment: center; }
+                        }
+                        Text { text: "壁纸 / Monet 动态色暂由 Python 面板承担（设置按钮可打开，设置里「位置」页不冲突）";
+                               color: #6b7680; font-size: 10px; wrap: word-wrap; }
+                    }
+
+                    // ── 03 显示 ──
+                    if root.page == 2: VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 14px;
+                            CheckBox { text: "速度"; checked: root.show-speed; toggled => { root.show-toggled("speed", self.checked); } }
+                            CheckBox { text: "上下文"; checked: root.show-ctx; toggled => { root.show-toggled("ctx", self.checked); } }
+                            CheckBox { text: "本轮"; checked: root.show-turn; toggled => { root.show-toggled("turn", self.checked); } }
+                        }
+                        HorizontalLayout {
+                            spacing: 14px;
+                            CheckBox { text: "会话"; checked: root.show-session; toggled => { root.show-toggled("session", self.checked); } }
+                            CheckBox { text: "今日"; checked: root.show-today; toggled => { root.show-toggled("today", self.checked); } }
+                            CheckBox { text: "工具"; checked: root.show-tools; toggled => { root.show-toggled("tools", self.checked); } }
+                        }
+                        HorizontalLayout {
+                            spacing: 14px;
+                            CheckBox { text: "缓存率"; checked: root.show-cache; toggled => { root.show-toggled("cache", self.checked); } }
+                            CheckBox { text: "显示标签文字"; checked: root.show-labels; toggled => { root.labels-toggled(self.checked); } }
+                        }
+                        Text { text: "开关立即生效并保存到 settings-rs.json。"; color: #6b7680; font-size: 10px; }
+                    }
+
+                    // ── 08 模型 ──
+                    if root.page == 3: VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            ComboBox {
+                                width: 240px;
+                                model: root.provider-names;
+                                current-index: root.provider-index;
+                                selected(i) => { root.provider-changed(i); }
+                            }
+                            Rectangle {
+                                width: 92px; height: 28px; border-radius: 7px;
+                                background: db.has-hover ? #337ddb8a : #29444b;
+                                db := TouchArea {
+                                    mouse-cursor: pointer;
+                                    enabled: !root.models-busy;
+                                    clicked => { root.discover-clicked(); }
+                                }
+                                Text { text: root.models-busy ? "发现中…" : "发现模型"; color: #eaffee; font-size: 12px;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Rectangle {
+                                width: 120px; height: 28px; border-radius: 7px;
+                                background: im.has-hover ? #337ddb8a : #29444b;
+                                im := TouchArea {
+                                    mouse-cursor: pointer;
+                                    enabled: !root.models-busy && root.model-ids.length > 0;
+                                    clicked => { root.import-clicked(); }
+                                }
+                                Text { text: "导入到 ZCode"; color: #eaffee; font-size: 12px;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                        Rectangle {
+                            border-radius: 7px;
+                            background: #22000000;
+                            border-width: 1px; border-color: #22ffffff;
+                            VerticalLayout {
+                                padding: 4px;
+                                if root.model-ids.length == 0: Text {
+                                    text: "（还没有模型，先「发现模型」）";
+                                    color: #5c6670; font-size: 11px; horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                if root.model-ids.length > 0: ListView {
+                                    for mid_item in root.model-ids: Rectangle {
+                                        height: 24px;
+                                        Text { text: mid_item; color: #dde3e8; font-size: 11px;
+                                               vertical-alignment: center; padding-left: 10px;
+                                               overflow: elide; }
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: "按 ID:"; color: #8892a0; font-size: 12px; vertical-alignment: center; }
+                            mid := LineEdit { placeholder-text: "模型 ID（逗号/空格分隔）"; font-size: 11px; }
+                            Rectangle {
+                                width: 70px; height: 26px; border-radius: 7px;
+                                background: mi.has-hover ? #337ddb8a : #29444b;
+                                mi := TouchArea { mouse-cursor: pointer; clicked => { root.import-id-clicked(mid.text); } }
+                                Text { text: "导入"; color: #eaffee; font-size: 11px;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                        Text { text: root.models-status; color: #8892a0; font-size: 10px; wrap: word-wrap; }
+                    }
+
+                    // ── 09 状态 ──
+                    if root.page == 4: VerticalLayout {
+                        spacing: 6px;
+                        Text { text: root.status-lines; color: #a8b2bd; font-size: 11px; wrap: word-wrap; font-family: "Consolas"; }
+                    }
+                }
+            }
+        }
+    }
+}
