@@ -187,6 +187,18 @@ fn base_url(options: &Value) -> Result<String, String> {
     Ok(stripped)
 }
 
+/// 认证解析（Python _credential 同款）：支持 {env:NAME} / ${NAME} 引用环境变量。
+fn credential(raw: &str) -> String {
+    let t = raw.trim();
+    if let Some(inner) = t.strip_prefix("{env:").and_then(|x| x.strip_suffix('}')) {
+        return std::env::var(inner).unwrap_or_default();
+    }
+    if let Some(inner) = t.strip_prefix("${").and_then(|x| x.strip_suffix('}')) {
+        return std::env::var(inner).unwrap_or_default();
+    }
+    t.to_string()
+}
+
 /// GET {base}/models；404/405 返回 Ok(None) 让调用方走本地回退。
 fn http_list_models(url: &str, headers: &[(String, String)]) -> Result<Option<Vec<String>>, String> {
     let client = reqwest::blocking::Client::builder()
@@ -242,18 +254,6 @@ pub fn discover_provider(pid: &str) -> Result<Discovery, String> {
         return Err("该 provider 协议暂不支持模型发现（支持 OpenAI 与 Anthropic 兼容接口）。".into());
     };
 
-    // 认证解析（Python _credential 同款）：支持 {env:NAME} / ${NAME} 引用环境变量；
-    // key 落点兜底 access.apiKey 或 api.apiKey（不同 provider 配置习惯不同）。
-    let credential = |raw: &str| -> String {
-        let t = raw.trim();
-        if let Some(inner) = t.strip_prefix("{env:").and_then(|x| x.strip_suffix('}')) {
-            return std::env::var(inner).unwrap_or_default();
-        }
-        if let Some(inner) = t.strip_prefix("${").and_then(|x| x.strip_suffix('}')) {
-            return std::env::var(inner).unwrap_or_default();
-        }
-        t.to_string()
-    };
     let key_raw = {
         let a = text(obj(&options, "apiKey"), "");
         if a.is_empty() { text(obj(&record, "apiKey"), "") } else { a }
@@ -319,6 +319,90 @@ pub fn discover_provider(pid: &str) -> Result<Discovery, String> {
         }).collect(),
         source_note: String::new(),
     })
+}
+
+// ── 探针：逐模型小请求实测可用性 ────────────────────────────────
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ProbeOutcome {
+    pub model_id: String,
+    pub usable: Option<bool>, // Some(true)=可用 Some(false)=明确不可用 None=未知（超时/5xx）
+    pub error: String,
+}
+
+/// 单模型探针：1-token 对话请求，2xx 即可用。Python probe_model 的简化版
+/// （tools/image/pdf 细项探测后续补，先用可用性支撑「只导入能用到的」）。
+pub fn probe_model(pid: &str, model_id: &str) -> ProbeOutcome {
+    let mut out = ProbeOutcome { model_id: model_id.to_string(), usable: None, error: String::new() };
+    let Some(record) = provider_record(pid) else {
+        out.error = "provider 已移除。".into();
+        return out;
+    };
+    let options = obj(&record, "options").clone();
+    let Ok(base) = base_url(&options) else {
+        // 账号类 provider 没有独立端点：无法实测，视作未知（照常导入）
+        return out;
+    };
+    let kind = text(obj(&record, "kind"), "").to_ascii_lowercase();
+    let key_raw = {
+        let a = text(obj(&options, "apiKey"), "");
+        if a.is_empty() { text(obj(&record, "apiKey"), "") } else { a }
+    };
+    let key = credential(&key_raw);
+
+    let (url, body, headers) = if kind.contains("anthropic") {
+        let suffix = if base.ends_with("/v1") { "/messages" } else { "/v1/messages" };
+        let mut hs = vec![("anthropic-version".to_string(), "2023-06-01".to_string())];
+        if !key.is_empty() {
+            hs.push(("x-api-key".into(), key.clone()));
+        }
+        (format!("{base}{suffix}"), json!({"model": model_id, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}), hs)
+    } else {
+        let mut hs = Vec::new();
+        if !key.is_empty() {
+            hs.push(("Authorization".into(), format!("Bearer {key}")));
+        }
+        (format!("{base}/chat/completions"), json!({"model": model_id, "max_tokens": 1, "stream": false, "messages": [{"role": "user", "content": "hi"}]}), hs)
+    };
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => { out.error = e.to_string(); return out; }
+    };
+    let mut req = client.post(&url).json(&body);
+    for (k, v) in &headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    match req.send() {
+        Ok(resp) => {
+            let st = resp.status().as_u16();
+            if (200..300).contains(&st) {
+                out.usable = Some(true);
+            } else if (400..500).contains(&st) {
+                out.usable = Some(false);
+                out.error = format!("HTTP {st}");
+            } else {
+                out.error = format!("HTTP {st}");
+            }
+        }
+        Err(e) => {
+            out.error = if e.to_string().contains("timed out") { "超时".into() } else { e.to_string() };
+        }
+    }
+    out
+}
+
+/// 批量探针：逐个顺序请求（每模型最多 15s，避免并发打爆端点）。
+pub fn probe_models(pid: &str, ids: &[String], progress: impl Fn(usize, usize)) -> Vec<ProbeOutcome> {
+    let mut out = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        out.push(probe_model(pid, id));
+        progress(i + 1, ids.len());
+    }
+    out
 }
 
 // ── 导入（热写入 + 校验） ───────────────────────────────────────────

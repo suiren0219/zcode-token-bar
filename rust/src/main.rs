@@ -68,6 +68,22 @@ fn main() {
 
     init_logging();
 
+    // --discover <provider_id>：命令行直跑发现（排障入口，输出脱敏细节）
+    if arg == "--discover" {
+        let pid = args.get(2).map(|s| s.as_str()).unwrap_or("xingchiapi");
+        match models::discover_provider(pid) {
+            Ok(d) => println!(
+                "OK: {} 个模型 from {}
+示例: {:?}",
+                d.rows.len(),
+                d.provider,
+                d.rows.iter().take(5).map(|r| r.id.clone()).collect::<Vec<_>>()
+            ),
+            Err(e) => println!("ERR: {e}"),
+        }
+        return;
+    }
+
     if arg == "--once" {
         match data::connect_readonly() {
             Ok(con) => {
@@ -583,10 +599,19 @@ fn bind_panel_callbacks(
         let idx = provider_index.clone();
         let panel = panel.clone();
         win.on_provider_changed(move |s| {
-            if let Ok(i) = s.to_string().parse::<i32>() {
-                idx.store(i, Ordering::Relaxed);
+            // Slint 1.18 的 ComboBox.selected 传的是选中文本（"名字 · 协议"），
+            // 不是索引——按文本反查 provider 列表位置（此前 parse 失败导致
+            // 索引永远停在 0：选 Xingchia 实际请求的是列表第一项）。
+            let display = s.to_string();
+            let providers = models::configured_providers();
+            if let Some(i) = providers
+                .iter()
+                .position(|p| format!("{} · {}", p.name, p.kind) == display
+                    || p.name == display)
+            {
+                idx.store(i as i32, Ordering::Relaxed);
                 if let Some(w) = panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
-                    w.set_provider_index(i);
+                    w.set_provider_index(i as i32);
                 }
             }
         });
@@ -682,6 +707,76 @@ fn bind_panel_callbacks(
                         } else {
                             w.set_models_status(format!("导入失败：{}", result.error).into());
                         }
+                    }
+                });
+            });
+        });
+    }
+    {
+        let panel = panel.clone();
+        let busy = busy.clone();
+        let rows_slot = last_rows.clone();
+        win.on_probe_clicked(move || {
+            if busy.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            let rows = rows_slot.lock().unwrap().clone();
+            if rows.is_empty() {
+                busy.store(false, Ordering::Relaxed);
+                return;
+            }
+            if let Some(w) = panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
+                w.set_models_busy(true);
+                w.set_models_status(format!("探测中：0/{}…", rows.len()).into());
+            }
+            let panel = panel.clone();
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                let mut usable_rows = Vec::new();
+                let mut unusable = Vec::new();
+                let total = rows.len();
+                for (i, r) in rows.iter().enumerate() {
+                    let o = models::probe_model(&r.provider_id, &r.id);
+                    match o.usable {
+                        Some(true) => usable_rows.push(r.clone()),
+                        Some(false) => unusable.push(r.id.clone()),
+                        _ => unusable.push(format!("{}({})", r.id, o.error)),
+                    }
+                    let done = i + 1;
+                    let p2 = panel.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = p2.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
+                            w.set_models_status(format!("探测中：{done}/{total}…").into());
+                        }
+                    });
+                }
+                let mut result = models::ImportResult::default();
+                if !usable_rows.is_empty() {
+                    let mut groups: Vec<(String, Vec<models::ModelRow>)> = Vec::new();
+                    for r in &usable_rows {
+                        match groups.iter_mut().find(|(p, _)| *p == r.provider_id) {
+                            Some((_, v)) => v.push(r.clone()),
+                            None => groups.push((r.provider_id.clone(), vec![r.clone()])),
+                        }
+                    }
+                    result = models::import_groups(&groups);
+                    let applied = models::verify_import_applied(&result.added_ids);
+                    if !applied {
+                        result.error = "写入被 ZCode 覆盖".into();
+                    }
+                }
+                let summary = format!(
+                    "实测 {} 个：可用 {} 已导入，{} 不可用/未知{}",
+                    total,
+                    usable_rows.len(),
+                    unusable.len(),
+                    if result.error.is_empty() { String::new() } else { format!("；{}", result.error) }
+                );
+                let _ = slint::invoke_from_event_loop(move || {
+                    busy.store(false, Ordering::Relaxed);
+                    if let Some(w) = panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
+                        w.set_models_busy(false);
+                        w.set_models_status(summary.into());
                     }
                 });
             });
