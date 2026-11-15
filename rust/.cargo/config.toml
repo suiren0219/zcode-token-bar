@@ -1,0 +1,4 @@
+# 不在仓库配置中写入机器绝对路径。
+# MSVC: cargo build --release
+# LLVM-MinGW: 使用 scripts/build-llvm-mingw.ps1，
+# 通过 -ToolchainRoot 指定工具链目录，兼容库在 target/ 中自动生成。

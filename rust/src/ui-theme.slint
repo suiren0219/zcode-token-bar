@@ -1,0 +1,234 @@
+// 共享设置主题。颜色按 RRGGBBAA 编写，所有承载内容的表面均为不透明实底。
+import { Button, SpinBox, CheckBox, ScrollView } from "std-widgets.slint";
+
+export global SettingsTheme {
+    in-out property <bool> wallpaper-active: false;
+    out property <string> font-family: "Microsoft YaHei UI";
+    out property <length> body-size: 14px;
+    out property <length> section-size: 16px;
+    out property <length> title-size: 22px;
+    out property <length> space-xs: 4px;
+    out property <length> space-sm: 8px;
+    out property <length> space-md: 12px;
+    out property <length> space-lg: 16px;
+    out property <length> page-padding: 20px;
+    out property <length> control-height: 36px;
+    out property <length> selection-row-height: 40px;
+    out property <length> radius: 8px;
+    out property <color> background: #17191fff;
+    out property <color> sidebar: root.wallpaper-active ? #161b24b8 : #1e2128ff;
+    out property <color> surface: root.wallpaper-active ? #242831d9 : #242831ff;
+    out property <color> inset: #191d24ff;
+    out property <color> hover: #303744ff;
+    out property <color> pressed: #3b4655ff;
+    out property <color> selected: #293f53ff;
+    out property <color> border: #414958ff;
+    out property <color> text: #f3f5f8ff;
+    out property <color> secondary: #bdc6d4ff;
+    out property <color> muted: #a5b0c0ff;
+    out property <color> accent: #8bcaffff;
+    out property <color> good: #9ad7b6ff;
+    out property <color> warning: #f2cc8fff;
+    out property <color> error: #ffb4abff;
+}
+
+export component BodyText inherits Text {
+    font-family: SettingsTheme.font-family;
+    font-size: SettingsTheme.body-size;
+    color: SettingsTheme.text;
+    wrap: word-wrap;
+    min-width: 0px;
+    vertical-stretch: 0;
+}
+
+export component HelpText inherits BodyText {
+    color: SettingsTheme.secondary;
+}
+
+export component Section inherits Rectangle {
+    in property <string> title;
+    background: SettingsTheme.surface;
+    border-radius: SettingsTheme.radius;
+    border-width: 1px;
+    border-color: SettingsTheme.border;
+    min-width: 0px;
+    vertical-stretch: 0;
+    VerticalLayout {
+        padding: SettingsTheme.space-lg;
+        spacing: SettingsTheme.space-md;
+        alignment: start;
+        if root.title != "": BodyText {
+            text: root.title;
+            font-size: SettingsTheme.section-size;
+            font-weight: 600;
+        }
+        @children
+    }
+}
+
+export component PageScroll inherits ScrollView {
+    min-width: 0px;
+    min-height: 0px;
+    horizontal-scrollbar-policy: always-off;
+    vertical-scrollbar-policy: as-needed;
+    content-width: self.visible-width;
+    content-height: content.preferred-height;
+    content-x: 0px;
+    content := VerticalLayout {
+        width: root.visible-width;
+        height: self.preferred-height;
+        padding: SettingsTheme.page-padding;
+        padding-right: SettingsTheme.page-padding + SettingsTheme.space-xs;
+        spacing: SettingsTheme.space-lg;
+        alignment: start;
+        @children
+    }
+}
+
+// 标准 widgets 保留平台原生键盘、焦点和 accessibility 行为。
+export component ActionButton inherits Button {
+    min-width: 0px;
+    min-height: SettingsTheme.control-height;
+    horizontal-stretch: 1;
+}
+
+export component NumberRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> help;
+    in property <int> minimum: 0;
+    in property <int> maximum: 100;
+    in property <int> step-size: 1;
+    in property <bool> enabled: true;
+    in-out property <int> value;
+    callback edited(int);
+    spacing: SettingsTheme.space-md;
+    min-width: 0px;
+    VerticalLayout {
+        spacing: SettingsTheme.space-xs;
+        alignment: center;
+        min-width: 0px;
+        BodyText { text: root.label; }
+        if root.help != "": HelpText { text: root.help; }
+    }
+    SpinBox {
+        width: 134px;
+        min-height: SettingsTheme.control-height;
+        value <=> root.value;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step-size: root.step-size;
+        enabled: root.enabled;
+        accessible-label: root.label;
+        edited(value) => { root.edited(value); }
+    }
+}
+
+export component ToggleRow inherits VerticalLayout {
+    in property <string> label;
+    in property <string> help;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    callback toggled(bool);
+    spacing: SettingsTheme.space-xs;
+    CheckBox {
+        text: root.label;
+        checked <=> root.checked;
+        enabled: root.enabled;
+        min-height: SettingsTheme.control-height;
+        toggled => { root.toggled(self.checked); }
+    }
+    if root.help != "": HelpText { text: root.help; }
+}
+
+// 导航页签/模型行共用可聚焦的选择表面。鼠标、键盘与读屏动作走同一回调。
+export component SelectableRow inherits Rectangle {
+    in property <string> label;
+    in property <string> prefix;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    in property <bool> request-focus: false;
+    in property <int> item-index: 0;
+    callback activated();
+    callback move-selection(int);
+    callback focus-received();
+    min-width: 0px;
+    height: SettingsTheme.selection-row-height;
+    vertical-stretch: 0;
+    border-radius: SettingsTheme.radius;
+    border-width: focus.has-focus ? 2px : 0px;
+    border-color: SettingsTheme.accent;
+    background: root.selected ? SettingsTheme.selected : touch.pressed ? SettingsTheme.pressed : touch.has-hover ? SettingsTheme.hover : SettingsTheme.sidebar;
+    accessible-role: list-item;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-item-index: root.item-index;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    accessible-action-default => { if root.enabled { focus.focus(); root.focus-received(); root.activated(); } }
+    forward-focus: focus;
+
+    // 键盘请求只消费一次；虚拟列表新建的目标行也能接住请求。
+    function take-requested-focus() {
+        if root.request-focus && root.enabled {
+            focus.focus();
+            root.focus-received();
+        }
+    }
+    changed request-focus => { root.take-requested-focus(); }
+    init => { root.take-requested-focus(); }
+
+    Rectangle {
+        x: 0px;
+        y: 10px;
+        width: 3px;
+        height: parent.height - 20px;
+        border-radius: 1.5px;
+        background: root.selected ? SettingsTheme.accent : SettingsTheme.sidebar;
+    }
+    HorizontalLayout {
+        padding-left: SettingsTheme.space-md;
+        padding-right: SettingsTheme.space-md;
+        spacing: SettingsTheme.space-sm;
+        if root.prefix != "": BodyText {
+            text: root.prefix;
+            color: root.selected ? SettingsTheme.accent : SettingsTheme.muted;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+        BodyText {
+            text: root.label;
+            color: root.enabled ? SettingsTheme.text : SettingsTheme.muted;
+            font-weight: root.selected ? 600 : 400;
+            wrap: no-wrap;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            accessible-role: none;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { focus.focus(); root.focus-received(); root.activated(); }
+    }
+    focus := FocusScope {
+        width: 0px;
+        enabled: root.enabled;
+        focus-changed-event => { if self.has-focus { root.focus-received(); } }
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == Key.Space {
+                root.activated();
+                return accept;
+            }
+            if event.text == Key.UpArrow {
+                root.move-selection(-1);
+                return accept;
+            }
+            if event.text == Key.DownArrow {
+                root.move-selection(1);
+                return accept;
+            }
+            return reject;
+        }
+    }
+}

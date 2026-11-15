@@ -1,0 +1,167 @@
+import { ScrollView, TextEdit, Button } from "std-widgets.slint";
+import { SettingsWindow, SettingsBridge } from "settings.slint";
+export { SettingsWindow, SettingsBridge }
+
+component Metric inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <string> suffix;
+    in property <color> ink: #ebeff4;
+    in property <length> text-size: 13px;
+    spacing: 4px;
+    alignment: center;
+    if label != "": Text { text: root.label; color: #a5b0bd; font-size: root.text-size - 1px; vertical-alignment: center; }
+    Text { text: root.value; color: root.ink; font-size: root.text-size; font-weight: 600; vertical-alignment: center; }
+    if suffix != "": Text { text: root.suffix; color: #a5b0bd; font-size: root.text-size - 1px; vertical-alignment: center; }
+}
+
+export component BarWindow inherits Window {
+    no-frame: true;
+    title: "zcode-token-bar-bar";
+    icon: @image-url("icon.png");
+    default-font-family: root.font-family;
+    background: transparent;
+    in property <string> font-family: "Microsoft YaHei UI";
+    in property <int> font-px: 13;
+    in property <float> opacity-level: 0.92;
+    in property <bool> labels-on: true;
+    in property <bool> pinned: false;
+    in property <bool> active: false;
+    in property <bool> has-data: false;
+    in property <string> title-text: "等待会话";
+    in property <string> speed: "";
+    in property <int> speed-level: 0;
+    in property <string> context-text: "";
+    in property <float> context-percent: 0;
+    in property <int> context-level: 0;
+    in property <string> turn: "";
+    in property <string> turn-sub: "";
+    in property <string> session: "";
+    in property <string> session-sub: "";
+    in property <string> today: "";
+    in property <string> tools: "";
+    in property <string> tools-errors: "";
+    in property <string> cache: "";
+    in property <int> cache-level: 0;
+    in property <string> warning: "";
+    in property <bool> companion-enabled: false;
+    in property <length> bar-max-width: 1400px;
+    callback action(string);
+    callback drag-start();
+    callback drag-move();
+    callback drag-end();
+    callback hovering(bool);
+    function level-color(level:int)->color {return level==3 ? #a5b0bd : (level>=2 ? #ff8e91 : (level==1 ? #f6ca7b : #a7e4bc));}
+    width: min(root.bar-max-width, max(250px, content.preferred-width + 16px));
+    height: max(38px, root.font-px * 1px + 22px);
+    Rectangle {
+        background: #11161d;
+        opacity: root.opacity-level;
+        border-radius: self.height / 2;
+        border-width: 1px;
+        border-color: root.pinned ? #b6cc8a : #46515d;
+    }
+    drag := TouchArea {
+        mouse-cursor: root.pinned ? default : grab;
+        changed has-hover => {root.hovering(self.has-hover);}
+        pointer-event(e) => {
+            if e.button==PointerEventButton.left {
+                if e.kind==PointerEventKind.down {root.drag-start();}
+                if e.kind==PointerEventKind.up || e.kind==PointerEventKind.cancel {root.drag-end();}
+            }
+            if e.button==PointerEventButton.right && e.kind==PointerEventKind.up {root.action("menu");}
+        }
+        moved => {if self.pressed {root.drag-move();}}
+        double-clicked => {root.action("settings");}
+    }
+    content := HorizontalLayout {
+        padding-left: 8px; padding-right: 8px; spacing: 10px; alignment: center;
+        Rectangle {
+            width: 26px;
+            accessible-role: button;
+            accessible-label: root.pinned ? "解除会话和位置钉住" : "钉住会话和位置";
+            accessible-action-default => {root.action("pin");}
+            TouchArea {mouse-cursor: pointer; clicked => {root.action("pin");}}
+            Text {text: root.pinned ? "◆" : "◇"; color:root.pinned ? #e1ee96 : #c4d0dc; font-size:17px;horizontal-alignment:center;vertical-alignment:center;}
+        }
+        ScrollView {
+            min-width: 90px;
+            preferred-width: metrics.preferred-width;
+            horizontal-stretch: 1;
+            vertical-scrollbar-policy: always-off;
+            horizontal-scrollbar-policy: always-off;
+            height: parent.height - 8px;
+            content-width: metrics.preferred-width;
+            content-height: self.height;
+            metrics := HorizontalLayout {
+                height: parent.height;
+                spacing: 12px;
+                alignment: center;
+                if !root.has-data: Text {text: root.title-text; color:#a5b0bd;font-size:root.font-px*1px;vertical-alignment:center;}
+                if root.warning != "": Text {text:root.warning;color:#ffb4a3;font-size:(root.font-px - 1)*1px;vertical-alignment:center;}
+                if root.speed != "": Metric {label:root.labels-on ? "速度" : "";value:root.speed;suffix:"t/s";ink:root.level-color(root.speed-level);text-size:root.font-px*1px;}
+                if root.context-text != "": HorizontalLayout {
+                    spacing:5px;alignment:center;
+                    if root.labels-on:Text {text:"上下文";color:#a5b0bd;font-size:(root.font-px - 1)*1px;vertical-alignment:center;}
+                    Rectangle {width:34px;height:5px;border-radius:3px;background:#3a434f;
+                        Rectangle {height:parent.height;width:parent.width*min(100,max(0,root.context-percent))/100;border-radius:3px;background:root.level-color(root.context-level);}
+                    }
+                    Text {text:root.context-text;color:root.level-color(root.context-level);font-size:root.font-px*1px;vertical-alignment:center;}
+                }
+                if root.turn != "":Metric {label:root.labels-on?"本轮":"";value:root.turn;suffix:root.turn-sub;text-size:root.font-px*1px;}
+                if root.session != "":Metric {label:root.labels-on?"会话":"";value:root.session;suffix:root.session-sub;text-size:root.font-px*1px;}
+                if root.today != "":Metric {label:root.labels-on?"今日":"";value:root.today;text-size:root.font-px*1px;}
+                if root.tools != "":Metric {label:root.labels-on?"工具":"";value:root.tools;suffix:root.tools-errors;ink:root.tools-errors!=""?#ffb4a3:#ebeff4;text-size:root.font-px*1px;}
+                if root.cache != "":Metric {label:root.labels-on?"缓存":"";value:root.cache;ink:root.level-color(root.cache-level);text-size:root.font-px*1px;}
+            }
+        }
+        if root.companion-enabled:Rectangle {
+            width:26px;accessible-role:button;accessible-label:"打开小亚陪伴";accessible-action-default=>{root.action("companion");}
+            TouchArea{mouse-cursor:pointer;clicked=>{root.action("companion");}}
+            Image{source:@image-url("icon.png");width:23px;height:23px;image-fit:contain;}
+        }
+        Rectangle {
+            width:30px;
+            accessible-role:button;accessible-label:"打开悬浮条设置";accessible-action-default=>{root.action("settings");}
+            TouchArea{mouse-cursor:pointer;clicked=>{root.action("settings");}}
+            Text{text:"⚙";color:#e5ebf1;font-size:18px;horizontal-alignment:center;vertical-alignment:center;}
+        }
+    }
+}
+
+export component DetailsWindow inherits Window {
+    title:"zcode-token-bar-details";icon:@image-url("icon.png");default-font-family:"Microsoft YaHei UI";
+    preferred-width:640px;preferred-height:560px;min-width:420px;min-height:300px;background:#161a21;
+    in property <string> content-text;
+    callback action(string);
+    VerticalLayout{padding:16px;spacing:12px;
+        Text{text:"会话与用量详情";color:#eef1f6;font-size:18px;font-weight:600;}
+        TextEdit{text:root.content-text;read-only:true;font-size:13px;wrap:word-wrap;}
+        HorizontalLayout{spacing:8px;
+            Button{text:"当前会话";clicked=>{root.action("details-current");}}
+            Button{text:"近 7 天";clicked=>{root.action("reports-week");}}
+            Button{text:"近 30 天";clicked=>{root.action("reports-month");}}
+        }
+        HorizontalLayout{alignment:end;spacing:8px;Button{text:"复制详情";clicked=>{root.action("copy-details");}}Button{text:"关闭";clicked=>{root.action("close-details");}}}
+    }
+}
+export component HoverWindow inherits Window {
+    title:"zcode-token-bar-hover";no-frame:true;always-on-top:true;background:#161a21;
+    preferred-width:480px;preferred-height:360px;default-font-family:"Microsoft YaHei UI";
+    in property <string> content-text;
+    VerticalLayout{padding:14px;spacing:8px;
+        TextEdit{text:root.content-text;read-only:true;font-size:12px;wrap:word-wrap;}
+        Text{text:"可移入阅读和滚动 · 右键条面查看独立详情";color:#a0adbb;font-size:11px;}
+    }
+}
+export component ToastWindow inherits Window {
+    title:"zcode-token-bar-companion-toast";no-frame:true;always-on-top:true;background:#171d24;
+    preferred-width:340px;preferred-height:130px;default-font-family:"Microsoft YaHei UI";
+    in property <string> message;
+    callback clicked();
+    HorizontalLayout{padding:12px;spacing:10px;
+        Image{source:@image-url("icon.png");width:44px;height:44px;image-fit:contain;}
+        Text{text:root.message;color:#ecf1f5;font-size:13px;wrap:word-wrap;}
+    }
+    TouchArea{mouse-cursor:pointer;clicked=>{root.clicked();}}
+}
