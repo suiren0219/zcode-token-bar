@@ -4327,26 +4327,6 @@ def main(argv):
             return 0
         print("悬浮条未运行，先启动：python hoverbar.py")
         return 1
-    if "--panel" in argv:
-        # 只开设置面板、不显示条面（Rust 版条面 2026-11-15 起接管显示，
-        # 这里的面板照常可用：壁纸/CDP/模型导入全在）。已有实例在跑就把
-        # 面板指令转给它；否则藏起条面、开面板，面板关闭进程即退。
-        if running_pid():
-            send("settings")
-            return 0
-        bar = HoverBar(load_settings())
-        bar.root.withdraw()
-        bar.root.after(250, bar.open_settings)
-
-        def _poll():
-            if getattr(bar, "_dlg", None) is None:
-                bar.root.quit()
-                return
-            bar.root.after(500, _poll)
-
-        bar.root.after(600, _poll)
-        bar.run()
-        return 0
     if "--check-update" in argv:
         return cli_check_update()
     if "--update" in argv:

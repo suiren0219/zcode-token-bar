@@ -1,187 +1,167 @@
-// 条面：无边框深色圆角胶囊，外观照 Python 版还原。
-// 数据全部由 Rust 侧拼好传进来（字符串 + 配色等级 0=正常 1=警示 2=告急），
-// UI 只负责排版——口径集中在 data.rs，Slint 里没有业务逻辑。
+import { ScrollView, TextEdit, Button } from "std-widgets.slint";
+import { SettingsWindow, SettingsBridge } from "settings.slint";
+export { SettingsWindow, SettingsBridge }
 
-import { Button } from "std-widgets.slint";
-import { SettingsWindow } from "settings.slint";
-export { SettingsWindow }
+component Metric inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <string> suffix;
+    in property <color> ink: #ebeff4;
+    in property <length> text-size: 13px;
+    spacing: 4px;
+    alignment: center;
+    if label != "": Text { text: root.label; color: #a5b0bd; font-size: root.text-size - 1px; vertical-alignment: center; }
+    Text { text: root.value; color: root.ink; font-size: root.text-size; font-weight: 600; vertical-alignment: center; }
+    if suffix != "": Text { text: root.suffix; color: #a5b0bd; font-size: root.text-size - 1px; vertical-alignment: center; }
+}
 
 export component BarWindow inherits Window {
     no-frame: true;
     title: "zcode-token-bar-bar";
     icon: @image-url("icon.png");
-    always-on-top: true;
-    default-font-family: "Microsoft YaHei UI";
+    default-font-family: root.font-family;
     background: transparent;
-
-    // ── Rust 侧注入的数据 ──
-    // 三档配色（对照 Python 版 OK/WARM/HOT）。
-    function level-color(level: int) -> color {
-        if (level >= 2) { return #ff6b6b; }   // HOT  告急（红）
-        if (level == 1) { return #ffc966; }   // WARM 警示（橙黄）
-        return #7ddb8a;                        // OK   正常（绿）
-    }
-
-    in property <string> session-title: "…";
-    in property <bool> active: false;
-    in property <bool> generating: false;
-    in property <string> speed-text: "";
-    in property <int> speed-level: 0;
-    in property <int> ctx-pct: 0;           // 0-100，进度条宽度
-    in property <string> ctx-text: "";
-    in property <int> ctx-level: 0;
-    in property <string> turn-text: "";
-    in property <string> turn-sub: "";
-    in property <string> session-text: "";
-    in property <string> session-sub: "";
-    in property <string> today-text: "";
-    in property <string> cache-text: "";
-    in property <int> cache-level: 0;
-    in property <bool> has-data: false;
-    in property <float> opacity-level: 0.92;
+    in property <string> font-family: "Microsoft YaHei UI";
     in property <int> font-px: 13;
+    in property <float> opacity-level: 0.92;
     in property <bool> labels-on: true;
-
-    callback settings-clicked();
-    // 拖动：down/move 持续触发 drag-move，up 触发 drag-end，双击恢复自动贴靠。
+    in property <bool> pinned: false;
+    in property <bool> active: false;
+    in property <bool> has-data: false;
+    in property <string> title-text: "等待会话";
+    in property <string> speed: "";
+    in property <int> speed-level: 0;
+    in property <string> context-text: "";
+    in property <float> context-percent: 0;
+    in property <int> context-level: 0;
+    in property <string> turn: "";
+    in property <string> turn-sub: "";
+    in property <string> session: "";
+    in property <string> session-sub: "";
+    in property <string> today: "";
+    in property <string> tools: "";
+    in property <string> tools-errors: "";
+    in property <string> cache: "";
+    in property <int> cache-level: 0;
+    in property <string> warning: "";
+    in property <bool> companion-enabled: false;
+    in property <length> bar-max-width: 1400px;
+    callback action(string);
     callback drag-start();
     callback drag-move();
     callback drag-end();
-    callback dock-restore();
-
-    // 胶囊底整个可拖（设置按钮的 TouchArea 在上层，优先吃掉点击）。
-    // moved 里只发信号，坐标全由 Rust 侧 GetCursorPos 计算——避开
-    // Slint 逻辑坐标与 Win32 物理坐标的换算。
-    touch := TouchArea {
-        mouse-cursor: default;
-        pointer-event(p) => {
-            if (p.kind == PointerEventKind.down) { root.drag-start(); }
-            if (p.kind == PointerEventKind.up) { root.drag-end(); }
-        }
-        moved => { root.drag-move(); }
-        double-clicked => { root.dock-restore(); }
-    }
-
-    // 宽度自适应内容：绑到胶囊的 preferred-width（各数据项自然宽度之和），
-    // 下限 340 防止空数据时缩成一条缝。Python 版就是内容定宽。
-    width: max(340px, bar.preferred-width);
-    height: 40px;
-
-    // 胶囊底：半透明深色 + 1px 描边（对照 Python 版 EF_PAPER/EF_RULE）。
-    bar := Rectangle {
+    callback hovering(bool);
+    function level-color(level:int)->color {return level==3 ? #a5b0bd : (level>=2 ? #ff8e91 : (level==1 ? #f6ca7b : #a7e4bc));}
+    width: min(root.bar-max-width, max(250px, content.preferred-width + 16px));
+    height: max(38px, root.font-px * 1px + 22px);
+    Rectangle {
+        background: #11161d;
         opacity: root.opacity-level;
         border-radius: self.height / 2;
-        background: #0e1014e6;
         border-width: 1px;
-        border-color: #ffffff33;
-
-        HorizontalLayout {
-            padding-left: 14px;
-            padding-right: 8px;
-            padding-top: 6px;
-            padding-bottom: 6px;
-            spacing: 10px;
-            alignment: center;
-
-            // 左：会话状态点 + 标题（窄条里截断）。
-            Rectangle {
-                width: 7px;
-                border-radius: 3.5px;
-                y: (parent.height - self.height) / 2;
-                background: root.generating ? #7ddb8a : (root.active ? #7ddb8a : #8a909966);
+        border-color: root.pinned ? #b6cc8a : #46515d;
+    }
+    drag := TouchArea {
+        mouse-cursor: root.pinned ? default : grab;
+        changed has-hover => {root.hovering(self.has-hover);}
+        pointer-event(e) => {
+            if e.button==PointerEventButton.left {
+                if e.kind==PointerEventKind.down {root.drag-start();}
+                if e.kind==PointerEventKind.up || e.kind==PointerEventKind.cancel {root.drag-end();}
             }
-            Text {
-                text: root.session-title;
-                color: #dde3e8;
-                font-size: root.font-px * 1px;
-                vertical-alignment: center;
-                overflow: elide;
-                max-width: 150px;
-            }
-
-            // 速度
-            if root.speed-text != "": HorizontalLayout {
-                spacing: 3px;
+            if e.button==PointerEventButton.right && e.kind==PointerEventKind.up {root.action("menu");}
+        }
+        moved => {if self.pressed {root.drag-move();}}
+        double-clicked => {root.action("settings");}
+    }
+    content := HorizontalLayout {
+        padding-left: 8px; padding-right: 8px; spacing: 10px; alignment: center;
+        Rectangle {
+            width: 26px;
+            accessible-role: button;
+            accessible-label: root.pinned ? "解除会话和位置钉住" : "钉住会话和位置";
+            accessible-action-default => {root.action("pin");}
+            TouchArea {mouse-cursor: pointer; clicked => {root.action("pin");}}
+            Text {text: root.pinned ? "◆" : "◇"; color:root.pinned ? #e1ee96 : #c4d0dc; font-size:17px;horizontal-alignment:center;vertical-alignment:center;}
+        }
+        ScrollView {
+            min-width: 90px;
+            preferred-width: metrics.preferred-width;
+            horizontal-stretch: 1;
+            vertical-scrollbar-policy: always-off;
+            horizontal-scrollbar-policy: always-off;
+            height: parent.height - 8px;
+            content-width: metrics.preferred-width;
+            content-height: self.height;
+            metrics := HorizontalLayout {
+                height: parent.height;
+                spacing: 12px;
                 alignment: center;
-                Text { text: root.speed-text; color: level-color(root.speed-level); font-size: root.font-px * 1px; font-weight: 700; vertical-alignment: center; }
-                Text { text: "t/s"; color: #8892a0; font-size: (root.font-px - 2) * 1px; vertical-alignment: center; }
-            }
-
-            // 上下文：微进度条 + 百分比
-            if root.ctx-pct > 0: HorizontalLayout {
-                spacing: 4px;
-                alignment: center;
-                Rectangle {
-                    width: 36px;
-                    height: 4px;
-                    y: (parent.height - self.height) / 2;
-                    border-radius: 2px;
-                    background: #ffffff22;
-                    Rectangle {
-                        x: 0;
-                        y: 0;
-                        height: parent.height;
-                        width: parent.width * min(100, max(0, root.ctx-pct)) / 100;
-                        border-radius: 2px;
-                        background: level-color(root.ctx-level);
+                if !root.has-data: Text {text: root.title-text; color:#a5b0bd;font-size:root.font-px*1px;vertical-alignment:center;}
+                if root.warning != "": Text {text:root.warning;color:#ffb4a3;font-size:(root.font-px - 1)*1px;vertical-alignment:center;}
+                if root.speed != "": Metric {label:root.labels-on ? "速度" : "";value:root.speed;suffix:"t/s";ink:root.level-color(root.speed-level);text-size:root.font-px*1px;}
+                if root.context-text != "": HorizontalLayout {
+                    spacing:5px;alignment:center;
+                    if root.labels-on:Text {text:"上下文";color:#a5b0bd;font-size:(root.font-px - 1)*1px;vertical-alignment:center;}
+                    Rectangle {width:34px;height:5px;border-radius:3px;background:#3a434f;
+                        Rectangle {height:parent.height;width:parent.width*min(100,max(0,root.context-percent))/100;border-radius:3px;background:root.level-color(root.context-level);}
                     }
+                    Text {text:root.context-text;color:root.level-color(root.context-level);font-size:root.font-px*1px;vertical-alignment:center;}
                 }
-                Text { text: root.ctx-text; color: level-color(root.ctx-level); font-size: root.font-px * 1px; vertical-alignment: center; }
-            }
-
-            // 本轮
-            if root.turn-text != "": HorizontalLayout {
-                spacing: 3px;
-                alignment: center;
-                Text { text: "本轮"; color: #8892a0; font-size: (root.font-px - 2) * 1px; visible: root.labels-on; vertical-alignment: center; }
-                Text { text: root.turn-text; color: #dde3e8; font-size: root.font-px * 1px; vertical-alignment: center; }
-                if root.turn-sub != "": Text { text: root.turn-sub; color: #8892a0; font-size: (root.font-px - 2) * 1px; vertical-alignment: center; }
-            }
-
-            // 会话
-            if root.session-text != "": HorizontalLayout {
-                spacing: 3px;
-                alignment: center;
-                Text { text: "会话"; color: #8892a0; font-size: (root.font-px - 2) * 1px; visible: root.labels-on; vertical-alignment: center; }
-                Text { text: root.session-text; color: #dde3e8; font-size: root.font-px * 1px; vertical-alignment: center; }
-                if root.session-sub != "": Text { text: root.session-sub; color: #8892a0; font-size: (root.font-px - 2) * 1px; vertical-alignment: center; }
-            }
-
-            // 今日
-            if root.today-text != "": HorizontalLayout {
-                spacing: 3px;
-                alignment: center;
-                Text { text: "今日"; color: #8892a0; font-size: (root.font-px - 2) * 1px; visible: root.labels-on; vertical-alignment: center; }
-                Text { text: root.today-text; color: #dde3e8; font-size: root.font-px * 1px; vertical-alignment: center; }
-            }
-
-            // 缓存率
-            if root.cache-text != "": HorizontalLayout {
-                spacing: 3px;
-                alignment: center;
-                Text { text: "缓存"; color: #8892a0; font-size: (root.font-px - 2) * 1px; visible: root.labels-on; vertical-alignment: center; }
-                Text { text: root.cache-text; color: level-color(root.cache-level); font-size: root.font-px * 1px; vertical-alignment: center; }
-            }
-
-            // 右端：设置按钮（悬停反白；点击回调给 Rust）。
-            // 窗口宽度已自适应内容，固定 width 不会被裁（此前是被 560 定宽裁掉的）。
-            Rectangle {
-                width: 22px;
-                border-radius: 6px;
-                y: (parent.height - self.height) / 2;
-                background: btn.pressed ? #ffffff33 : (btn.has-hover ? #ffffff22 : transparent);
-                btn := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { root.settings-clicked(); }
-                }
-                Text {
-                    text: "◱";
-                    color: btn.has-hover ? #ffffff : #8892a0;
-                    font-size: 12px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
+                if root.turn != "":Metric {label:root.labels-on?"本轮":"";value:root.turn;suffix:root.turn-sub;text-size:root.font-px*1px;}
+                if root.session != "":Metric {label:root.labels-on?"会话":"";value:root.session;suffix:root.session-sub;text-size:root.font-px*1px;}
+                if root.today != "":Metric {label:root.labels-on?"今日":"";value:root.today;text-size:root.font-px*1px;}
+                if root.tools != "":Metric {label:root.labels-on?"工具":"";value:root.tools;suffix:root.tools-errors;ink:root.tools-errors!=""?#ffb4a3:#ebeff4;text-size:root.font-px*1px;}
+                if root.cache != "":Metric {label:root.labels-on?"缓存":"";value:root.cache;ink:root.level-color(root.cache-level);text-size:root.font-px*1px;}
             }
         }
+        if root.companion-enabled:Rectangle {
+            width:26px;accessible-role:button;accessible-label:"打开小亚陪伴";accessible-action-default=>{root.action("companion");}
+            TouchArea{mouse-cursor:pointer;clicked=>{root.action("companion");}}
+            Image{source:@image-url("icon.png");width:23px;height:23px;image-fit:contain;}
+        }
+        Rectangle {
+            width:30px;
+            accessible-role:button;accessible-label:"打开悬浮条设置";accessible-action-default=>{root.action("settings");}
+            TouchArea{mouse-cursor:pointer;clicked=>{root.action("settings");}}
+            Text{text:"⚙";color:#e5ebf1;font-size:18px;horizontal-alignment:center;vertical-alignment:center;}
+        }
     }
+}
+
+export component DetailsWindow inherits Window {
+    title:"zcode-token-bar-details";icon:@image-url("icon.png");default-font-family:"Microsoft YaHei UI";
+    preferred-width:640px;preferred-height:560px;min-width:420px;min-height:300px;background:#161a21;
+    in property <string> content-text;
+    callback action(string);
+    VerticalLayout{padding:16px;spacing:12px;
+        Text{text:"会话与用量详情";color:#eef1f6;font-size:18px;font-weight:600;}
+        TextEdit{text:root.content-text;read-only:true;font-size:13px;wrap:word-wrap;}
+        HorizontalLayout{spacing:8px;
+            Button{text:"当前会话";clicked=>{root.action("details-current");}}
+            Button{text:"近 7 天";clicked=>{root.action("reports-week");}}
+            Button{text:"近 30 天";clicked=>{root.action("reports-month");}}
+        }
+        HorizontalLayout{alignment:end;spacing:8px;Button{text:"复制详情";clicked=>{root.action("copy-details");}}Button{text:"关闭";clicked=>{root.action("close-details");}}}
+    }
+}
+export component HoverWindow inherits Window {
+    title:"zcode-token-bar-hover";no-frame:true;always-on-top:true;background:#161a21;
+    preferred-width:480px;preferred-height:360px;default-font-family:"Microsoft YaHei UI";
+    in property <string> content-text;
+    VerticalLayout{padding:14px;spacing:8px;
+        TextEdit{text:root.content-text;read-only:true;font-size:12px;wrap:word-wrap;}
+        Text{text:"可移入阅读和滚动 · 右键条面查看独立详情";color:#a0adbb;font-size:11px;}
+    }
+}
+export component ToastWindow inherits Window {
+    title:"zcode-token-bar-companion-toast";no-frame:true;always-on-top:true;background:#171d24;
+    preferred-width:340px;preferred-height:130px;default-font-family:"Microsoft YaHei UI";
+    in property <string> message;
+    callback clicked();
+    HorizontalLayout{padding:12px;spacing:10px;
+        Image{source:@image-url("icon.png");width:44px;height:44px;image-fit:contain;}
+        Text{text:root.message;color:#ecf1f5;font-size:13px;wrap:word-wrap;}
+    }
+    TouchArea{mouse-cursor:pointer;clicked=>{root.clicked();}}
 }

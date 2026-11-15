@@ -1,643 +1,378 @@
-//! 模型发现 / 导入 / 校验：口径与 Python model_discovery.py 对齐。
+//! 原生模型发现、声明合并、能力探针和保守导入。
 //!
-//! 两条配置来源（与 Python 版同构）：
-//! * personal：`~/.zcode/v2/provider_config.json` 的 providerRules
-//!   （自定义 API provider：有 baseUrl/apiKey，走 HTTP 发现）
-//! * builtin/account：`~/.zcode/v2/config.json` 的 provider 字典
-//!   （账号类 provider：没有独立地址，发现走 provider.models 本地清单）
-//!
-//! 导入的「热写入」契约（2026-11-15 与 Python 版同步定稿）：客户端每秒
-//! 轮询 provider_config.json，兼容写入立即生效；写完必须
-//! `verify_import_applied` 读回校验，撞上客户端写回覆盖才降级。
-//!
-//! Rust 与 Python 的差异集中在错误处理：Python 抛 DiscoveryError，
-//! 这里统一返回 `Result<_, String>`（消息文本与 Python 版一致，直接上 UI）。
+//! 同步入口须在后台线程调用。`ModelsService` 固定配置路径，provider 始终以 ID
+//! 选择；界面应保存同一批 `providers()` 结果，不能在点击时重新按索引枚举。
+//! 所有公开结果只含清洗后的名称、ID、能力、固定错误与文件路径，不含认证信息。
+//! 配置读回只能证明条目仍在磁盘，不能证明运行中的客户端已接受它。
 
-use serde_json::{json, Value};
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::time::{Duration, Instant};
 
-/// 账号类 provider 的发现回退上限（Python MAX_MODELS = 200）。
-const MAX_MODELS: usize = 200;
+#[path = "models_config.rs"] mod config;
+#[path = "models_metadata.rs"] mod metadata;
+#[path = "models_http.rs"] mod http;
+#[path = "models_import.rs"] mod importing;
+#[cfg(test)] #[path = "models_tests.rs"] mod tests;
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
-}
+pub use config::ConfigPaths;
+pub use metadata::{capability_lines, load_model_rules, merge_capabilities};
+pub use importing::{FileImport, ImportReport, Verification};
 
-fn v2_config_path() -> PathBuf {
-    home().join(".zcode").join("v2").join("config.json")
-}
+pub const MAX_MODELS: usize = 200;
+pub const MAX_PAGES: usize = 5;
+pub const MAX_BODY: usize = 2 * 1024 * 1024;
+pub const MAX_PROBE_MODELS: usize = 12;
+pub const MODALITIES: [&str; 5] = ["text", "image", "video", "audio", "pdf"];
 
-fn personal_path() -> PathBuf {
-    // 与 Python 版一致：环境变量可覆盖（测试/便携用）。
-    std::env::var("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home().join(".zcode").join("v2").join("provider_config.json"))
-}
-
-fn obj<'a>(v: &'a Value, key: &str) -> &'a Value {
-    v.get(key).unwrap_or(&Value::Null)
-}
-
-fn text(v: &Value, default: &str) -> String {
-    v.as_str().map(|s| s.to_string()).unwrap_or_else(|| default.to_string())
-}
-
-// ── provider 枚举 ───────────────────────────────────────────────────
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ProviderInfo {
-    pub id: String,
-    pub name: String,
-    pub kind: String,
-}
-
-/// 全部可发现的 provider：personal（自定义 API）排前，账号类随后。
-pub fn configured_providers() -> Vec<ProviderInfo> {
-    let mut out: Vec<ProviderInfo> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    if let Ok(data) = std::fs::read_to_string(personal_path()) {
-        if let Ok(v) = serde_json::from_str::<Value>(&data) {
-            let rules = obj(obj(obj(&v, "config"), "providerConfigRules"), "providerRules")
-                .as_array().cloned().unwrap_or_default();
-            for rule in rules {
-                let pid = text(obj(&rule, "providerId"), "");
-                let cfg = obj(&rule, "config").clone();
-                let api = obj(&cfg, "api").clone();
-                if pid.is_empty() || text(obj(&api, "baseUrl"), "").is_empty() {
-                    continue;
-                }
-                if seen.insert(pid.clone()) {
-                    out.push(ProviderInfo {
-                        name: {
-                            let n = text(obj(&rule, "providerName"), &pid);
-                            if n.is_empty() { pid.clone() } else { n }
-                        },
-                        kind: text(obj(&api, "type"), "openai-chat-completions"),
-                        id: pid,
-                    });
-                }
-            }
-        }
-    }
-
-    if let Ok(data) = std::fs::read_to_string(v2_config_path()) {
-        if let Ok(v) = serde_json::from_str::<Value>(&data) {
-            if let Some(providers) = obj(&v, "provider").as_object() {
-                for (pid, p) in providers {
-                    if p.get("enabled") == Some(&json!(false)) || !seen.insert(pid.clone()) {
-                        continue;
-                    }
-                    out.push(ProviderInfo {
-                        id: pid.clone(),
-                        name: text(obj(p, "name"), pid),
-                        kind: text(obj(p, "kind"), "unknown"),
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-/// 发现用完整 provider 记录（含 options/models，认证信息只在内存）。
-fn provider_record(pid: &str) -> Option<Value> {
-    // personal 优先。
-    if let Ok(data) = std::fs::read_to_string(personal_path()) {
-        if let Ok(v) = serde_json::from_str::<Value>(&data) {
-            let rules = obj(obj(obj(&v, "config"), "providerConfigRules"), "providerRules")
-                .as_array().cloned().unwrap_or_default();
-            for rule in rules {
-                if text(obj(&rule, "providerId"), "") == pid {
-                    let cfg = obj(&rule, "config").clone();
-                    let api = obj(&cfg, "api").clone();
-                    let base = text(obj(&api, "baseUrl"), "");
-                    if base.is_empty() {
-                        continue;
-                    }
-                    let ids: Vec<String> = obj(&cfg, "personalModelIds")
-                        .as_array().map(|a| {
-                            a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
-                        }).unwrap_or_default();
-                    let models: Value = ids.into_iter()
-                        .map(|i| (i, json!({}))).collect::<serde_json::Map<String, Value>>().into();
-                    return Some(json!({
-                        "name": text(obj(&rule, "providerName"), pid),
-                        "kind": text(obj(&api, "type"), "openai-chat-completions"),
-                        "options": {
-                            "baseURL": base,
-                            "apiKey": obj(obj(&cfg, "access"), "apiKey"),
-                        },
-                        "models": models,
-                    }));
-                }
-            }
-        }
-    }
-    // 账号类。
-    if let Ok(data) = std::fs::read_to_string(v2_config_path()) {
-        if let Ok(v) = serde_json::from_str::<Value>(&data) {
-            if let Some(p) = obj(&v, "provider").get(pid) {
-                if p.get("enabled") != Some(&json!(false)) {
-                    return Some(p.clone());
-                }
-            }
-        }
-    }
-    None
-}
-
-// ── 发现 ────────────────────────────────────────────────────────────
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ModelRow {
-    pub provider: String,
-    pub provider_id: String,
-    pub id: String,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
+// 保持旧 struct literal 兼容；丰富字段放进单独的 Rich 类型。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProviderInfo { pub id: String, pub name: String, pub kind: String }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModelRow { pub provider: String, pub provider_id: String, pub id: String }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Discovery {
-    pub provider: String,
-    pub provider_id: String,
-    pub rows: Vec<ModelRow>,
-    pub source_note: String,
+    pub provider: String, pub provider_id: String, pub rows: Vec<ModelRow>, pub source_note: String,
 }
-
-/// base URL 清洗：去尾斜杠、剥掉误配的 /models 等端点尾巴（Python _base_url 同规则）。
-fn base_url(options: &Value) -> Result<String, String> {
-    let raw = text(obj(options, "baseURL"), "").trim().to_string();
-    let raw = if raw.is_empty() { text(obj(options, "baseUrl"), "") } else { raw };
-    let raw = raw.trim().trim_end_matches('/').to_string();
-    if raw.is_empty() {
-        return Err("未配置 API 地址。".into());
-    }
-    if !raw.starts_with("https://") && !raw.starts_with("http://") {
-        return Err("API 地址必须是有效的 HTTP(S) 地址。".into());
-    }
-    let stripped = raw
-        .trim_end_matches(|c: char| c == '/')
-        .to_string();
-    // 简化版：剥 chat/completions|models 尾巴（Python 正则同义）。
-    for tail in ["/chat/completions", "/completions", "/responses", "/messages", "/models"] {
-        if stripped.to_ascii_lowercase().ends_with(tail) {
-            return Ok(stripped[..stripped.len() - tail.len()].trim_end_matches('/').to_string());
-        }
-    }
-    Ok(stripped)
-}
-
-/// 认证解析（Python _credential 同款）：支持 {env:NAME} / ${NAME} 引用环境变量。
-fn credential(raw: &str) -> String {
-    let t = raw.trim();
-    if let Some(inner) = t.strip_prefix("{env:").and_then(|x| x.strip_suffix('}')) {
-        return std::env::var(inner).unwrap_or_default();
-    }
-    if let Some(inner) = t.strip_prefix("${").and_then(|x| x.strip_suffix('}')) {
-        return std::env::var(inner).unwrap_or_default();
-    }
-    t.to_string()
-}
-
-/// GET {base}/models；404/405 返回 Ok(None) 让调用方走本地回退。
-fn http_list_models(url: &str, headers: &[(String, String)]) -> Result<Option<Vec<String>>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("HTTP 客户端创建失败：{e}"))?;
-    let mut req = client.get(url).header("Accept", "application/json").header("User-Agent", "zcode-token-bar-rs/1");
-    for (k, v) in headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let resp = req.send().map_err(|e| {
-        // reqwest 的连接错误统一成 Python 版口吻
-        let msg = e.to_string();
-        if msg.contains("timed out") { "请求超时（20s）。".into() } else { format!("网络错误：{msg}") }
-    })?;
-    match resp.status().as_u16() {
-        404 | 405 => return Ok(None),
-        401 => return Err("HTTP 401：认证失败。检查 API Key（支持 {env:变量名} 引用），或 Key 是否配在自定义 headers 里。".into()),
-        s if !(200..300).contains(&s) => return Err(format!("HTTP {s}。")),
-        _ => {}
-    }
-    let v: Value = resp.json().map_err(|e| format!("响应不是 JSON：{e}"))?;
-    let mut ids = Vec::new();
-    if let Some(arr) = obj(&v, "data").as_array() {
-        for item in arr {
-            if let Some(id) = obj(item, "id").as_str() {
-                if !id.trim().is_empty() {
-                    ids.push(id.trim().to_string());
-                }
-            }
-        }
-    }
-    ids.truncate(MAX_MODELS);
-    Ok(Some(ids))
-}
-
-/// 单个 provider 的发现。认证头构造照 Python _headers（openai→Bearer，
-/// anthropic→x-api-key + anthropic-version）。
-pub fn discover_provider(pid: &str) -> Result<Discovery, String> {
-    let record = provider_record(pid).ok_or_else(|| "provider 已移除或停用。".to_string())?;
-    let name = text(obj(&record, "name"), pid);
-    let kind = text(obj(&record, "kind"), "").to_ascii_lowercase();
-    let options = obj(&record, "options").clone();
-
-    let base = base_url(&options)?;
-    let (url, api_type) = if kind.contains("anthropic") {
-        let suffix = if base.ends_with("/v1") { "/models" } else { "/v1/models" };
-        (format!("{base}{suffix}"), "anthropic")
-    } else if kind.is_empty() || kind.contains("openai") {
-        let suffix = if base[8..].contains('/') { "/models" } else { "/v1/models" };
-        (format!("{base}{suffix}"), "openai")
-    } else {
-        return Err("该 provider 协议暂不支持模型发现（支持 OpenAI 与 Anthropic 兼容接口）。".into());
-    };
-
-    let key_raw = {
-        let a = text(obj(&options, "apiKey"), "");
-        if a.is_empty() { text(obj(&record, "apiKey"), "") } else { a }
-    };
-    let key = credential(&key_raw);
-    if key_raw.contains("{env:") && key.is_empty() {
-        return Err("认证所引用的环境变量未设置。".into());
-    }
-    let mut headers: Vec<(String, String)> = Vec::new();
-    if api_type == "anthropic" {
-        headers.push(("anthropic-version".into(), "2023-06-01".into()));
-        if !key.is_empty() {
-            headers.push(("x-api-key".into(), key.clone()));
-        }
-    } else if !key.is_empty() {
-        headers.push(("Authorization".into(), format!("Bearer {key}")));
-    }
-    // 转交用户自定义头（白名单同 Python 版：只认认证与组织选择，不允许改 Host 等）。
-    let allowed = ["authorization", "x-api-key", "openai-organization", "openai-project", "anthropic-version"];
-    if let Some(hs) = obj(&options, "headers").as_object() {
-        for (k, v) in hs {
-            let kl = k.to_ascii_lowercase();
-            if allowed.contains(&kl.as_str()) {
-                if let Some(val) = v.as_str() {
-                    // 白名单头不覆盖上面已设置的默认（用户显式声明优先，但同名跳过重复 push）
-                    if !headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&kl)) {
-                        headers.push((k.clone(), val.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    let ids = match http_list_models(&url, &headers)? {
-        Some(ids) => ids,
-        None => {
-            // 本地回退：provider.models 键名清单（账号类 provider 唯一路径）。
-            let local: Vec<String> = obj(&record, "models")
-                .as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-            if local.is_empty() {
-                return Err("端点无模型列表接口且本地没有模型清单。".into());
-            }
-            return Ok(Discovery {
-                provider: name.clone(),
-                provider_id: pid.to_string(),
-                rows: local.into_iter().take(MAX_MODELS).map(|id| ModelRow {
-                    provider: name.clone(),
-                    provider_id: pid.to_string(),
-                    id,
-                }).collect(),
-                source_note: "该端点不提供模型列表接口；清单来自 ZCode 配置。".into(),
-            });
-        }
-    };
-
-    Ok(Discovery {
-        provider: name.clone(),
-        provider_id: pid.to_string(),
-        rows: ids.into_iter().map(|id| ModelRow {
-            provider: name.clone(),
-            provider_id: pid.to_string(),
-            id,
-        }).collect(),
-        source_note: String::new(),
-    })
-}
-
-// ── 探针：逐模型小请求实测可用性 ────────────────────────────────
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ProbeOutcome {
-    pub model_id: String,
-    pub usable: Option<bool>, // Some(true)=可用 Some(false)=明确不可用 None=未知（超时/5xx）
-    pub error: String,
-}
-
-/// 单模型探针：1-token 对话请求，2xx 即可用。Python probe_model 的简化版
-/// （tools/image/pdf 细项探测后续补，先用可用性支撑「只导入能用到的」）。
-pub fn probe_model(pid: &str, model_id: &str) -> ProbeOutcome {
-    let mut out = ProbeOutcome { model_id: model_id.to_string(), usable: None, error: String::new() };
-    let Some(record) = provider_record(pid) else {
-        out.error = "provider 已移除。".into();
-        return out;
-    };
-    let options = obj(&record, "options").clone();
-    let Ok(base) = base_url(&options) else {
-        // 账号类 provider 没有独立端点：无法实测，视作未知（照常导入）
-        return out;
-    };
-    let kind = text(obj(&record, "kind"), "").to_ascii_lowercase();
-    let key_raw = {
-        let a = text(obj(&options, "apiKey"), "");
-        if a.is_empty() { text(obj(&record, "apiKey"), "") } else { a }
-    };
-    let key = credential(&key_raw);
-
-    let (url, body, headers) = if kind.contains("anthropic") {
-        let suffix = if base.ends_with("/v1") { "/messages" } else { "/v1/messages" };
-        let mut hs = vec![("anthropic-version".to_string(), "2023-06-01".to_string())];
-        if !key.is_empty() {
-            hs.push(("x-api-key".into(), key.clone()));
-        }
-        (format!("{base}{suffix}"), json!({"model": model_id, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}), hs)
-    } else {
-        let mut hs = Vec::new();
-        if !key.is_empty() {
-            hs.push(("Authorization".into(), format!("Bearer {key}")));
-        }
-        (format!("{base}/chat/completions"), json!({"model": model_id, "max_tokens": 1, "stream": false, "messages": [{"role": "user", "content": "hi"}]}), hs)
-    };
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => { out.error = e.to_string(); return out; }
-    };
-    let mut req = client.post(&url).json(&body);
-    for (k, v) in &headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    match req.send() {
-        Ok(resp) => {
-            let st = resp.status().as_u16();
-            if (200..300).contains(&st) {
-                out.usable = Some(true);
-            } else if (400..500).contains(&st) {
-                out.usable = Some(false);
-                out.error = format!("HTTP {st}");
-            } else {
-                out.error = format!("HTTP {st}");
-            }
-        }
-        Err(e) => {
-            out.error = if e.to_string().contains("timed out") { "超时".into() } else { e.to_string() };
-        }
-    }
-    out
-}
-
-/// 批量探针：逐个顺序请求（每模型最多 15s，避免并发打爆端点）。
-pub fn probe_models(pid: &str, ids: &[String], progress: impl Fn(usize, usize)) -> Vec<ProbeOutcome> {
-    let mut out = Vec::new();
-    for (i, id) in ids.iter().enumerate() {
-        out.push(probe_model(pid, id));
-        progress(i + 1, ids.len());
-    }
-    out
-}
-
-// ── 导入（热写入 + 校验） ───────────────────────────────────────────
-
-#[derive(Clone, Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ImportResult {
-    pub added: usize,
-    pub skipped: Vec<String>,
-    pub missing: Vec<String>,
-    pub added_ids: Vec<(String, String)>,
-    pub backup: String,
-    pub error: String,
+    pub added: usize, pub skipped: Vec<String>, pub missing: Vec<String>,
+    pub added_ids: Vec<(String, String)>, pub backup: String, pub error: String,
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProbeOutcome { pub model_id: String, pub usable: Option<bool>, pub error: String }
 
-/// 把发现结果分组导入。personal provider 写 provider_config.json
-/// （personalModelIds/modelOrder + providerModelRules），账号类写
-/// v2/config.json 的 provider.models。只新增，不覆盖。
-pub fn import_groups(groups: &[(String, Vec<ModelRow>)]) -> ImportResult {
-    let mut res = ImportResult::default();
-    if groups.is_empty() {
-        res.error = "没有可写入的模型。".into();
-        return res;
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Modalities {
+    pub text: Option<bool>, pub image: Option<bool>, pub video: Option<bool>,
+    pub audio: Option<bool>, pub pdf: Option<bool>,
+}
+impl Modalities {
+    pub fn get(&self, name: &str) -> Option<bool> {
+        match name { "text" => self.text, "image" => self.image, "video" => self.video,
+            "audio" => self.audio, "pdf" => self.pdf, _ => None }
     }
-
-    let personal_ids: std::collections::HashSet<String> = {
-        let mut s = std::collections::HashSet::new();
-        if let Ok(data) = std::fs::read_to_string(personal_path()) {
-            if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                for rule in obj(obj(obj(&v, "config"), "providerConfigRules"), "providerRules")
-                    .as_array().map(|a| a.clone()).unwrap_or_default()
-                {
-                    if let Some(pid) = obj(&rule, "providerId").as_str() {
-                        s.insert(pid.to_string());
-                    }
-                }
+    pub(crate) fn set(&mut self, name: &str, value: bool) {
+        match name { "text" => self.text = Some(value), "image" => self.image = Some(value),
+            "video" => self.video = Some(value), "audio" => self.audio = Some(value),
+            "pdf" => self.pdf = Some(value), _ => {} }
+    }
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Capabilities {
+    pub input: Modalities, pub output: Modalities,
+    pub context_window: Option<u64>, pub output_limit: Option<u64>,
+    pub tools: Option<bool>, pub reasoning: Option<bool>,
+    pub structured_output: Option<bool>, pub web_search: Option<bool>,
+    /// 字段名如 input.image；值为 provider API / ZCode config / ZCode rules / 实测探针。
+    pub sources: BTreeMap<String, String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RichModelRow {
+    #[serde(flatten)] pub row: ModelRow,
+    pub capabilities: Capabilities,
+}
+impl From<ModelRow> for RichModelRow {
+    fn from(row: ModelRow) -> Self { Self { row, capabilities: Capabilities::default() } }
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RichDiscovery {
+    pub provider: String, pub provider_id: String, pub rows: Vec<RichModelRow>,
+    pub source_note: String, pub truncated: bool,
+}
+impl RichDiscovery {
+    pub fn legacy(&self) -> Discovery {
+        Discovery { provider: self.provider.clone(), provider_id: self.provider_id.clone(),
+            rows: self.rows.iter().map(|r| r.row.clone()).collect(), source_note: self.source_note.clone() }
+    }
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RichProbeOutcome {
+    pub provider_id: String,
+    pub model_id: String, pub usable: Option<bool>, pub tools: Option<bool>,
+    pub image: Option<bool>, pub pdf: Option<bool>, pub error: String,
+    pub errors: BTreeMap<String, String>, pub cancelled: bool, pub timed_out: bool,
+    /// 实际发出的请求数；文本失败时不再发送能力探针。
+    pub requests: usize,
+}
+impl RichProbeOutcome {
+    pub fn apply(&self, row: &mut RichModelRow) {
+        if self.usable != Some(true) { return; }
+        let c = &mut row.capabilities;
+        c.input.text = Some(true);
+        c.sources.insert("input.text".into(), "实测探针".into());
+        for (key, value) in [("tools", self.tools), ("input.image", self.image), ("input.pdf", self.pdf)] {
+            if let Some(v) = value {
+                match key { "tools" => c.tools = Some(v), "input.image" => c.input.image = Some(v),
+                    _ => c.input.pdf = Some(v) }
+                c.sources.insert(key.into(), "实测探针".into());
             }
         }
-        s
+    }
+}
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ProbeBatch {
+    pub outcomes: Vec<RichProbeOutcome>, pub rows: Vec<RichModelRow>,
+    pub probed: usize, pub total: usize, pub truncated: bool,
+    pub cancelled: bool, pub timed_out: bool,
+}
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ProbeImportReport { pub probe: ProbeBatch, pub import: ImportReport }
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DiscoveryBatch {
+    pub providers: Vec<RichDiscovery>, pub errors: BTreeMap<String, String>,
+    pub cancelled: bool, pub timed_out: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct Progress {
+    pub provider_id: String, pub model_id: String, pub stage: String,
+    pub completed: usize, pub total: usize,
+}
+#[derive(Clone, Default, Debug)]
+pub struct CancelToken(Arc<AtomicBool>);
+impl CancelToken {
+    pub fn cancel(&self) { self.0.store(true, Ordering::Release); }
+    pub fn is_cancelled(&self) -> bool { self.0.load(Ordering::Acquire) }
+}
+/// 一次任务共享同一个 Operation，发现/批量探针不会逐模型重置总时限。
+#[derive(Clone)]
+pub struct Operation {
+    pub cancel: CancelToken,
+    deadline: Instant,
+    progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+}
+impl Operation {
+    pub fn new(timeout: Duration) -> Self {
+        Self { cancel: CancelToken::default(), deadline: Instant::now() + timeout.min(Duration::from_secs(3600)), progress: None }
+    }
+    pub fn discovery() -> Self { Self::new(Duration::from_secs(20)) }
+    pub fn probe() -> Self { Self::new(Duration::from_secs(240)) }
+    pub fn with_progress(mut self, callback: impl Fn(Progress) + Send + Sync + 'static) -> Self {
+        self.progress = Some(Arc::new(callback)); self
+    }
+    pub fn is_timed_out(&self) -> bool { Instant::now() >= self.deadline }
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if self.cancel.is_cancelled() { Err("操作已取消。".into()) }
+        else if self.is_timed_out() { Err("操作总时限已到，剩余项未处理。".into()) } else { Ok(()) }
+    }
+    pub(crate) fn remaining(&self) -> Duration { self.deadline.saturating_duration_since(Instant::now()) }
+    pub(crate) fn emit(&self, pid: &str, mid: &str, stage: &str, completed: usize, total: usize) {
+        if let Some(cb) = &self.progress {
+            // 界面回调不应影响请求/写入的资源清理。
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(Progress {
+                provider_id: pid.into(), model_id: mid.into(), stage: stage.into(), completed, total,
+            })));
+        }
+    }
+    pub(crate) fn wait(&self, duration: Duration) -> Result<(), String> {
+        let end = Instant::now() + duration;
+        while Instant::now() < end {
+            self.check()?;
+            std::thread::sleep(Duration::from_millis(25).min(end.saturating_duration_since(Instant::now())).min(self.remaining()));
+        }
+        self.check()
+    }
+}
+
+/// 服务仅保存定位路径，不缓存任何凭据；fixture 可显式传入隔离路径。
+#[derive(Clone, Debug)]
+pub struct ModelsService { pub paths: ConfigPaths }
+impl ModelsService {
+    pub fn from_env() -> Result<Self, String> { Ok(Self::new(ConfigPaths::from_env()?)) }
+    pub fn new(paths: ConfigPaths) -> Self { Self { paths } }
+    pub fn providers(&self) -> Result<Vec<ProviderInfo>, String> {
+        Ok(config::load_records(&self.paths)?.into_iter().map(|r| r.info).collect())
+    }
+    pub fn discover(&self, provider_id: &str, operation: &Operation) -> Result<RichDiscovery, String> {
+        operation.check()?;
+        let _guard = http::ActiveGuard::acquire(&self.paths, provider_id)?;
+        let record = config::find_record(&self.paths, provider_id)?;
+        let rules = config::rules_for(&self.paths)?;
+        http::discover(&record, &rules, operation)
+    }
+    /// 顺序、总时限有界；一个 provider 失败不会抹掉其它成功结果。
+    pub fn discover_all(&self, ids: &[String], operation: &Operation) -> DiscoveryBatch {
+        let mut out = DiscoveryBatch::default();
+        let mut seen = std::collections::HashSet::new();
+        for (i, id) in ids.iter().take(MAX_MODELS).enumerate() {
+            if !seen.insert(id) { continue; }
+            if operation.check().is_err() { break; }
+            match self.discover(id, operation) {
+                Ok(result) => out.providers.push(result),
+                Err(error) => { out.errors.insert(config::safe_identifier(id), error); }
+            }
+            operation.emit(&config::safe_identifier(id), "", "provider", i + 1, ids.len().min(MAX_MODELS));
+        }
+        out.cancelled = operation.cancel.is_cancelled(); out.timed_out = operation.is_timed_out(); out
+    }
+    pub fn manual_rows(&self, provider_id: &str, input: &str) -> Result<Vec<RichModelRow>, String> {
+        let record = config::find_record(&self.paths, provider_id)?;
+        let rules = config::rules_for(&self.paths)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut rows = Vec::new();
+        for id in input.split(|c: char| c.is_whitespace() || ",，;；、".contains(c)) {
+            if !config::valid_id(id, &record.secrets()) || !seen.insert(id) { continue; }
+            rows.push(metadata::make_row(&record, &rules, id, &Value::Null));
+            if rows.len() >= MAX_MODELS { break; }
+        }
+        if rows.is_empty() { return Err("没有可用的模型 ID。".into()); }
+        Ok(rows)
+    }
+    pub fn probe_model(&self, provider_id: &str, model_id: &str, operation: &Operation) -> RichProbeOutcome {
+        let run = || -> Result<RichProbeOutcome, String> {
+            operation.check()?;
+            let _guard = http::ActiveGuard::acquire(&self.paths, provider_id)?;
+            let record = config::find_record(&self.paths, provider_id)?;
+            http::probe(&record, model_id, operation)
+        };
+        run().unwrap_or_else(|error| RichProbeOutcome { provider_id: config::safe_identifier(provider_id), model_id: "[未完成探针]".into(), error,
+            cancelled: operation.cancel.is_cancelled(), timed_out: operation.is_timed_out(), ..Default::default() })
+    }
+    pub fn probe_rows(&self, provider_id: &str, rows: &[RichModelRow], operation: &Operation) -> Result<ProbeBatch, String> {
+        operation.check()?;
+        let _guard = http::ActiveGuard::acquire(&self.paths, provider_id)?;
+        let record = config::find_record(&self.paths, provider_id)?;
+        let secrets = record.secrets();
+        let mut selected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            if row.row.provider_id != provider_id || !config::valid_id(&row.row.id, &secrets) {
+                return Err("模型条目与目标 provider 不匹配，或 ID 无效。".into());
+            }
+            if seen.insert(&row.row.id) { selected.push(row); }
+        }
+        let mut out = ProbeBatch { total: selected.len().min(MAX_PROBE_MODELS), truncated: selected.len() > MAX_PROBE_MODELS, ..Default::default() };
+        for row in selected.into_iter().take(MAX_PROBE_MODELS) {
+            if operation.check().is_err() { break; }
+            let result = http::probe(&record, &row.row.id, operation)?;
+            let abort = result.cancelled || result.timed_out;
+            if result.usable == Some(true) && !abort {
+                let mut row = row.clone(); result.apply(&mut row); out.rows.push(row);
+            }
+            out.probed += 1;
+            out.outcomes.push(result);
+            operation.emit(provider_id, &row.row.id, "model", out.probed, out.total);
+            if abort { break; }
+        }
+        out.cancelled = operation.cancel.is_cancelled(); out.timed_out = operation.is_timed_out();
+        Ok(out)
+    }
+    /// 仅 usable == Some(true) 的行会导入；取消/总超时后整批不写。
+    pub fn probe_and_import(&self, provider_id: &str, rows: &[RichModelRow], operation: &Operation) -> Result<ProbeImportReport, String> {
+        self.probe_all_and_import(&[(provider_id.to_owned(), rows.to_vec())], operation)
+    }
+    /// 跨 provider 共用 12 个模型上限与总时限；所有探针完成后才统一写入。
+    pub fn probe_all_and_import(&self, groups: &[(String, Vec<RichModelRow>)], operation: &Operation) -> Result<ProbeImportReport, String> {
+        if operation.check().is_err() {
+            return Ok(ProbeImportReport { probe: ProbeBatch { cancelled: operation.cancel.is_cancelled(), timed_out: operation.is_timed_out(), ..Default::default() }, ..Default::default() });
+        }
+        let records = config::load_records(&self.paths)?;
+        let mut selected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut identities = Vec::new();
+        for (pid, rows) in groups {
+            if rows.is_empty() { continue; }
+            let record = records.iter().find(|r| r.info.id == *pid).ok_or("所选 provider 已移除或停用。")?;
+            let secrets = record.secrets();
+            if !identities.iter().any(|(id, _)| id == pid) { identities.push((pid.clone(), record.identity.clone())); }
+            for row in rows {
+                if row.row.provider_id != *pid || !config::valid_id(&row.row.id, &secrets) { return Err("模型条目与目标 provider 不匹配，或 ID 无效。".into()); }
+                if seen.insert((pid.clone(), row.row.id.clone())) { selected.push((record, row)); }
+            }
+        }
+        let mut probe = ProbeBatch { total: selected.len().min(MAX_PROBE_MODELS), truncated: selected.len() > MAX_PROBE_MODELS, ..Default::default() };
+        for (record, row) in selected.into_iter().take(MAX_PROBE_MODELS) {
+            if operation.check().is_err() { break; }
+            let result = match http::ActiveGuard::acquire(&self.paths, &record.info.id) {
+                Ok(_guard) => http::probe(record, &row.row.id, operation),
+                Err(e) => Err(e),
+            }.unwrap_or_else(|error| RichProbeOutcome { provider_id: record.info.id.clone(), model_id: row.row.id.clone(), error, cancelled: operation.cancel.is_cancelled(), timed_out: operation.is_timed_out(), ..Default::default() });
+            let abort = result.cancelled || result.timed_out;
+            if result.usable == Some(true) && !abort {
+                let mut row = row.clone(); result.apply(&mut row); probe.rows.push(row);
+            }
+            probe.probed += 1; probe.outcomes.push(result);
+            operation.emit(&record.info.id, &row.row.id, "model", probe.probed, probe.total);
+            if abort { break; }
+        }
+        probe.cancelled = operation.cancel.is_cancelled(); probe.timed_out = operation.is_timed_out();
+        let import = if probe.cancelled || probe.timed_out || probe.rows.is_empty() { ImportReport::default() }
+        else {
+            let mut groups: Vec<(String, Vec<RichModelRow>)> = Vec::new();
+            for row in &probe.rows {
+                match groups.iter_mut().find(|(pid, _)| *pid == row.row.provider_id) {
+                    Some((_, rows)) => rows.push(row.clone()),
+                    None => groups.push((row.row.provider_id.clone(), vec![row.clone()])),
+                }
+            }
+            // 在文件锁与快照校验范围内再次比较全部 provider 配置，防止旧探针结果写入新地址。
+            importing::import_checked(self, &groups, operation, &identities)
+        };
+        Ok(ProbeImportReport { probe, import })
+    }
+    /// 不发探针的显式导入；发现/手动输入后由用户选择导入时调用。
+    pub fn import_rows(&self, groups: &[(String, Vec<RichModelRow>)], operation: &Operation) -> ImportReport {
+        importing::import(self, groups, operation)
+    }
+    /// 默认等待 1.2 秒再读回；runtime_accepted 永远为 None（未取得客户端确认）。
+    pub fn verify(&self, report: &ImportReport, operation: &Operation) -> Verification {
+        importing::verify_report(report, Duration::from_millis(1200), operation)
+    }
+    pub fn verify_after(&self, report: &ImportReport, delay: Duration, operation: &Operation) -> Verification {
+        importing::verify_report(report, delay, operation)
+    }
+}
+
+// 兼容 API：保持原签名，错误仅使用固定文本；默认新任务各有独立总时限。
+pub fn configured_providers() -> Vec<ProviderInfo> {
+    ModelsService::from_env().and_then(|s| s.providers()).unwrap_or_default()
+}
+pub fn configured_providers_checked() -> Result<Vec<ProviderInfo>, String> { ModelsService::from_env()?.providers() }
+pub fn discover_provider(pid: &str) -> Result<Discovery, String> {
+    Ok(ModelsService::from_env()?.discover(pid, &Operation::discovery())?.legacy())
+}
+pub fn probe_model(pid: &str, model_id: &str) -> ProbeOutcome {
+    let rich = match ModelsService::from_env() {
+        Ok(s) => s.probe_model(pid, model_id, &Operation::probe()),
+        Err(error) => RichProbeOutcome { provider_id: config::safe_identifier(pid), error, model_id: "[未完成探针]".into(), ..Default::default() },
     };
-
-    let mut personal: Vec<(String, &Vec<ModelRow>)> = Vec::new();
-    let mut account: Vec<(String, &Vec<ModelRow>)> = Vec::new();
-    for (pid, rows) in groups {
-        if personal_ids.contains(pid) {
-            personal.push((pid.clone(), rows));
-        } else {
-            account.push((pid.clone(), rows));
-        }
-    }
-
-    // —— personal → provider_config.json ——
-    if !personal.is_empty() {
-        let path = personal_path();
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            res.error = "找不到 provider_config.json。".into();
-            return res;
-        };
-        let mut data: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                res.error = format!("provider_config.json 解析失败：{e}");
-                return res;
-            }
-        };
-        res.backup = backup_file(&path);
-        let rules = obj(obj(obj(&data, "config"), "providerConfigRules"), "providerRules")
-            .as_array().cloned().unwrap_or_default();
-        let mcr = {
-            // 确保 config.modelConfigRules.providerModelRules 存在
-            let cfg = data["config"].as_object_mut().unwrap();
-            let mcr = cfg.entry("modelConfigRules".to_string()).or_insert_with(|| json!({}));
-            mcr["providerModelRules"] = mcr["providerModelRules"].clone();
-            let arr = if mcr["providerModelRules"].is_array() {
-                mcr["providerModelRules"].as_array().unwrap().clone()
-            } else {
-                mcr["providerModelRules"] = json!([]);
-                Vec::new()
-            };
-            arr
-        };
-        let mut pmr = mcr;
-        for (pid, rows) in personal.iter() {
-            let rule = rules.iter().find(|r| obj(r, "providerId").as_str() == Some(pid));
-            let Some(rule) = rule else {
-                res.missing.push(pid.clone());
-                continue;
-            };
-            let cfg_mut = &data["config"]["providerConfigRules"]["providerRules"];
-            let _ = cfg_mut; // borrow 帮手（实际改动在下面的循环外做）
-            let idx = rules.iter().position(|r| obj(r, "providerId").as_str() == Some(pid)).unwrap();
-            // personalModelIds / modelOrder 追加
-            let ptr = format!("/config/providerConfigRules/providerRules/{idx}/config");
-            let rule_cfg = data.pointer_mut(&ptr).unwrap();
-            let ids = rule_cfg["personalModelIds"].as_array().cloned().unwrap_or_default();
-            let order = rule_cfg["modelOrder"].as_array().cloned().unwrap_or_default();
-            let mut ids = ids;
-            let mut order = order;
-            for row in rows.iter() {
-                if ids.iter().any(|x| x.as_str() == Some(row.id.as_str())) {
-                    res.skipped.push(format!("{pid} / {}", row.id));
-                    continue;
-                }
-                ids.push(json!(row.id));
-                if !order.iter().any(|x| x.as_str() == Some(row.id.as_str())) {
-                    order.push(json!(row.id));
-                }
-                pmr.push(json!({
-                    "providerId": pid, "modelId": row.id, "config": {"enabled": true}
-                }));
-                res.added += 1;
-                res.added_ids.push((pid.clone(), row.id.clone()));
-            }
-            rule_cfg["personalModelIds"] = json!(ids);
-            rule_cfg["modelOrder"] = json!(order);
-        }
-        data["config"]["modelConfigRules"]["providerModelRules"] = json!(pmr);
-        if !write_json_atomic(&path, &data) {
-            res.error = "写入 provider_config.json 失败，原文件未修改。".into();
-            return res;
-        }
-    }
-
-    // —— account → v2/config.json ——
-    if !account.is_empty() {
-        let path = v2_config_path();
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            res.error = "找不到 v2/config.json。".into();
-            return res;
-        };
-        let mut data: Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                res.error = format!("v2/config.json 解析失败：{e}");
-                return res;
-            }
-        };
-        res.backup = backup_file(&path);
-        for (pid, rows) in account.iter() {
-            if data["provider"].get(pid).is_none() {
-                res.missing.push(pid.clone());
-                continue;
-            }
-            let models = data["provider"][pid]["models"].as_object().cloned().unwrap_or_default();
-            let mut models = models;
-            for row in rows.iter() {
-                if models.contains_key(&row.id) {
-                    res.skipped.push(format!("{pid} / {}", row.id));
-                    continue;
-                }
-                models.insert(row.id.clone(), json!({"enabled": true}));
-                res.added += 1;
-                res.added_ids.push((pid.clone(), row.id.clone()));
-            }
-            data["provider"][pid]["models"] = models.into_iter().collect::<serde_json::Map<String, Value>>().into();
-        }
-        if !write_json_atomic(&path, &data) {
-            res.error = "写入 v2/config.json 失败，原文件未修改。".into();
-            return res;
-        }
-    }
-    res
+    ProbeOutcome { model_id: rich.model_id, usable: rich.usable, error: rich.error }
 }
-
-/// 写盘后校验：新增条目是否仍在配置里（被客户端写回覆盖返回 false）。
+pub fn probe_models(pid: &str, ids: &[String], progress: impl Fn(usize, usize)) -> Vec<ProbeOutcome> {
+    let op = Operation::probe();
+    let service = ModelsService::from_env();
+    let total = ids.len().min(MAX_PROBE_MODELS);
+    let mut out = Vec::new();
+    for (i, id) in ids.iter().take(total).enumerate() {
+        if op.check().is_err() { break; }
+        let r = match &service {
+            Ok(s) => s.probe_model(pid, id, &op),
+            Err(e) => RichProbeOutcome { provider_id: config::safe_identifier(pid), model_id: "[未完成探针]".into(), error: e.clone(), ..Default::default() },
+        };
+        out.push(ProbeOutcome { model_id: r.model_id, usable: r.usable, error: r.error }); progress(i + 1, total);
+    }
+    out
+}
+pub fn import_groups(groups: &[(String, Vec<ModelRow>)]) -> ImportResult {
+    let service = match ModelsService::from_env() { Ok(s) => s, Err(error) => return ImportResult { error, ..Default::default() } };
+    let rich: Vec<_> = groups.iter().map(|(pid, rows)| (pid.clone(), rows.iter().cloned().map(RichModelRow::from).collect())).collect();
+    service.import_rows(&rich, &Operation::new(Duration::from_secs(30))).result
+}
+/// 只检查延迟读回后的磁盘条目，不代表客户端热重载成功。
 pub fn verify_import_applied(added_ids: &[(String, String)]) -> bool {
-    if added_ids.is_empty() {
-        return true;
-    }
-    // personal 判定
-    let personal_ids: std::collections::HashSet<String> = std::fs::read_to_string(personal_path())
-        .ok()
-        .and_then(|d| serde_json::from_str::<Value>(&d).ok())
-        .map(|v| {
-            obj(obj(obj(&v, "config"), "providerConfigRules"), "providerRules")
-                .as_array().map(|a| {
-                    a.iter().filter_map(|r| obj(r, "providerId").as_str().map(|s| s.to_string())).collect()
-                }).unwrap_or_default()
-        })
-        .unwrap_or_default();
-
-    let personal: Vec<_> = added_ids.iter().filter(|(p, _)| personal_ids.contains(p)).collect();
-    if !personal.is_empty() {
-        let Ok(data) = std::fs::read_to_string(personal_path()) else { return false };
-        let Ok(v) = serde_json::from_str::<Value>(&data) else { return false };
-        let pmr = obj(obj(obj(&v, "config"), "modelConfigRules"), "providerModelRules")
-            .as_array().cloned().unwrap_or_default();
-        let mut have: std::collections::HashSet<(String, String)> = pmr.into_iter().filter_map(|r| {
-            Some((text(obj(&r, "providerId"), ""), text(obj(&r, "modelId"), "")))
-        }).collect();
-        for rule in obj(obj(obj(&v, "config"), "providerConfigRules"), "providerRules")
-            .as_array().map(|a| a.clone()).unwrap_or_default()
-        {
-            let pid = text(obj(&rule, "providerId"), "");
-            for id in obj(&rule, "config").get("personalModelIds")
-                .and_then(|x| x.as_array()).map(|a| a.clone()).unwrap_or_default()
-            {
-                if let Some(s) = id.as_str() {
-                    have.insert((pid.clone(), s.to_string()));
-                }
-            }
-        }
-        for (p, m) in &personal {
-            if !have.contains(&(p.clone(), m.clone())) {
-                return false;
-            }
-        }
-    }
-    let account: Vec<_> = added_ids.iter().filter(|(p, _)| !personal_ids.contains(p)).collect();
-    if !account.is_empty() {
-        let Ok(data) = std::fs::read_to_string(v2_config_path()) else { return false };
-        let Ok(v) = serde_json::from_str::<Value>(&data) else { return false };
-        for (p, m) in &account {
-            match v["provider"].get(p).and_then(|prov| prov.get("models")) {
-                Some(models) if models.get(m).is_some() => {}
-                _ => return false,
-            }
-        }
-    }
-    true
+    if added_ids.is_empty() { return true; }
+    let Ok(s) = ModelsService::from_env() else { return false; };
+    importing::verify_ids(&s.paths, added_ids, &Operation::new(Duration::from_secs(10)))
 }
 
-fn backup_file(path: &PathBuf) -> String {
-    let dir = crate::data_dir().join("registry-backups");
-    let _ = std::fs::create_dir_all(&dir);
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let name = format!("{}.bak-{}", path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), stamp);
-    let target = dir.join(name);
-    match std::fs::copy(path, &target) {
-        Ok(_) => target.to_string_lossy().to_string(),
-        Err(_) => String::new(),
-    }
-}
-
-fn write_json_atomic(path: &PathBuf, v: &Value) -> bool {
-    let body = serde_json::to_string_pretty(v).unwrap_or_default();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_ok()
-}
+pub(crate) fn positive_int(v: &Value) -> Option<u64> { v.as_u64().filter(|n| *n > 0 && *n < 100_000_000) }
+pub(crate) fn object(v: &Value) -> serde_json::Map<String, Value> { v.as_object().cloned().unwrap_or_default() }
+pub(crate) fn string(v: &Value) -> &str { v.as_str().unwrap_or("") }

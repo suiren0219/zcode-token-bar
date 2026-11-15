@@ -1,325 +1,794 @@
-// 设置面板：无边框暗色窗口，左侧页签 + 右侧内容。
-// 与 Python 版设置面板同构（位置/外观/显示/模型/状态），壁纸页暂由
-// Python 面板承担（--panel 桥接保留）。全部状态由 Rust 持有，Slint 纯展示。
+// 原生设置 UI；业务与持久化由 Rust 主装配负责。
+// Contract：可编辑属性双向回显，generic change 的 key 与属性名完全一致。
+// action 使用稳定连字符名；页序 0..7 为位置/外观/显示/壁纸/行为/更新/状态/模型，8 为小亚。
+import { ComboBox, CheckBox, ListView, LineEdit, TextEdit, SpinBox, Palette } from "std-widgets.slint";
+import { SettingsTheme, BodyText, HelpText, Section, PageScroll, ActionButton, NumberRow, ToggleRow, SelectableRow } from "ui-theme.slint";
 
-import { ComboBox, CheckBox, ListView, LineEdit, Slider } from "std-widgets.slint";
+export global SettingsBridge {
+    in-out property <string> status: "调整后点“应用”保存，关闭可撤销未应用修改。";
+    in-out property <bool> busy: false;
+    callback bool-change(string, bool);
+    callback number-change(string, float);
+    callback text-change(string, string);
+    callback action(string);
+    callback provider-change(int);
+    callback model-select(int);
+    callback model-filter(string);
+    callback manual-import(string);
+    callback page-change(int);
+}
 
 export component SettingsWindow inherits Window {
-    no-frame: true;
     title: "zcode-token-bar-settings";
     icon: @image-url("icon.png");
-    always-on-top: true;
-    default-font-family: "Microsoft YaHei UI";
+    no-frame: false;
+    default-font-family: SettingsTheme.font-family;
+    default-font-size: SettingsTheme.body-size;
     background: transparent;
-    width: 660px;
-    height: 470px;
+    preferred-width: 820px;
+    preferred-height: 700px;
+    min-width: 640px;
+    min-height: 480px;
 
-    in property <int> page: 0;
-    in property <[string]> page-names: ["01 位置", "02 外观", "03 显示", "06 壁纸", "08 模型", "09 状态"];
-    in property <[string]> provider-names;
-    in property <int> provider-index: 0;
-    in property <[string]> model-ids;
-    in property <string> models-status: "选 provider 后点「发现模型」。";
-    in property <string> status-lines: "";
-    in property <bool> models-busy: false;
-    // 当前值回显（Rust → UI）
-    in property <int> anchor-index: 1;
-    in property <int> scope-index: 0;
-    in property <int> opacity-pct: 92;
-    in property <int> font-px: 13;
-    in property <bool> show-speed: true;
-    in property <bool> show-ctx: true;
-    in property <bool> show-turn: true;
-    in property <bool> show-session: true;
-    in property <bool> show-today: true;
-    in property <bool> show-tools: true;
-    in property <bool> show-cache: true;
-    in property <bool> show-labels: true;
+    // Rust setters 对应连字符转下划线；全部可编辑值先由 UI 更新，再发 change 回调。
+    in-out property <int> page: 0;
+    in-out property <int> anchor-index: 0; // 0左下 1下中 2右下 3左上 4上中 5右上 6自由
+    in-out property <int> scope-index: 0; // 0 window / 1 screen
+    in-out property <int> offset-x: 16;
+    in-out property <int> offset-y: 6;
+    in-out property <int> free-x: 0;
+    in-out property <int> free-y: 0;
+    in-out property <bool> free-position-valid: false;
+    in-out property <bool> pinned: false;
+    in-out property <string> pinned-label: "未锁定会话";
+    in-out property <bool> lock-position: false;
 
-    callback close-panel();
-    callback set-page(int);
-    callback anchor-set(int);
-    callback scope-set(int);
-    callback restore-dock();
-    callback opacity-changed(int);
-    callback font-changed(int);
-    callback show-toggled(string, bool);
-    callback labels-toggled(bool);
-    callback discover-clicked();
-    callback provider-changed(string);
-    callback import-clicked();
-    callback import-id-clicked(string);
-    callback probe-clicked();
-    callback open-python-panel();
-    callback offset-changed(int, int);
-    callback restore-defaults();
-    in property <int> offset-x: 16;
-    in property <int> offset-y: 6;
-    callback drag-panel-start();
-    callback drag-panel-move();
-    callback drag-panel-end();
+    in-out property <int> opacity-pct: 100;
+    in-out property <int> font-px: 14;
+    in-out property <string> font-family: "Microsoft YaHei UI";
+    in-out property <int> panel-opacity: 100;
+    in-out property <bool> panel-wallpaper: true;
+    in-out property <int> panel-wallpaper-dim: 65;
+    private property <bool> has-backdrop: root.panel-wallpaper && root.wp-preview-ready;
+    in-out property <bool> show-labels: true;
+    in-out property <bool> show-speed: true;
+    in-out property <bool> show-ctx: true;
+    in-out property <bool> show-turn: true;
+    in-out property <bool> show-session: true;
+    in-out property <bool> show-today: true;
+    in-out property <bool> show-tools: true;
+    in-out property <bool> show-cache: true;
 
-    // 面板拖动（标题行按住拖动；逻辑同条面：Rust 侧 GetCursorPos）。
-    TouchArea {
-        pointer-event(p) => {
-            if (p.kind == PointerEventKind.down) { root.drag-panel-start(); }
-            if (p.kind == PointerEventKind.up) { root.drag-panel-end(); }
-        }
-        moved => { root.drag-panel-move(); }
+    in-out property <string> wp-path;
+    in-out property <image> w-preview;
+    in-out property <bool> wp-preview-ready: false;
+    in-out property <bool> wp-enabled: false;
+    in-out property <bool> wp-visible: true;
+    in-out property <bool> wp-monet: true;
+    in-out property <int> wp-blur: 0;
+    in-out property <int> wp-dim: 30;
+    in-out property <int> wp-fit: 0; // cover / contain / smart / stretch
+    in-out property <int> focus-x: 50;
+    in-out property <int> focus-y: 50;
+    in-out property <int> wp-port: 9222;
+    in-out property <string> wp-status: "尚未检查连接";
+    in-out property <bool> auto-client-recovery: true;
+    in-out property <string> recovery-status: "尚未检测客户端包";
+    in-out property <bool> wp-busy: false;
+
+    // Window.always-on-top 为内置属性；这里单独保存悬浮条的置顶偏好。
+    // bool-change 的持久化 key 仍是 "always-on-top"。
+    in-out property <bool> bar-always-on-top: true;
+    in-out property <bool> hide-when-inactive: false;
+    in-out property <int> poll-ms: 1200;
+    in-out property <bool> auto-start: false;
+    in-out property <bool> auto-update: false;
+    in-out property <bool> bar-visible: true;
+    in-out property <string> version-info: "版本信息尚未读取";
+    in-out property <string> update-status: "尚未检查更新";
+    in-out property <bool> update-available: false;
+
+    in-out property <string> status-lines;
+    in-out property <bool> remote-enabled: false;
+    in-out property <string> remote-host;
+    in-out property <string> remote-user;
+    in-out property <int> remote-port: 22;
+    in-out property <string> remote-key; // 仅私钥文件路径，不存放或展示私钥内容
+    in-out property <string> remote-helper;
+
+    in-out property <[string]> provider-names;
+    in-out property <int> provider-index: -1;
+    in-out property <[string]> model-items;
+    in-out property <int> model-selected-index: -1;
+    in-out property <string> filter-text;
+    in-out property <string> model-details;
+    in-out property <string> models-status: "选择提供方，然后发现模型。";
+    in-out property <bool> models-busy: false;
+    in-out property <int> model-count: 0;
+    in-out property <string> manual-model-ids;
+
+    in-out property <bool> companion-enabled: false;
+    in-out property <bool> companion-auto: false;
+    in-out property <bool> companion-paused: false;
+    in-out property <string> companion-config-path;
+    in-out property <int> companion-cooldown-secs: 600;
+    in-out property <int> companion-hourly: 6;
+    in-out property <string> companion-history;
+    in-out property <string> companion-status: "尚未连接陪伴配置";
+    in-out property <bool> companion-busy: false;
+    in-out property <string> companion-input;
+    in-out property <[string]> companion-model-names;
+    in-out property <int> companion-model-index: -1;
+    in-out property <bool> companion-stream: false;
+    in-out property <bool> companion-persist-history: false;
+
+    private property <[string]> page-names: ["位置", "外观", "显示", "壁纸", "行为", "更新", "状态", "模型", "小亚"];
+    private property <[string]> page-hints: [
+        "选择贴靠方式，或为悬浮条保存自由位置。",
+        "调整字体与透明度，以清晰易读为先。",
+        "只保留你关心的用量信息。",
+        "图片预览、动态配色与 ZCode 连接。",
+        "管理悬浮条运行方式与快捷操作。",
+        "查看版本，检查与安装可用更新。",
+        "复制诊断信息，管理日志与远程连接。",
+        "发现、筛选并导入提供方的模型。",
+        "连接陪伴配置，调整主动问候与对话。"
+    ];
+
+    init => { Palette.color-scheme = ColorScheme.dark; }
+
+    // 仅由选择变化/键盘事件调用，不把滚动位置持续绑定到选中行。
+    pure function row-scroll-y(index: int, count: int, view-height: length, current-y: length) -> length {
+        if index < 0 || index >= count || view-height <= 0px { return current-y; }
+        let row-top = index * SettingsTheme.selection-row-height;
+        let row-bottom = row-top + SettingsTheme.selection-row-height;
+        let next-y = row-top + current-y < 0px ? -row-top
+            : row-bottom + current-y > view-height ? view-height - row-bottom : current-y;
+        return max(min(0px, view-height - count * SettingsTheme.selection-row-height), min(0px, next-y));
     }
 
-    Rectangle {
-        border-radius: 10px;
-        background: #0e1014f0;
-        border-width: 1px;
-        border-color: #40ffffff;
+    function select-page(index: int) {
+        root.page = max(0, min(8, index));
+        SettingsBridge.page-change(root.page);
+    }
+    function select-model(index: int) {
+        if index >= 0 && index < root.model-items.length {
+            root.model-selected-index = index;
+            SettingsBridge.model-select(index);
+        }
+    }
+    function send-companion() {
+        if root.companion-enabled && !root.companion-busy && root.companion-input != "" {
+            SettingsBridge.action("companion-send");
+        }
+    }
+
+    changed has-backdrop => { SettingsTheme.wallpaper-active = root.has-backdrop; }
+    forward-focus: keyboard;
+    scene := Rectangle {
+        width: 100%; height: 100%;
+        background: SettingsTheme.background;
+        opacity: root.panel-opacity / 100;
+    if root.has-backdrop: Rectangle {
+        clip: true;
+        Image { source: root.w-preview; image-fit: cover; width: 100%; height: 100%; }
+        Rectangle { background: #10141d; opacity: root.panel-wallpaper-dim / 100; }
+    }
+
+    keyboard := FocusScope {
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                SettingsBridge.action("close-panel");
+                return accept;
+            }
+            if root.page == 8 && event.modifiers.control && event.text == Key.Return {
+                root.send-companion();
+                return accept;
+            }
+            return reject;
+        }
 
         VerticalLayout {
-            padding: 1px;
-
-            // ── 标题行 ──
-            Rectangle {
-                height: 40px;
-                border-radius: 9px;
-                background: #00000022;
-                HorizontalLayout {
-                    padding-left: 16px;
-                    padding-right: 10px;
-                    spacing: 8px;
-                    Text {
-                        text: "ZCODE TOKEN · settings (rust)";
-                        color: #dde3e8; font-size: 13px; font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                    Rectangle { vertical-stretch: 0; }
-                    Rectangle {
-                        width: 26px; height: 22px; border-radius: 6px;
-                        y: 9px;
-                        background: close.pressed ? #ff6b6b44 : (close.has-hover ? #ff888833 : transparent);
-                        close := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.close-panel(); }
+            spacing: 0px;
+            HorizontalLayout {
+                min-height: 0px;
+                spacing: 0px;
+                Rectangle {
+                    width: 150px;
+                    background: SettingsTheme.sidebar;
+                    VerticalLayout {
+                        padding: SettingsTheme.space-md;
+                        spacing: SettingsTheme.space-md;
+                        BodyText { text: "TOKEN BAR"; font-weight: 700; color: SettingsTheme.accent; }
+                        HelpText { text: "设置"; }
+                        nav := ListView {
+                            min-height: 0px;
+                            horizontal-scrollbar-policy: always-off;
+                            content-width: self.visible-width;
+                            accessible-role: tab-list;
+                            accessible-label: "设置页面";
+                            accessible-item-count: 8;
+                            property <int> focus-request-index: -1;
+                            property <int> selected-index: root.page;
+                            function reveal(index: int) {
+                                self.content-y = root.row-scroll-y(index, 8, self.visible-height, self.content-y);
+                            }
+                            changed selected-index => { self.reveal(self.selected-index); }
+                            for name[index] in ["位置", "外观", "显示", "壁纸", "行为", "更新", "状态", "模型"]: SelectableRow {
+                                width: nav.visible-width;
+                                label: name;
+                                prefix: "0" + (index + 1);
+                                item-index: index;
+                                accessible-role: tab;
+                                selected: root.page == index;
+                                request-focus: nav.focus-request-index == index;
+                                focus-received => { nav.focus-request-index = -1; }
+                                activated => { root.select-page(index); }
+                                move-selection(delta) => {
+                                    let next-index = max(0, min(7, index + delta));
+                                    nav.reveal(next-index);
+                                    nav.focus-request-index = next-index;
+                                    root.select-page(next-index);
+                                }
+                            }
                         }
-                        Text { text: "✕"; color: close.has-hover ? #ffb0b0 : #8892a0; font-size: 12px;
-                               horizontal-alignment: center; vertical-alignment: center; }
+                        ActionButton {
+                            text: "打开小亚";
+                            clicked => { root.select-page(8); SettingsBridge.action("open-companion"); }
+                        }
+                    }
+                }
+                Rectangle { width: 1px; background: SettingsTheme.border; }
+                VerticalLayout {
+                    min-width: 0px;
+                    min-height: 0px;
+                    spacing: 0px;
+                    VerticalLayout {
+                        padding: SettingsTheme.page-padding;
+                        padding-bottom: SettingsTheme.space-md;
+                        spacing: SettingsTheme.space-xs;
+                        BodyText {
+                            text: root.page-names[max(0, min(8, root.page))];
+                            font-size: SettingsTheme.title-size;
+                            font-weight: 700;
+                        }
+                        HelpText { text: root.page-hints[max(0, min(8, root.page))]; }
+                    }
+                    Rectangle {
+                        min-height: 0px;
+                        min-width: 0px;
+                        horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        clip: true;
+
+                        // 00 位置：索引直接映射，无 i+1 的上排偏移。
+                        if root.page == 0: PageScroll {
+                            Section {
+                                title: "贴靠与偏移";
+                                BodyText { text: "贴靠位置"; }
+                                ComboBox {
+                                    model: ["左下", "下中", "右下", "左上", "上中", "右上", "自由位置"];
+                                    current-index <=> root.anchor-index;
+                                    accessible-label: "贴靠位置";
+                                    selected(value) => { SettingsBridge.number-change("anchor-index", self.current-index); }
+                                }
+                                BodyText { text: "位置基准"; }
+                                ComboBox {
+                                    model: ["跟随 ZCode 窗口", "整块屏幕"];
+                                    current-index <=> root.scope-index;
+                                    accessible-label: "位置基准";
+                                    selected(value) => { SettingsBridge.number-change("scope-index", self.current-index); }
+                                }
+                                NumberRow {
+                                    label: "水平偏移"; help: "像素，可输入负数";
+                                    minimum: -4000; maximum: 4000;
+                                    value <=> root.offset-x;
+                                    edited(value) => { SettingsBridge.number-change("offset-x", value); }
+                                }
+                                NumberRow {
+                                    label: "垂直偏移"; help: "像素，可输入负数";
+                                    minimum: -4000; maximum: 4000;
+                                    value <=> root.offset-y;
+                                    edited(value) => { SettingsBridge.number-change("offset-y", value); }
+                                }
+                                ActionButton {
+                                    text: "恢复自动贴靠";
+                                    enabled: !SettingsBridge.busy;
+                                    clicked => { SettingsBridge.action("restore-dock"); }
+                                }
+                            }
+                            Section {
+                                title: "自由位置";
+                                HelpText {
+                                    text: root.free-position-valid ? "已保存自由位置，可直接恢复。" : "尚未保存自由位置。调整坐标或拖动悬浮条后保存。";
+                                }
+                                NumberRow {
+                                    label: "屏幕 X"; minimum: -32000; maximum: 32000;
+                                    value <=> root.free-x;
+                                    edited(value) => { SettingsBridge.number-change("free-x", value); }
+                                }
+                                NumberRow {
+                                    label: "屏幕 Y"; minimum: -32000; maximum: 32000;
+                                    value <=> root.free-y;
+                                    edited(value) => { SettingsBridge.number-change("free-y", value); }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "保存自由位置"; enabled: !SettingsBridge.busy; clicked => { SettingsBridge.action("save-free-position"); } }
+                                    ActionButton { text: "恢复自由位置"; enabled: root.free-position-valid && !SettingsBridge.busy; clicked => { SettingsBridge.action("restore-free-position"); } }
+                                }
+                            }
+                            Section {
+                                title: "锁定与迁移";
+                                ToggleRow {
+                                    label: "锁定当前会话"; help: root.pinned-label;
+                                    checked <=> root.pinned;
+                                    toggled(value) => { SettingsBridge.bool-change("pinned", value); }
+                                }
+                                ToggleRow {
+                                    label: "锁定悬浮条位置"; help: "锁定后避免误拖动。";
+                                    checked <=> root.lock-position;
+                                    toggled(value) => { SettingsBridge.bool-change("lock-position", value); }
+                                }
+                                ActionButton {
+                                    text: "恢复旧 Python 设置";
+                                    enabled: !SettingsBridge.busy;
+                                    clicked => { SettingsBridge.action("restore-python-settings"); }
+                                }
+                            }
+                        }
+
+                        // 01 外观：默认实底；修改即时预览，应用才保存。
+                        if root.page == 1: PageScroll {
+                            Section {
+                                title: "清晰度";
+                                NumberRow {
+                                    label: "悬浮条不透明度"; help: "30–100%";
+                                    minimum: 30; maximum: 100;
+                                    value <=> root.opacity-pct;
+                                    edited(value) => { SettingsBridge.number-change("opacity-pct", value); }
+                                }
+                                NumberRow {
+                                    label: "面板不透明度"; help: "55–100%，默认 100% 实底";
+                                    minimum: 55; maximum: 100;
+                                    value <=> root.panel-opacity;
+                                    edited(value) => { SettingsBridge.number-change("panel-opacity", value); }
+                                }
+                                HelpText { text: "即时预览外观；点底部“应用”保存。关闭会撤销尚未应用的修改。"; }
+                            }
+                            Section {
+                                title: "字体与标签";
+                                NumberRow {
+                                    label: "悬浮条字号"; help: "10–28 px";
+                                    minimum: 10; maximum: 28;
+                                    value <=> root.font-px;
+                                    edited(value) => { SettingsBridge.number-change("font-px", value); }
+                                }
+                                BodyText { text: "字体名称"; }
+                                LineEdit {
+                                    text <=> root.font-family;
+                                    placeholder-text: "Microsoft YaHei UI";
+                                    accessible-label: "悬浮条字体名称";
+                                    edited(value) => { SettingsBridge.text-change("font-family", value); }
+                                }
+                                ActionButton { text: "选择系统字体"; clicked => { SettingsBridge.action("choose-font"); } }
+                                ToggleRow {
+                                    label: "显示指标标签"; help: "同时影响“显示”页的标签开关。";
+                                    checked <=> root.show-labels;
+                                    toggled(value) => { SettingsBridge.bool-change("show-labels", value); }
+                                }
+                            }
+                        }
+
+                        // 02 显示：各指标单独开关，工具计数与其他指标使用相同契约。
+                        if root.page == 2: PageScroll {
+                            Section {
+                                title: "生成与上下文";
+                                ToggleRow { label: "生成速度"; help: "生成期间的输出速度。"; checked <=> root.show-speed; toggled(value) => { SettingsBridge.bool-change("show-speed", value); } }
+                                ToggleRow { label: "上下文占用"; help: "当前上下文用量与占比。"; checked <=> root.show-ctx; toggled(value) => { SettingsBridge.bool-change("show-ctx", value); } }
+                                ToggleRow { label: "本轮用量"; checked <=> root.show-turn; toggled(value) => { SettingsBridge.bool-change("show-turn", value); } }
+                                ToggleRow { label: "缓存命中率"; checked <=> root.show-cache; toggled(value) => { SettingsBridge.bool-change("show-cache", value); } }
+                            }
+                            Section {
+                                title: "累计与工具";
+                                ToggleRow { label: "会话累计"; checked <=> root.show-session; toggled(value) => { SettingsBridge.bool-change("show-session", value); } }
+                                ToggleRow { label: "今日累计"; checked <=> root.show-today; toggled(value) => { SettingsBridge.bool-change("show-today", value); } }
+                                ToggleRow { label: "工具调用次数"; help: "显示当前会话的工具使用统计。"; checked <=> root.show-tools; toggled(value) => { SettingsBridge.bool-change("show-tools", value); } }
+                                ToggleRow { label: "显示指标标签"; checked <=> root.show-labels; toggled(value) => { SettingsBridge.bool-change("show-labels", value); } }
+                            }
+                            Section {
+                                title: "内容预览";
+                                BodyText {
+                                    text: (root.show-speed ? "速度  ·  " : "") + (root.show-ctx ? "上下文  ·  " : "") + (root.show-turn ? "本轮  ·  " : "") + (root.show-session ? "会话  ·  " : "") + (root.show-today ? "今日  ·  " : "") + (root.show-tools ? "工具  ·  " : "") + (root.show-cache ? "缓存" : "");
+                                    color: SettingsTheme.accent;
+                                }
+                                HelpText { text: "这里展示启用的内容项，实际数值随会话更新；全部关闭时不显示用量指标。"; }
+                            }
+                        }
+
+                        // 03 壁纸：图片由 Rust 加载；预览始终留出130px可见区域。
+                        if root.page == 3: PageScroll {
+                            Section {
+                                title: "壁纸图片";
+                                Rectangle {
+                                    height: 130px;
+                                    border-radius: SettingsTheme.radius;
+                                    background: SettingsTheme.inset;
+                                    border-width: 1px;
+                                    border-color: SettingsTheme.border;
+                                    clip: true;
+                                    if root.wp-preview-ready: Image {
+                                        source: root.w-preview;
+                                        image-fit: contain;
+                                        width: 100%; height: 100%;
+                                        accessible-label: "所选壁纸预览";
+                                    }
+                                    if !root.wp-preview-ready: HelpText {
+                                        x: SettingsTheme.space-lg; y: SettingsTheme.space-lg;
+                                        width: parent.width - 2 * SettingsTheme.space-lg;
+                                        height: parent.height - 2 * SettingsTheme.space-lg;
+                                        text: root.wp-busy ? "正在加载图片…" : root.wp-path == "" ? "选择图片，或粘贴本地图片路径" : "预览尚不可用，请查看下方状态或重新选择图片。";
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                LineEdit {
+                                    text <=> root.wp-path;
+                                    placeholder-text: "本地图片路径";
+                                    accessible-label: "壁纸图片路径";
+                                    edited(value) => { SettingsBridge.text-change("wp-path", value); }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "选择图片"; enabled: !root.wp-busy; clicked => { SettingsBridge.action("choose-wallpaper"); } }
+                                    ActionButton { text: "粘贴路径"; enabled: !root.wp-busy; clicked => { SettingsBridge.action("paste-wallpaper-path"); } }
+                                }
+                                BodyText {
+                                    text: (root.wp-busy ? "正在处理 · " : !root.wp-enabled ? "壁纸已禁用 · " : !root.wp-visible ? "壁纸已隐藏 · " : "") + root.wp-status;
+                                    color: root.wp-busy ? SettingsTheme.accent : SettingsTheme.secondary;
+                                }
+                            }
+                            Section {
+                                title: "设置窗口背景";
+                                ToggleRow { label: "设置窗口使用这张壁纸"; help: "使用同一张图片，背景与桌面隔离；暗色遮罩保持文字清晰。"; checked <=> root.panel-wallpaper; toggled(value) => { SettingsBridge.bool-change("panel-wallpaper", value); } }
+                                NumberRow { label: "设置窗口压暗"; help: "35–95%，只影响此窗口"; minimum: 35; maximum: 95; value <=> root.panel-wallpaper-dim; edited(value) => { SettingsBridge.number-change("panel-wallpaper-dim", value); } }
+                            }
+                            Section {
+                                title: "显示与动态配色";
+                                ToggleRow { label: "启用壁纸"; checked <=> root.wp-enabled; toggled(value) => { SettingsBridge.bool-change("wp-enabled", value); } }
+                                ToggleRow { label: "显示壁纸图片"; help: "关闭后可保留从图片提取的配色。"; checked <=> root.wp-visible; toggled(value) => { SettingsBridge.bool-change("wp-visible", value); } }
+                                ToggleRow { label: "Monet 动态配色"; checked <=> root.wp-monet; toggled(value) => { SettingsBridge.bool-change("wp-monet", value); } }
+                                NumberRow { label: "背景模糊"; help: "0–80 px"; maximum: 80; value <=> root.wp-blur; edited(value) => { SettingsBridge.number-change("wp-blur", value); } }
+                                NumberRow { label: "背景压暗"; help: "0–100%"; value <=> root.wp-dim; edited(value) => { SettingsBridge.number-change("wp-dim", value); } }
+                                BodyText { text: "图片适配方式"; }
+                                ComboBox {
+                                    model: ["填充 cover", "完整显示 contain", "智能裁切 smart", "拉伸 stretch"];
+                                    current-index <=> root.wp-fit;
+                                    accessible-label: "壁纸适配方式";
+                                    selected(value) => { SettingsBridge.number-change("wp-fit", self.current-index); }
+                                }
+                                NumberRow { label: "水平焦点"; help: "0% 左侧 · 100% 右侧"; value <=> root.focus-x; edited(value) => { SettingsBridge.number-change("focus-x", value); } }
+                                NumberRow { label: "垂直焦点"; help: "0% 顶部 · 100% 底部"; value <=> root.focus-y; edited(value) => { SettingsBridge.number-change("focus-y", value); } }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: root.wp-busy ? "处理中…" : "应用壁纸"; primary: true; enabled: !root.wp-busy && root.wp-path != ""; clicked => { SettingsBridge.action("apply-wallpaper"); } }
+                                    ActionButton { text: "刷新壁纸"; enabled: !root.wp-busy; clicked => { SettingsBridge.action("refresh-wallpaper"); } }
+                                }
+                            }
+                            Section {
+                                title: "ZCode 连接与维护";
+                                ToggleRow { label: "ZCode 更新后自动恢复"; help: "检测客户端包或窗口变化，重新应用保存的壁纸与动态主题；保留新版客户端。"; checked <=> root.auto-client-recovery; toggled(value) => { SettingsBridge.bool-change("auto-client-recovery", value); } }
+                                HelpText { text: root.recovery-status; }
+                                ActionButton { text: "立即恢复自定义外观"; enabled: !root.wp-busy; clicked => { SettingsBridge.action("restore-after-update"); } }
+                                NumberRow { label: "连接端口"; minimum: 1024; maximum: 65535; value <=> root.wp-port; edited(value) => { SettingsBridge.number-change("wp-port", value); } }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "检查连接"; enabled: !root.wp-busy; clicked => { SettingsBridge.action("check-wallpaper-connection"); } }
+                                    ActionButton { text: "恢复默认主题"; enabled: !root.wp-busy; clicked => { SettingsBridge.action("reset-theme"); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "修复 ZCode 入口"; enabled: !root.wp-busy; clicked => { SettingsBridge.action("repair-launchers"); } }
+                                    ActionButton { text: "打开图片目录"; clicked => { SettingsBridge.action("open-wallpaper-directory"); } }
+                                }
+                            }
+                        }
+
+                        // 04 行为
+                        if root.page == 4: PageScroll {
+                            Section {
+                                title: "运行方式";
+                                ToggleRow { label: "悬浮条始终置顶"; checked <=> root.bar-always-on-top; toggled(value) => { SettingsBridge.bool-change("always-on-top", value); } }
+                                ToggleRow { label: "ZCode 最小化或关闭时收起"; help: "切到其它应用不会隐藏悬浮条。"; checked <=> root.hide-when-inactive; toggled(value) => { SettingsBridge.bool-change("hide-when-inactive", value); } }
+                                NumberRow { label: "刷新间隔"; help: "300–30000 ms"; minimum: 300; maximum: 30000; step-size: 100; value <=> root.poll-ms; edited(value) => { SettingsBridge.number-change("poll-ms", value); } }
+                                ToggleRow { label: "开机启动"; checked <=> root.auto-start; toggled(value) => { SettingsBridge.bool-change("auto-start", value); } }
+                                ToggleRow { label: "自动检查更新"; checked <=> root.auto-update; toggled(value) => { SettingsBridge.bool-change("auto-update", value); } }
+                            }
+                            Section {
+                                title: "快捷操作";
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "打开小亚陪伴"; clicked => { root.select-page(8); SettingsBridge.action("open-companion"); } }
+                                    ActionButton { text: root.bar-visible ? "隐藏悬浮条" : "显示悬浮条"; clicked => { SettingsBridge.action("toggle-bar"); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "重启悬浮条"; enabled: !SettingsBridge.busy; clicked => { SettingsBridge.action("restart-bar"); } }
+                                    ActionButton { text: "创建桌面快捷方式"; enabled: !SettingsBridge.busy; clicked => { SettingsBridge.action("create-desktop-shortcut"); } }
+                                }
+                            }
+                        }
+
+                        // 05 更新：版本和状态都由后端提供，不预置虚构版本。
+                        if root.page == 5: PageScroll {
+                            Section {
+                                title: "当前版本";
+                                BodyText { text: root.version-info; }
+                                HelpText { text: root.update-status; }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: SettingsBridge.busy ? "处理中…" : "检查更新"; enabled: !SettingsBridge.busy; clicked => { SettingsBridge.action("check-update"); } }
+                                    ActionButton { text: "安装更新"; primary: true; enabled: root.update-available && !SettingsBridge.busy; clicked => { SettingsBridge.action("install-update"); } }
+                                }
+                                ActionButton { text: "打开发布页"; clicked => { SettingsBridge.action("open-releases"); } }
+                            }
+                            Section {
+                                title: "更新偏好";
+                                ToggleRow { label: "自动检查更新"; help: "发现可用更新后，在此查看与安装。"; checked <=> root.auto-update; toggled(value) => { SettingsBridge.bool-change("auto-update", value); } }
+                            }
+                        }
+
+                        // 06 状态：诊断只读可选中复制；远程密钥字段仅表示文件路径。
+                        if root.page == 6: PageScroll {
+                            Section {
+                                title: "运行诊断";
+                                TextEdit {
+                                    height: 200px;
+                                    min-width: 0px;
+                                    text: root.status-lines;
+                                    read-only: true;
+                                    wrap: word-wrap;
+                                    font-size: SettingsTheme.body-size;
+                                    placeholder-text: "点“刷新自检”读取运行状态。";
+                                    accessible-label: "运行诊断，可选择并复制";
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "刷新自检"; enabled: !SettingsBridge.busy; clicked => { SettingsBridge.action("refresh-diagnostics"); } }
+                                    ActionButton { text: "复制诊断"; enabled: root.status-lines != ""; clicked => { SettingsBridge.action("copy-diagnostics"); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "打开日志"; clicked => { SettingsBridge.action("open-logs"); } }
+                                    ActionButton { text: "打开数据目录"; clicked => { SettingsBridge.action("open-data-directory"); } }
+                                }
+                                ActionButton { text: "重启悬浮条"; enabled: !SettingsBridge.busy; clicked => { SettingsBridge.action("restart-bar"); } }
+                            }
+                            Section {
+                                title: "远程会话";
+                                ToggleRow { label: "启用远程读取"; checked <=> root.remote-enabled; toggled(value) => { SettingsBridge.bool-change("remote-enabled", value); } }
+                                BodyText { text: "主机"; }
+                                LineEdit { text <=> root.remote-host; placeholder-text: "主机名或 IP"; enabled: root.remote-enabled; accessible-label: "远程主机"; edited(value) => { SettingsBridge.text-change("remote-host", value); } }
+                                BodyText { text: "用户"; }
+                                LineEdit { text <=> root.remote-user; placeholder-text: "远程用户名"; enabled: root.remote-enabled; accessible-label: "远程用户名"; edited(value) => { SettingsBridge.text-change("remote-user", value); } }
+                                NumberRow { label: "SSH 端口"; minimum: 1; maximum: 65535; enabled: root.remote-enabled; value <=> root.remote-port; edited(value) => { SettingsBridge.number-change("remote-port", value); } }
+                                BodyText { text: "私钥文件路径"; }
+                                LineEdit { text <=> root.remote-key; placeholder-text: "仅填写文件路径"; enabled: root.remote-enabled; accessible-label: "SSH 私钥文件路径，不是私钥内容"; edited(value) => { SettingsBridge.text-change("remote-key", value); } }
+                                HelpText { text: "这里只填写路径，不粘贴私钥或密码。"; }
+                                BodyText { text: "远程辅助程序路径"; }
+                                LineEdit { text <=> root.remote-helper; placeholder-text: "远程 helper 的路径"; enabled: root.remote-enabled; accessible-label: "远程辅助程序路径"; edited(value) => { SettingsBridge.text-change("remote-helper", value); } }
+                            }
+                        }
+
+                        // 07 模型：model-items 是已筛选列表，选择索引对应该列表。
+                        if root.page == 7: PageScroll {
+                            Section {
+                                title: "提供方与发现";
+                                ComboBox {
+                                    model: root.provider-names;
+                                    current-index <=> root.provider-index;
+                                    enabled: !root.models-busy && root.provider-names.length > 0;
+                                    accessible-label: "模型提供方";
+                                    selected(value) => { SettingsBridge.provider-change(self.current-index); }
+                                }
+                                if root.provider-names.length == 0: HelpText { text: "尚未读取到提供方，请检查配置后刷新。"; }
+                                LineEdit {
+                                    text <=> root.filter-text;
+                                    placeholder-text: "筛选模型名称或 ID";
+                                    accessible-label: "模型筛选";
+                                    edited(value) => { SettingsBridge.model-filter(value); }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: root.models-busy ? "发现 / 实测中…" : "发现模型"; enabled: !root.models-busy && root.provider-index >= 0; clicked => { SettingsBridge.action("discover-models"); } }
+                                    ActionButton { text: "取消任务"; enabled: root.models-busy; clicked => { SettingsBridge.action("cancel-models"); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "导入筛选列表"; enabled: !root.models-busy && root.model-items.length > 0; clicked => { SettingsBridge.action("import-filtered-models"); } }
+                                    ActionButton { text: "一键实测并导入"; primary: true; enabled: !root.models-busy && root.model-items.length > 0; clicked => { SettingsBridge.action("probe-import-models"); } }
+                                }
+                                HelpText { text: root.models-status; }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "继续上次待办"; enabled: !root.models-busy; clicked => { SettingsBridge.action("resume-pending-models"); } }
+                                    ActionButton { text: "取消上次待办"; enabled: !root.models-busy; clicked => { SettingsBridge.action("cancel-pending-models"); } }
+                                }
+                            }
+                            Section {
+                                title: "模型列表 · " + root.model-items.length + " / " + root.model-count;
+                                Rectangle {
+                                    height: max(170px, min(260px, root.height - 430px));
+                                    min-width: 0px;
+                                    border-radius: SettingsTheme.radius;
+                                    border-width: 1px;
+                                    border-color: SettingsTheme.border;
+                                    background: SettingsTheme.inset;
+                                    clip: true;
+                                    model-list := ListView {
+                                        x: 4px; y: 4px;
+                                        width: parent.width - 8px;
+                                        height: parent.height - 8px;
+                                        content-width: self.visible-width;
+                                        horizontal-scrollbar-policy: always-off;
+                                        accessible-label: "发现的模型";
+                                        accessible-item-count: root.model-items.length;
+                                        property <int> focus-request-index: -1;
+                                        property <int> selected-index: root.model-selected-index;
+                                        function reveal(index: int) {
+                                            self.content-y = root.row-scroll-y(index, root.model-items.length, self.visible-height, self.content-y);
+                                        }
+                                        changed selected-index => { self.reveal(self.selected-index); }
+                                        for model-id[index] in root.model-items: SelectableRow {
+                                            width: model-list.visible-width;
+                                            label: model-id;
+                                            selected: root.model-selected-index == index;
+                                            item-index: index;
+                                            request-focus: model-list.focus-request-index == index;
+                                            focus-received => { model-list.focus-request-index = -1; }
+                                            activated => { root.select-model(index); }
+                                            move-selection(delta) => {
+                                                let next-index = max(0, min(root.model-items.length - 1, index + delta));
+                                                model-list.reveal(next-index);
+                                                model-list.focus-request-index = next-index;
+                                                root.select-model(next-index);
+                                            }
+                                        }
+                                    }
+                                    if root.model-items.length == 0: HelpText {
+                                        x: SettingsTheme.space-lg; y: SettingsTheme.space-lg;
+                                        width: parent.width - 2 * SettingsTheme.space-lg;
+                                        height: parent.height - 2 * SettingsTheme.space-lg;
+                                        text: root.models-busy ? "正在读取模型，请稍候…" : root.filter-text != "" ? "没有匹配的模型，试试其他筛选条件。" : "尚无模型。选择提供方并点“发现模型”，也可以在下方手动导入。";
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                                ActionButton { text: "复制选中 ID"; enabled: root.model-selected-index >= 0 && root.model-selected-index < root.model-items.length; clicked => { SettingsBridge.action("copy-model-id"); } }
+                                BodyText { text: "模型能力"; font-weight: 600; }
+                                TextEdit {
+                                    height: 150px;
+                                    min-width: 0px;
+                                    text: root.model-details;
+                                    placeholder-text: "选择列表中的模型，查看其能力与实测结果。";
+                                    read-only: true;
+                                    wrap: word-wrap;
+                                    font-size: SettingsTheme.body-size;
+                                    accessible-label: "选中模型的能力详情，可复制";
+                                }
+                            }
+                            Section {
+                                title: "手动导入";
+                                LineEdit {
+                                    text <=> root.manual-model-ids;
+                                    placeholder-text: "模型 ID，多个可用逗号或空格分隔";
+                                    accessible-label: "手动导入模型 ID";
+                                    edited(value) => { SettingsBridge.text-change("manual-model-ids", value); }
+                                    accepted(value) => { if !root.models-busy && value != "" && root.provider-index >= 0 { SettingsBridge.manual-import(value); } }
+                                }
+                                ActionButton { text: "导入填写的 ID"; enabled: !root.models-busy && root.manual-model-ids != "" && root.provider-index >= 0; clicked => { SettingsBridge.manual-import(root.manual-model-ids); } }
+                            }
+                        }
+
+                        // 08 小亚：从独立入口访问，不挤占八个设置页签。
+                        if root.page == 8: PageScroll {
+                            Section {
+                                title: "陪伴连接";
+                                ToggleRow { label: "启用小亚"; checked <=> root.companion-enabled; toggled(value) => { SettingsBridge.bool-change("companion-enabled", value); } }
+                                BodyText { text: "连接配置文件"; }
+                                LineEdit {
+                                    text <=> root.companion-config-path;
+                                    placeholder-text: "本地配置文件路径";
+                                    accessible-label: "小亚配置文件路径";
+                                    edited(value) => { SettingsBridge.text-change("companion-config-path", value); }
+                                }
+                                ActionButton { text: "选择连接文件"; enabled: !root.companion-busy; clicked => { SettingsBridge.action("choose-companion-config"); } }
+                                if root.companion-model-names.length > 0: ComboBox {
+                                    model: root.companion-model-names;
+                                    current-index <=> root.companion-model-index;
+                                    accessible-label: "陪伴提供方与模型";
+                                    selected(value) => { SettingsBridge.number-change("companion-model-index", self.current-index); }
+                                }
+                                ToggleRow { label: "流式显示回复"; checked <=> root.companion-stream; toggled(value) => { SettingsBridge.bool-change("companion-stream", value); } }
+                                ToggleRow { label: "保留小亚回复历史"; help: "只保存陪伴回复，不保存工作内容、用户输入或凭据。"; checked <=> root.companion-persist-history; toggled(value) => { SettingsBridge.bool-change("companion-persist-history", value); } }
+                                HelpText { text: (root.companion-paused ? "主动陪伴已暂停 · " : "") + root.companion-status; }
+                            }
+                            Section {
+                                title: "主动陪伴";
+                                ToggleRow { label: "允许主动问候"; enabled: root.companion-enabled; checked <=> root.companion-auto; toggled(value) => { SettingsBridge.bool-change("companion-auto", value); } }
+                                NumberRow { label: "冷却时间"; help: "秒，0–86400"; maximum: 86400; enabled: root.companion-enabled; value <=> root.companion-cooldown-secs; edited(value) => { SettingsBridge.number-change("companion-cooldown-secs", value); } }
+                                NumberRow { label: "每小时上限"; help: "0–60 次"; maximum: 60; enabled: root.companion-enabled; value <=> root.companion-hourly; edited(value) => { SettingsBridge.number-change("companion-hourly", value); } }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: "问候"; enabled: root.companion-enabled && !root.companion-busy; clicked => { SettingsBridge.action("companion-greet"); } }
+                                    ActionButton { text: "来一句"; enabled: root.companion-enabled && !root.companion-busy; clicked => { SettingsBridge.action("companion-say"); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: root.companion-paused ? "继续主动陪伴" : "暂停主动陪伴"; enabled: root.companion-enabled; clicked => { SettingsBridge.action("companion-toggle-pause"); } }
+                                    ActionButton { text: "停止生成"; enabled: root.companion-busy; clicked => { SettingsBridge.action("companion-stop"); } }
+                                }
+                            }
+                            Section {
+                                title: "对话";
+                                TextEdit {
+                                    height: 200px;
+                                    min-width: 0px;
+                                    text: root.companion-history;
+                                    placeholder-text: "对话会显示在这里。启用后可以打个招呼。";
+                                    read-only: true;
+                                    wrap: word-wrap;
+                                    font-size: SettingsTheme.body-size;
+                                    accessible-label: "小亚对话记录，可复制";
+                                }
+                                LineEdit {
+                                    text <=> root.companion-input;
+                                    placeholder-text: "和小亚说句话 · Ctrl+Enter 发送";
+                                    enabled: root.companion-enabled;
+                                    accessible-label: "发给小亚的消息";
+                                    edited(value) => { SettingsBridge.text-change("companion-input", value); }
+                                    key-pressed(event) => {
+                                        if event.modifiers.control && event.text == Key.Return { root.send-companion(); return accept; }
+                                        return reject;
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: SettingsTheme.space-sm;
+                                    ActionButton { text: root.companion-busy ? "正在回复…" : "发送"; primary: true; enabled: root.companion-enabled && !root.companion-busy && root.companion-input != ""; clicked => { root.send-companion(); } }
+                                    ActionButton { text: "清空历史"; enabled: !root.companion-busy && root.companion-history != ""; clicked => { SettingsBridge.action("companion-clear-history"); } }
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            // ── 主体：左页签 + 右内容 ──
-            HorizontalLayout {
-                spacing: 0px;
-
+            // 固定页脚：状态与操作分行，不随页面滚动，也不挤占按钮宽度。
+            Rectangle {
+                height: 108px;
+                background: SettingsTheme.sidebar;
+                Rectangle { height: 1px; background: SettingsTheme.border; }
                 VerticalLayout {
-                    width: 120px;
-                    padding: 10px;
-                    spacing: 6px;
-                    alignment: start;
-
-                    for pn[i] in root.page-names: Rectangle {
-                        height: 30px;
-                        border-radius: 7px;
-                        background: root.page == i ? #ffffff33 : (tab.has-hover ? #ffffff22 : transparent);
-                        tab := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.set-page(i); }
-                        }
-                        Text {
-                            text: pn;
-                            color: root.page == i ? #ffffff : #a8b2bd;
-                            font-size: 12px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
+                    padding: SettingsTheme.space-lg;
+                    spacing: SettingsTheme.space-sm;
+                    Text {
+                        text: (SettingsBridge.busy ? "处理中 · " : "") + SettingsBridge.status;
+                        color: SettingsBridge.busy ? SettingsTheme.accent : SettingsTheme.secondary;
+                        font-size: SettingsTheme.body-size;
+                        min-width: 0px;
+                        overflow: elide;
+                        accessible-label: "操作状态";
                     }
-                }
-
-                VerticalLayout {
-                    padding: 12px;
-                    spacing: 10px;
-
-                    // ── 01 位置 ──
-                    if root.page == 0: VerticalLayout {
-                        spacing: 10px;
-                        Text { text: "锚点（跟随 ZCode 窗口 / 整块屏幕）"; color: #8892a0; font-size: 11px; }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            for an[i] in ["左下", "下中", "右下", "左上", "上中", "右上"]: Rectangle {
-                                height: 30px;
-                                border-radius: 7px;
-                                background: root.anchor-index == (i < 3 ? i : i + 1) ? #7ddb8a33 : (a.has-hover ? #ffffff22 : #ffffff22);
-                                a := TouchArea {
-                                    mouse-cursor: pointer;
-                                    clicked => { root.anchor-set(i < 3 ? i : i + 1); }
-                                }
-                                Text { text: an; color: root.anchor-index == (i < 3 ? i : i + 1) ? #eaffee : #a8b2bd;
-                                       font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                        }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            Text { text: "基准:"; color: #8892a0; font-size: 12px; vertical-alignment: center; }
-                            for sc[i] in ["跟随 ZCode 窗口", "整块屏幕"]: Rectangle {
-                                height: 28px;
-                                border-radius: 7px;
-                                background: root.scope-index == i ? #7ddb8a33 : #ffffff22;
-                                st := TouchArea { mouse-cursor: pointer; clicked => { root.scope-set(i); } }
-                                Text { text: sc; color: root.scope-index == i ? #eaffee : #a8b2bd;
-                                       font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                        }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Rectangle {
-                                height: 30px; width: 150px; border-radius: 7px;
-                                background: rd.has-hover ? #7ddb8a33 : #29444b;
-                                rd := TouchArea { mouse-cursor: pointer; clicked => { root.restore-dock(); } }
-                                Text { text: "恢复自动贴靠"; color: #eaffee; font-size: 12px;
-                                       horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                            Text { text: "拖动条面可自由摆放（free 模式），双击条面也可恢复"; color: #6b7680; font-size: 10px; vertical-alignment: center; }
-                        }
-                    }
-
-                    // ── 02 外观 ──
-                    if root.page == 1: VerticalLayout {
-                        spacing: 14px;
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Text { text: "不透明度"; color: #a8b2bd; font-size: 12px; width: 70px; vertical-alignment: center; }
-                            Slider { minimum: 55; maximum: 100; value: root.opacity-pct;
-                                     changed(v) => { root.opacity-changed(v); } }
-                            Text { text: root.opacity-pct + "%"; color: #dde3e8; font-size: 12px; width: 40px; vertical-alignment: center; }
-                        }
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Text { text: "字号"; color: #a8b2bd; font-size: 12px; width: 70px; vertical-alignment: center; }
-                            Slider { minimum: 11; maximum: 16; value: root.font-px;
-                                     changed(v) => { root.font-changed(v); } }
-                            Text { text: root.font-px + "px"; color: #dde3e8; font-size: 12px; width: 40px; vertical-alignment: center; }
-                        }
-                        Text { text: "壁纸 / Monet 动态色暂由 Python 面板承担（设置按钮可打开，设置里「位置」页不冲突）";
-                               color: #6b7680; font-size: 10px; wrap: word-wrap; }
-                    }
-
-                    // ── 03 显示 ──
-                    if root.page == 2: VerticalLayout {
-                        spacing: 8px;
-                        HorizontalLayout {
-                            spacing: 14px;
-                            CheckBox { text: "速度"; checked: root.show-speed; toggled => { root.show-toggled("speed", self.checked); } }
-                            CheckBox { text: "上下文"; checked: root.show-ctx; toggled => { root.show-toggled("ctx", self.checked); } }
-                            CheckBox { text: "本轮"; checked: root.show-turn; toggled => { root.show-toggled("turn", self.checked); } }
-                        }
-                        HorizontalLayout {
-                            spacing: 14px;
-                            CheckBox { text: "会话"; checked: root.show-session; toggled => { root.show-toggled("session", self.checked); } }
-                            CheckBox { text: "今日"; checked: root.show-today; toggled => { root.show-toggled("today", self.checked); } }
-                            CheckBox { text: "工具"; checked: root.show-tools; toggled => { root.show-toggled("tools", self.checked); } }
-                        }
-                        HorizontalLayout {
-                            spacing: 14px;
-                            CheckBox { text: "缓存率"; checked: root.show-cache; toggled => { root.show-toggled("cache", self.checked); } }
-                            CheckBox { text: "显示标签文字"; checked: root.show-labels; toggled => { root.labels-toggled(self.checked); } }
-                        }
-                        Text { text: "开关立即生效并保存到 settings-rs.json。"; color: #6b7680; font-size: 10px; }
-                    }
-
-                    // ── 06 壁纸（桥接 Python 插件）──
-                    if root.page == 3: VerticalLayout {
-                        spacing: 12px;
-                        Text { text: "壁纸 / Monet 动态色 / CDP 注入目前由 Python 侧承担"; color: #8892a0; font-size: 11px; wrap: word-wrap; }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Rectangle {
-                                height: 32px; width: 190px; border-radius: 7px;
-                                background: wp1.has-hover ? #337ddb8a : #29444b;
-                                wp1 := TouchArea { mouse-cursor: pointer; clicked => { root.open-python-panel(); } }
-                                Text { text: "打开壁纸设置（完整）"; color: #eaffee; font-size: 12px;
-                                       horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                            Text { text: "换图 / 压暗 / 模糊 / Monet 全功能"; color: #6b7680; font-size: 10px; vertical-alignment: center; }
-                        }
-                        Text { text: "原生壁纸引擎在后续版本替换此页。"; color: #5c6670; font-size: 10px; }
-                    }
-
-                    // ── 08 模型 ──
-                    if root.page == 4: VerticalLayout {
-                        spacing: 8px;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            ComboBox {
-                                width: 240px;
-                                model: root.provider-names;
-                                current-index: root.provider-index;
-                                selected(i) => { root.provider-changed(i); }
-                            }
-                            Rectangle {
-                                width: 92px; height: 28px; border-radius: 7px;
-                                background: db.has-hover ? #7ddb8a33 : #29444b;
-                                db := TouchArea {
-                                    mouse-cursor: pointer;
-                                    enabled: !root.models-busy;
-                                    clicked => { root.discover-clicked(); }
-                                }
-                                Text { text: root.models-busy ? "发现中…" : "发现模型"; color: #eaffee; font-size: 12px;
-                                       horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                            Rectangle {
-                                width: 120px; height: 28px; border-radius: 7px;
-                                background: im.has-hover ? #7ddb8a33 : #29444b;
-                                im := TouchArea {
-                                    mouse-cursor: pointer;
-                                    enabled: !root.models-busy && root.model-ids.length > 0;
-                                    clicked => { root.import-clicked(); }
-                                }
-                                Text { text: "导入到 ZCode"; color: #eaffee; font-size: 12px;
-                                       horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                        }
-                        Rectangle {
-                            border-radius: 7px;
-                            background: #00000022;
-                            border-width: 1px; border-color: #ffffff22;
-                            VerticalLayout {
-                                padding: 4px;
-                                if root.model-ids.length == 0: Text {
-                                    text: "（还没有模型，先「发现模型」）";
-                                    color: #5c6670; font-size: 11px; horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                if root.model-ids.length > 0: ListView {
-                                    for mid_item in root.model-ids: Rectangle {
-                                        height: 24px;
-                                        Text { text: mid_item; color: #dde3e8; font-size: 11px;
-                                               vertical-alignment: center; padding-left: 10px;
-                                               overflow: elide; }
-                                    }
-                                }
-                            }
-                        }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text { text: "按 ID:"; color: #8892a0; font-size: 12px; vertical-alignment: center; }
-                            mid := LineEdit { placeholder-text: "模型 ID（逗号/空格分隔）"; font-size: 11px; }
-                            Rectangle {
-                                width: 70px; height: 26px; border-radius: 7px;
-                                background: mi.has-hover ? #7ddb8a33 : #29444b;
-                                mi := TouchArea { mouse-cursor: pointer; clicked => { root.import-id-clicked(mid.text); } }
-                                Text { text: "导入"; color: #eaffee; font-size: 11px;
-                                       horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                        }
-                        Text { text: root.models-status; color: #8892a0; font-size: 10px; wrap: word-wrap; }
-                    }
-
-                    // ── 09 状态 ──
-                    if root.page == 5: VerticalLayout {
-                        spacing: 6px;
-                        Text { text: root.status-lines; color: #a8b2bd; font-size: 11px; wrap: word-wrap; font-family: "Consolas"; }
+                    HorizontalLayout {
+                        spacing: SettingsTheme.space-sm;
+                        ActionButton { text: "恢复默认"; enabled: !SettingsBridge.busy; clicked => { SettingsBridge.action("restore-defaults"); } }
+                        Rectangle { min-width: 0px; horizontal-stretch: 2; }
+                        ActionButton { text: "应用"; primary: true; enabled: !SettingsBridge.busy; clicked => { SettingsBridge.action("apply"); } }
+                        ActionButton { text: "关闭"; clicked => { SettingsBridge.action("close-panel"); } }
                     }
                 }
             }
         }
+    }
     }
 }

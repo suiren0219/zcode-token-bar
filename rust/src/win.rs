@@ -1,310 +1,185 @@
-//! Win32 层：找 ZCode 窗口、贴靠计算、属主绑定、置顶、单实例。
-//!
-//! Python 版用 ctypes 直接调 user32；Rust 里对应物是 `windows` crate——
-//! 它把每个 API 放在 feature gate 后面（Cargo.toml 里列的那些），调用
-//! 模式从「动态查找符号」变成「编译期链接」，写错签名编译期就炸。
-//!
-//! windows-rs 0.58 的几个约定（踩过的坑记在这）：
-//! * 出参/入参大多直接收值，不是 `Option`——`Option<HWND>` 是 0.5x 早期
-//!   风格，0.58 的 `SetWindowPos` 第二个参数直接给 `HWND_TOPMOST`。
-//! * `CreateMutexW/CreateEventW` 的签名里有 `SECURITY_ATTRIBUTES`，
-//!   所以还要开 `Win32_Security` feature。
-//! * 显示器 API（MonitorFromWindow/MONITORINFO）在 `Win32::Graphics::Gdi`。
-//! * `BOOL` 在 `Win32::Foundation`（不是 windows::core）。
+//! Win32 边界：窗口句柄、物理坐标、单实例信号。设置窗口始终保留正常输入焦点。
+use std::path::Path;
+use windows::{core::PCWSTR, Win32::{Foundation::*, Graphics::Gdi::*, System::Threading::*, UI::WindowsAndMessaging::*}};
+use crate::settings::Bounds;
 
-use windows::Win32::Foundation::{ BOOL, CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0 };
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
-use windows::Win32::System::Threading::{ CreateEventW, CreateMutexW, SetEvent, WaitForSingleObject };
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowLongPtrW,
-    SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, GWL_EXSTYLE,
-    GWLP_HWNDPARENT, HWND_TOPMOST, SWP_NOZORDER, WINDOW_EX_STYLE,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-};
-use windows::core::PCWSTR;
+fn wide(s:&str)->Vec<u16>{s.encode_utf16().chain(Some(0)).collect()}
+fn handle(h:isize)->HWND {HWND(h as *mut _)}
 
-// ── 找 ZCode 主窗口 ─────────────────────────────────────────────────
-
-/// EnumWindows 的回调签名是裸 C 函数指针（`WNDENUMPROC`），
-/// 不能捕获环境——所以「收集结果」要走 lparam 传指针，和 Python 版
-/// `found = []` 闭包收集同一个意思，只是写法更底层。
-struct EnumCtx {
-    best: (isize, i64), // (hwnd, 面积)
+pub fn slint_handle(window:&slint::Window)->isize {
+    use raw_window_handle::{HasWindowHandle,RawWindowHandle};
+    let owned=window.window_handle();
+    match owned.window_handle().map(|h|h.as_raw()) {Ok(RawWindowHandle::Win32(w))=>w.hwnd.get(),_=>0}
 }
-
-unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let ctx = &mut *(lparam.0 as *mut EnumCtx);
-    if !IsWindowVisible(hwnd).as_bool() {
-        return true.into();
+pub fn own_hwnd(title:&str)->isize {
+    struct Find<'a>{title:&'a str,result:isize}
+    unsafe extern "system" fn visit(hwnd:HWND,p:LPARAM)->BOOL {
+        let f=&mut *(p.0 as *mut Find);
+        let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
+        if pid==std::process::id()&&window_title(hwnd)==f.title {f.result=hwnd.0 as isize;return false.into()}
+        true.into()
     }
-    let len = GetWindowTextLengthW(hwnd);
-    if len <= 0 {
-        return true.into();
-    }
-    let mut buf = [0u16; 256];
-    let n = GetWindowTextW(hwnd, &mut buf) as usize;
-    let title = String::from_utf16_lossy(&buf[..n.min(256)]);
-    if !title.contains("ZCode") {
-        return true.into();
-    }
-    // 工具窗口（WS_EX_TOOLWINDOW）一般是托盘/辅助小窗，跳过。
-    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    if ex & WS_EX_TOOLWINDOW.0 != 0 {
-        return true.into();
-    }
-    let mut rect = RECT::default();
-    if GetWindowRect(hwnd, &mut rect).is_err() {
-        return true.into();
-    }
-    let w = rect.right - rect.left;
-    let h = rect.bottom - rect.top;
-    if w < 400 || h < 300 {
-        return true.into();
-    }
-    let area = w as i64 * h as i64;
-    if area > ctx.best.1 {
-        ctx.best = (hwnd.0 as isize, area);
-    }
-    true.into()
+    let mut f=Find{title,result:0};unsafe{let _=EnumWindows(Some(visit),LPARAM(&mut f as *mut _ as isize));}f.result
 }
-
-/// ZCode 主窗口句柄：可见、标题含 ZCode、非工具窗、面积最大。
-/// 0 = 没找到（客户端没开）。逻辑同 Python `zcode_hwnd()`。
-pub fn zcode_hwnd() -> isize {
-    let mut ctx = EnumCtx { best: (0, 0) };
-    unsafe {
-        let _ = EnumWindows(Some(enum_cb), LPARAM(&mut ctx as *mut EnumCtx as isize));
-    }
-    ctx.best.0
+unsafe fn window_title(hwnd:HWND)->String {
+    let n=GetWindowTextLengthW(hwnd).clamp(0,4096) as usize;
+    let mut buf=vec![0u16;n+1];let got=GetWindowTextW(hwnd,&mut buf).max(0) as usize;
+    String::from_utf16_lossy(&buf[..got])
 }
-
-/// 按标题精确找本进程的 Slint 窗口（条面/面板各一个标题）。
-/// 之前按「面积最大」找，面板打开后面板比条面大，贴靠定时器把面板
-/// 当成条面套了 WS_EX_NOACTIVATE 还每秒挪走——面板就此无法交互
-/// （2026-11-15 实测）。标题是 Slint Window.title 传下去的，唯一可靠。
-pub fn own_hwnd(title: &str) -> isize {
-    struct Ctx<'a>(&'a [u16], isize);
-    let wanted: Vec<u16> = title.encode_utf16().collect();
-    let mut ctx = Ctx(&wanted, 0);
-    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let ctx = &mut *(lparam.0 as *mut Ctx);
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid != std::process::id() {
-            return true.into();
-        }
-        let n = GetWindowTextLengthW(hwnd) as usize;
-        if n == ctx.0.len() {
-            let mut buf = vec![0u16; n + 1];
-            GetWindowTextW(hwnd, &mut buf);
-            if buf[..n] == *ctx.0 {
-                ctx.1 = hwnd.0 as isize;
-                return false.into();
-            }
+pub fn zcode_hwnd()->isize {
+    struct Find {best:isize,area:i64}
+    unsafe extern "system" fn visit(hwnd:HWND,p:LPARAM)->BOOL {
+        let f=&mut *(p.0 as *mut Find);let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
+        if pid==std::process::id()||!IsWindowVisible(hwnd).as_bool(){return true.into()}
+        if (GetWindowLongPtrW(hwnd,GWL_EXSTYLE) as u32)&WS_EX_TOOLWINDOW.0!=0{return true.into()}
+        let title=window_title(hwnd);
+        if !title.to_ascii_lowercase().contains("zcode"){return true.into()}
+        let mut r=RECT::default();
+        if GetWindowRect(hwnd,&mut r).is_ok() {
+            let(w,h)=(r.right-r.left,r.bottom-r.top);
+            if w>=400&&h>=300&&i64::from(w)*i64::from(h)>f.area {f.best=hwnd.0 as isize;f.area=i64::from(w)*i64::from(h);}
         }
         true.into()
     }
-    unsafe {
-        let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
-    }
-    ctx.1
+    let mut f=Find{best:0,area:0};unsafe{let _=EnumWindows(Some(visit),LPARAM(&mut f as *mut _ as isize));}f.best
 }
-
-// ── 窗口形态：无边框小胶囊的工具样式 ────────────────────────────────
-
-/// 给 Slint 建好的窗口加：不进任务栏、不抢焦点、置顶。
-/// Slint 的 `no-frame` 只去掉边框；「像悬浮条」的扩展样式要自己补。
-///
-/// # 安全
-/// `hwnd` 必须是本进程的合法窗口句柄。
-pub unsafe fn apply_bar_styles(hwnd: isize, owner: isize) {
-    let hwnd = HWND(hwnd as *mut _);
-    let ex = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
-    SetWindowLongPtrW(
-        hwnd,
-        GWL_EXSTYLE,
-        (ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST).0 as isize,
-    );
-    if owner != 0 {
-        // 属主绑定：条面永远压在 ZCode 上、随它最小化一起让路（Python 同款）。
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner);
-    }
-    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+pub fn rect(hwnd:isize)->Option<Bounds> {
+    if hwnd==0{return None}let mut r=RECT::default();
+    unsafe{GetWindowRect(handle(hwnd),&mut r)}.ok()?;
+    Some(Bounds{left:r.left,top:r.top,right:r.right,bottom:r.bottom})
 }
+pub fn window_rect(hwnd:isize)->(i32,i32,i32,i32){rect(hwnd).map(|r|(r.left,r.top,r.right,r.bottom)).unwrap_or_default()}
+pub fn cursor_pos()->(i32,i32){let mut p=POINT::default();unsafe{let _=GetCursorPos(&mut p);} (p.x,p.y)}
+pub fn left_down()->bool {unsafe{windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(1)<0}}
+pub fn minimized(hwnd:isize)->bool {hwnd==0||unsafe{IsIconic(handle(hwnd)).as_bool()}}
+pub fn foreground_is(hwnd:isize)->bool {hwnd!=0&&unsafe{GetForegroundWindow()==handle(hwnd)}}
 
-/// 把窗口放到物理坐标 (x, y)，同时确保置顶。
-///
-/// # 安全
-/// `hwnd` 必须是本进程的合法窗口句柄。
-pub unsafe fn move_window(hwnd: isize, x: i32, y: i32) {
-    let _ = SetWindowPos(
-        HWND(hwnd as *mut _),
-        HWND_TOPMOST,
-        x, y, 0, 0,
-        SWP_NOSIZE | SWP_NOACTIVATE,
-    );
+pub fn work_area(hwnd:isize)->Bounds {
+    let m=unsafe{MonitorFromWindow(handle(hwnd),MONITOR_DEFAULTTONEAREST)};monitor_bounds(m)
 }
-
-/// 计算条面贴靠位置：默认贴 ZCode 主窗口正下方居中；
-/// ZCode 不在/最大化则贴屏幕底部居中（Python 同策略）。
-/// 结果强制 clamp 进工作区——ZCode 被拖到屏幕边缘时条面不许跟出去
-/// （Python 版「六向全在界内」同规则，2026-11-15 用户实测越界后补）。
-///
-/// 返回物理像素坐标（条面左上角）。
-pub fn dock_position(bar_w: i32, bar_h: i32, zcode: isize) -> (i32, i32) {
-    let mut zx = RECT::default();
-    let have_zcode = zcode != 0 && unsafe { GetWindowRect(HWND(zcode as *mut _), &mut zx) }.is_ok();
-
-    let anchor = if have_zcode { zcode } else { 0 };
-    let work = monitor_info(anchor).rcWork;
-    let (x, y) = if have_zcode {
-        // 最大化检测：窗口矩形盖住整个工作区 ≈ 最大化 → 回落屏幕底部。
-        let maximized = zx.left <= work.left && zx.right >= work.right && zx.top <= work.top;
-        if maximized {
-            ((work.left + work.right) / 2 - bar_w / 2, work.bottom - bar_h - 2)
-        } else {
-            let cx = (zx.left + zx.right) / 2;
-            let x = cx - bar_w / 2;
-            let y = zx.bottom + 4;
-            if y + bar_h <= work.bottom {
-                (x, y)
-            } else {
-                // 底下放不下（任务栏/屏幕边）：贴 ZCode 所在工作区底部。
-                ((work.left + work.right) / 2 - bar_w / 2, work.bottom - bar_h - 2)
-            }
+pub fn work_area_point(x:i32,y:i32)->Bounds {
+    let m=unsafe{MonitorFromPoint(POINT{x,y},MONITOR_DEFAULTTONEAREST)};monitor_bounds(m)
+}
+fn monitor_bounds(m:HMONITOR)->Bounds {
+    let mut mi=MONITORINFO{cbSize:std::mem::size_of::<MONITORINFO>() as u32,..Default::default()};
+    if unsafe{GetMonitorInfoW(m,&mut mi)}.as_bool(){let r=mi.rcWork;Bounds{left:r.left,top:r.top,right:r.right,bottom:r.bottom}}
+    else{Bounds{left:0,top:0,right:unsafe{GetSystemMetrics(SM_CXSCREEN)}.max(640),bottom:unsafe{GetSystemMetrics(SM_CYSCREEN)}.max(480)}}
+}
+pub fn apply_bar_styles(hwnd:isize,topmost:bool) {
+    if hwnd==0{return}unsafe{
+        let hwnd=handle(hwnd);let old=GetWindowLongPtrW(hwnd,GWL_EXSTYLE) as u32;
+        let new=(old|WS_EX_NOACTIVATE.0|WS_EX_TOOLWINDOW.0)&!WS_EX_APPWINDOW.0;
+        if old!=new {SetWindowLongPtrW(hwnd,GWL_EXSTYLE,new as isize);}
+        // 不绑定 ZCode 属主：面板/拖动/置顶状态独立，最小化由调度器处理。
+        if GetWindowLongPtrW(hwnd,GWLP_HWNDPARENT)!=0 {SetWindowLongPtrW(hwnd,GWLP_HWNDPARENT,0);}
+        if (old&WS_EX_TOPMOST.0!=0)!=topmost {
+            let _=SetWindowPos(hwnd,if topmost{HWND_TOPMOST}else{HWND_NOTOPMOST},0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         }
-    } else {
-        ((work.left + work.right) / 2 - bar_w / 2, work.bottom - bar_h - 2)
-    };
-
-    // 界内 clamp：左右各留 4px。max 兜底处理「屏幕比条面还窄」的极端。
-    let min_x = work.left + 4;
-    let max_x = (work.right - bar_w - 4).max(min_x);
-    let min_y = work.top + 4;
-    let max_y = (work.bottom - bar_h - 4).max(min_y);
-    (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
-}
-
-fn monitor_info(hwnd: isize) -> MONITORINFO {
-    let hmon = unsafe { MonitorFromWindow(HWND(hwnd as *mut _), MONITOR_DEFAULTTONEAREST) };
-    let mut mi = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        let _ = GetMonitorInfoW(hmon, &mut mi);
-    }
-    mi
-}
-
-/// 当前光标物理坐标（拖动计算用）。
-pub fn cursor_pos() -> (i32, i32) {
-    let mut p = windows::Win32::Foundation::POINT::default();
-    unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);
-    }
-    (p.x, p.y)
-}
-
-/// 窗口矩形 (left, top, right, bottom)，物理坐标。失败返回 (0,0,0,0)。
-pub fn window_rect(hwnd: isize) -> (i32, i32, i32, i32) {
-    let mut r = RECT::default();
-    if unsafe { GetWindowRect(HWND(hwnd as *mut _), &mut r) }.is_ok() {
-        (r.left, r.top, r.right, r.bottom)
-    } else {
-        (0, 0, 0, 0)
     }
 }
-
-/// 置顶刷新（ZCode 重启/全屏切换后 topmost 可能被系统洗掉，定时补一次）。
-pub unsafe fn ensure_topmost(hwnd: isize) {
-    let _ = SetWindowPos(
-        HWND(hwnd as *mut _),
-        HWND_TOPMOST,
-        0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-    );
+pub fn move_window(hwnd:isize,x:i32,y:i32) {
+    if hwnd==0{return}if let Some(r)=rect(hwnd){if(r.left,r.top)==(x,y){return}}
+    unsafe{let _=SetWindowPos(handle(hwnd),HWND::default(),x,y,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER);}
+}
+pub fn visible(hwnd:isize)->bool {hwnd!=0&&unsafe{IsWindowVisible(handle(hwnd)).as_bool()}}
+pub fn show(hwnd:isize,yes:bool){if hwnd!=0&&visible(hwnd)!=yes{unsafe{let _=ShowWindow(handle(hwnd),if yes{SW_SHOWNOACTIVATE}else{SW_HIDE});}}}
+pub fn focus(hwnd:isize){if hwnd!=0{unsafe{let _=ShowWindow(handle(hwnd),SW_SHOWNORMAL);let _=SetForegroundWindow(handle(hwnd));}}}
+pub fn set_opacity(hwnd:isize,value:f64) {
+    if hwnd==0{return}unsafe{
+        let h=handle(hwnd);let ex=GetWindowLongPtrW(h,GWL_EXSTYLE) as u32;
+        if value>=0.999 {
+            if ex&WS_EX_LAYERED.0!=0 {SetWindowLongPtrW(h,GWL_EXSTYLE,(ex&!WS_EX_LAYERED.0) as isize);}
+        }else{
+            SetWindowLongPtrW(h,GWL_EXSTYLE,(ex|WS_EX_LAYERED.0) as isize);
+            let _=SetLayeredWindowAttributes(h,COLORREF(0),(value.clamp(0.3,1.0)*255.0).round() as u8,LWA_ALPHA);
+        }
+    }
+}
+pub fn place_panel(panel:isize,bar:isize) {
+    let Some(p)=rect(panel)else{return};let work=work_area(if bar==0{panel}else{bar});
+    let(x,y)=if let Some(b)=rect(bar){
+        let y=if b.top-p.height()-10>=work.top{b.top-p.height()-10}else{b.bottom+10};
+        (b.left+(b.width()-p.width())/2,y)
+    }else{(work.left+(work.width()-p.width())/2,work.top+(work.height()-p.height())/2)};
+    let(x,y)=work.clamp(x,y,p.width(),p.height());move_window(panel,x,y);
+}
+pub fn clamp_window(hwnd:isize) {
+    if let Some(r)=rect(hwnd){let w=work_area(hwnd);let(x,y)=w.clamp(r.left,r.top,r.width(),r.height());move_window(hwnd,x,y)}
 }
 
-// ── 单实例 + 远程退出 ───────────────────────────────────────────────
-
-/// 单实例互斥量 + 命名退出事件。
-///
-/// Python 版用 lock 文件 + 轮询；Rust 版换成内核对象：
-/// `CreateMutexW` 天然跨进程互斥（进程崩了系统自动释放，不会留死锁文件），
-/// `CreateEventW` + `SetEvent` 让 `--quit` 立刻唤醒主线程，不用轮询。
-pub struct SingleInstance {
-    mutex: HANDLE,
-    quit_event: HANDLE,
-}
-
-// HANDLE 内部是 *mut c_void（!Send），但这里的两个句柄只被
-// 「创建它的线程之外的一个等待线程」使用，内核对象本身跨线程安全，
-// CloseHandle 也只在这份所有权 drop 时调用一次——手动声明 Send。
-unsafe impl Send for SingleInstance {}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
+const INSTANCE:&str="Local\\zcode-token-bar-rs";
+struct OwnedHandle(HANDLE);
+impl Drop for OwnedHandle {fn drop(&mut self){unsafe{let _=CloseHandle(self.0);}}}
+/// 内核事件可跨线程等待；OwnedHandle 保证只关闭一次。
+unsafe impl Send for OwnedHandle {}
+pub struct SingleInstance { _mutex:OwnedHandle,quit:OwnedHandle,settings:OwnedHandle,details:OwnedHandle,reload:OwnedHandle,dump:OwnedHandle,wallpaper:OwnedHandle,companion:OwnedHandle }
+pub enum Instance {Primary(SingleInstance),Existing}
 impl SingleInstance {
-    /// 已有实例在跑 → 返回 None（`--quit` 由调用方先发退出信号）。
-    pub fn acquire(name: &str) -> Option<SingleInstance> {
-        unsafe {
-            let mutex = CreateMutexW(None, false, PCWSTR(wide(name).as_ptr())).ok()?;
-            // 互斥量已存在时句柄照样返回，要用 GetLastError 区分。
-            if windows::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS {
-                return None;
-            }
-            let quit_event = CreateEventW(
-                None,
-                true,             // 手动复位：多个等待者都能看到
-                false,
-                PCWSTR(wide(&format!("{name}-quit")).as_ptr()),
-            )
-            .ok()?;
-            Some(SingleInstance { mutex, quit_event })
+    pub fn acquire()->Result<Instance,String>{unsafe{
+        let m=CreateMutexW(None,false,PCWSTR(wide(INSTANCE).as_ptr())).map_err(|e|e.to_string())?;
+        let already=GetLastError()==ERROR_ALREADY_EXISTS;
+        let owned=OwnedHandle(m);if already{return Ok(Instance::Existing)}
+        fn event(suffix:&str)->Result<OwnedHandle,String>{unsafe{
+            CreateEventW(None,false,false,PCWSTR(wide(&format!("{INSTANCE}-{suffix}")).as_ptr())).map(OwnedHandle).map_err(|e|e.to_string())
+        }}
+        Ok(Instance::Primary(Self{_mutex:owned,quit:event("quit")?,settings:event("settings")?,details:event("details")?,reload:event("reload")?,dump:event("dump")?,wallpaper:event("wallpaper")?,companion:event("companion")?}))
+    }}
+    pub fn poll(&self)->Option<&'static str>{unsafe{
+        for (h,name) in [(&self.quit,"quit"),(&self.settings,"settings"),(&self.details,"details"),(&self.reload,"reload"),(&self.dump,"dump"),(&self.wallpaper,"wallpaper"),(&self.companion,"companion")] {
+            if WaitForSingleObject(h.0,0)==WAIT_OBJECT_0 {return Some(name)}
         }
-    }
-
-    /// 另一个实例在等这个信号退出（`--quit` 命令用）。
-    pub fn signal_quit(&self) {
-        unsafe {
-            let _ = SetEvent(self.quit_event);
-        }
-    }
-
-    /// 阻塞等退出信号（主线程的最后一步）。返回 true = 收到退出。
-    pub fn wait_quit(&self, timeout_ms: u32) -> bool {
-        unsafe { WaitForSingleObject(self.quit_event, timeout_ms) == WAIT_OBJECT_0 }
-    }
+        None
+    }}
 }
+pub fn signal(action:&str)->bool {unsafe{
+    let name=wide(&format!("{INSTANCE}-{action}"));
+    let Ok(h)=OpenEventW(EVENT_MODIFY_STATE,false,PCWSTR(name.as_ptr()))else{return false};
+    let owned=OwnedHandle(h);SetEvent(owned.0).is_ok()
+}}
 
-impl Drop for SingleInstance {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.quit_event);
-            let _ = CloseHandle(self.mutex);
-        }
-    }
-}
-
-/// 给运行中的实例发退出信号（--quit 用）。
-/// 不能走 SingleInstance::acquire——它发现 mutex 已存在会返回 None，
-/// 而退出信号恰恰要在「已有实例」时发。命名事件单独打开即可。
-pub fn signal_quit(name: &str) -> bool {
+pub fn copy_text(text:&str)->Result<(),String>{
+    use windows::Win32::System::{DataExchange::*,Memory::*};
     unsafe {
-        let ev = CreateEventW(None, true, false, PCWSTR(wide(&format!("{name}-quit")).as_ptr())).ok();
-        match ev {
-            Some(h) => {
-                let _ = SetEvent(h);
-                let _ = CloseHandle(h);
-                true
-            }
-            None => false,
-        }
+        OpenClipboard(HWND::default()).map_err(|e|e.to_string())?;
+        struct Clipboard;impl Drop for Clipboard{fn drop(&mut self){unsafe{let _=CloseClipboard();}}}
+        let _guard=Clipboard;
+        let data=wide(text);let mem=GlobalAlloc(GMEM_MOVEABLE,data.len()*2).map_err(|e|e.to_string())?;
+        let ptr=GlobalLock(mem);
+        if ptr.is_null(){let _=GlobalFree(mem);return Err("无法分配剪贴板内存".into())}
+        std::ptr::copy_nonoverlapping(data.as_ptr(),ptr as *mut u16,data.len());let _=GlobalUnlock(mem);
+        if let Err(e)=EmptyClipboard(){let _=GlobalFree(mem);return Err(e.to_string())}
+        match SetClipboardData(13,HANDLE(mem.0)) {Ok(_)=>Ok(()),Err(e)=>{let _=GlobalFree(mem);Err(e.to_string())}}
     }
+}
+
+pub fn clipboard_text()->Result<String,String>{
+    use windows::Win32::System::{DataExchange::*,Memory::*};
+    unsafe {
+        OpenClipboard(HWND::default()).map_err(|e|e.to_string())?;
+        struct Clipboard;impl Drop for Clipboard{fn drop(&mut self){unsafe{let _=CloseClipboard();}}}
+        let _guard=Clipboard;
+        let handle=GetClipboardData(13).map_err(|_|"剪贴板里没有文本".to_string())?;
+        let memory=HGLOBAL(handle.0);let count=(GlobalSize(memory)/2).min(32_768);
+        let ptr=GlobalLock(memory) as *const u16;
+        if ptr.is_null(){return Err("无法读取剪贴板文本".into())}
+        let data=std::slice::from_raw_parts(ptr,count);let len=data.iter().position(|c|*c==0).unwrap_or(count);
+        let text=String::from_utf16_lossy(&data[..len]);let _=GlobalUnlock(memory);Ok(text)
+    }
+}
+
+pub fn process_path(hwnd:isize)->Result<std::path::PathBuf,String>{
+    if hwnd==0{return Err("ZCode 尚未运行，无法确认需要修复的启动入口".into())}
+    unsafe{let mut pid=0;GetWindowThreadProcessId(handle(hwnd),Some(&mut pid));
+        let p=OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid).map_err(|e|e.to_string())?);
+        let mut b=vec![0u16;32768];let mut n=b.len()as u32;
+        QueryFullProcessImageNameW(p.0,PROCESS_NAME_WIN32,windows::core::PWSTR(b.as_mut_ptr()),&mut n).map_err(|e|e.to_string())?;
+        Ok(std::path::PathBuf::from(String::from_utf16_lossy(&b[..n as usize])))
+    }
+}
+
+pub fn open_path(path:&Path)->Result<(),String>{
+    use std::os::windows::ffi::OsStrExt;
+    let p:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let r=unsafe{windows::Win32::UI::Shell::ShellExecuteW(HWND::default(),PCWSTR(wide("open").as_ptr()),PCWSTR(p.as_ptr()),PCWSTR::null(),PCWSTR::null(),SW_SHOWNORMAL)};
+    if r.0 as isize>32{Ok(())}else{Err("无法打开指定路径".into())}
 }

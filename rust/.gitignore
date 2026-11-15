@@ -1,2 +1,5 @@
 /target
+/helper/target
+/dist
+/mingw-stub
 *.log
