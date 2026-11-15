@@ -1,0 +1,2 @@
+[build]
+rustflags = ["-L", "native=D:/zcode-data/workspace/default/zcode-token-bar-rs/mingw-stub"]

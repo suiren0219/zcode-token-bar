@@ -1,0 +1,42 @@
+[package]
+name = "zcode-token-bar"
+version = "0.1.0"
+edition = "2021"
+description = "ZCode token 用量悬浮条（Rust 重写版）——独立进程，不碰客户端安装目录"
+license = "MIT"
+
+# ── 依赖总览（对照 Python 版的对应物）───────────────────────────────
+# slint            ← tkinter（无边框条面 + 设置面板的声明式 UI）
+# rusqlite         ← sqlite3（只读 ~/.zcode/cli/db/db.sqlite）
+# serde/serde_json ← json（自身设置 + ZCode v2 配置读写）
+# windows          ← ctypes.WinDLL("user32")（贴靠/属主/置顶/单实例）
+# tracing 系列     ← 手写 log()（数据根下按天轮转）
+[dependencies]
+slint = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+raw-window-handle = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+] }
+
+[build-dependencies]
+slint-build = "1"
+
+# 发布档：体积优先。悬浮条是常驻小工具，exe 越小越不碍眼。
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

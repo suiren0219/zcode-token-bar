@@ -1,0 +1,176 @@
+// 条面：无边框深色圆角胶囊，外观照 Python 版还原。
+// 数据全部由 Rust 侧拼好传进来（字符串 + 配色等级 0=正常 1=警示 2=告急），
+// UI 只负责排版——口径集中在 data.rs，Slint 里没有业务逻辑。
+
+import { Button } from "std-widgets.slint";
+
+export component BarWindow inherits Window {
+    no-frame: true;
+    always-on-top: true;
+    default-font-family: "Microsoft YaHei UI";
+    background: transparent;
+
+    // ── Rust 侧注入的数据 ──
+    // 三档配色（对照 Python 版 OK/WARM/HOT）。
+    function level-color(level: int) -> color {
+        if (level >= 2) { return #ff6b6b; }   // HOT  告急（红）
+        if (level == 1) { return #ffc966; }   // WARM 警示（橙黄）
+        return #7ddb8a;                        // OK   正常（绿）
+    }
+
+    in property <string> session-title: "…";
+    in property <bool> active: false;
+    in property <bool> generating: false;
+    in property <string> speed-text: "";
+    in property <int> speed-level: 0;
+    in property <int> ctx-pct: 0;           // 0-100，进度条宽度
+    in property <string> ctx-text: "";
+    in property <int> ctx-level: 0;
+    in property <string> turn-text: "";
+    in property <string> turn-sub: "";
+    in property <string> session-text: "";
+    in property <string> session-sub: "";
+    in property <string> today-text: "";
+    in property <string> cache-text: "";
+    in property <int> cache-level: 0;
+    in property <bool> has-data: false;
+
+    callback settings-clicked();
+    // 拖动：down/move 持续触发 drag-move，up 触发 drag-end，双击恢复自动贴靠。
+    callback drag-start();
+    callback drag-move();
+    callback drag-end();
+    callback dock-restore();
+
+    // 胶囊底整个可拖（设置按钮的 TouchArea 在上层，优先吃掉点击）。
+    // moved 里只发信号，坐标全由 Rust 侧 GetCursorPos 计算——避开
+    // Slint 逻辑坐标与 Win32 物理坐标的换算。
+    touch := TouchArea {
+        mouse-cursor: default;
+        pointer-event(p) => {
+            if (p.kind == PointerEventKind.down) { root.drag-start(); }
+            if (p.kind == PointerEventKind.up) { root.drag-end(); }
+        }
+        moved => { root.drag-move(); }
+        double-clicked => { root.dock-restore(); }
+    }
+
+    width: 560px;
+    height: 40px;
+
+    // 胶囊底：半透明深色 + 1px 描边（对照 Python 版 EF_PAPER/EF_RULE）。
+    Rectangle {
+        border-radius: self.height / 2;
+        background: #e60e1014;
+        border-width: 1px;
+        border-color: #33ffffff;
+
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 8px;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            spacing: 10px;
+            alignment: center;
+
+            // 左：会话状态点 + 标题（窄条里截断）。
+            Rectangle {
+                width: 7px;
+                border-radius: 3.5px;
+                y: (parent.height - self.height) / 2;
+                background: root.generating ? #7ddb8a : (root.active ? #7ddb8a : #668a9099);
+            }
+            Text {
+                text: root.session-title;
+                color: #dde3e8;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+                max-width: 150px;
+            }
+
+            // 速度
+            if root.speed-text != "": HorizontalLayout {
+                spacing: 3px;
+                alignment: center;
+                Text { text: root.speed-text; color: level-color(root.speed-level); font-size: 12px; font-weight: 700; vertical-alignment: center; }
+                Text { text: "t/s"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+            }
+
+            // 上下文：微进度条 + 百分比
+            if root.ctx-pct > 0: HorizontalLayout {
+                spacing: 4px;
+                alignment: center;
+                Rectangle {
+                    width: 36px;
+                    height: 4px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 2px;
+                    background: #22ffffff;
+                    Rectangle {
+                        x: 0;
+                        y: 0;
+                        height: parent.height;
+                        width: parent.width * min(100, max(0, root.ctx-pct)) / 100;
+                        border-radius: 2px;
+                        background: level-color(root.ctx-level);
+                    }
+                }
+                Text { text: root.ctx-text; color: level-color(root.ctx-level); font-size: 12px; vertical-alignment: center; }
+            }
+
+            // 本轮
+            if root.turn-text != "": HorizontalLayout {
+                spacing: 3px;
+                alignment: center;
+                Text { text: "本轮"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+                Text { text: root.turn-text; color: #dde3e8; font-size: 12px; vertical-alignment: center; }
+                if root.turn-sub != "": Text { text: root.turn-sub; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+            }
+
+            // 会话
+            if root.session-text != "": HorizontalLayout {
+                spacing: 3px;
+                alignment: center;
+                Text { text: "会话"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+                Text { text: root.session-text; color: #dde3e8; font-size: 12px; vertical-alignment: center; }
+                if root.session-sub != "": Text { text: root.session-sub; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+            }
+
+            // 今日
+            if root.today-text != "": HorizontalLayout {
+                spacing: 3px;
+                alignment: center;
+                Text { text: "今日"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+                Text { text: root.today-text; color: #dde3e8; font-size: 12px; vertical-alignment: center; }
+            }
+
+            // 缓存率
+            if root.cache-text != "": HorizontalLayout {
+                spacing: 3px;
+                alignment: center;
+                Text { text: "缓存"; color: #8892a0; font-size: 10px; vertical-alignment: center; }
+                Text { text: root.cache-text; color: level-color(root.cache-level); font-size: 12px; vertical-alignment: center; }
+            }
+
+            // 右端：设置按钮（悬停反白；点击回调给 Rust）。
+            Rectangle {
+                width: 22px;
+                border-radius: 6px;
+                y: (parent.height - self.height) / 2;
+                background: btn.pressed ? #33ffffff : (btn.has-hover ? #22ffffff : transparent);
+                btn := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.settings-clicked(); }
+                }
+                Text {
+                    text: "◱";
+                    color: btn.has-hover ? #ffffff : #8892a0;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
