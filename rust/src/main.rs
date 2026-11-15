@@ -178,8 +178,14 @@ fn main() {
     // run() 阻塞期间 timer 必须活着——forget 阻止 run 返回后被 drop。
     std::mem::forget(timer);
 
+    // 设置按钮：拉起 Python 版设置面板（壁纸/CDP/模型导入全在）。
+    // Rust 原生面板完成前，这是功能继承的桥接——pythonw 无控制台窗口。
     bar.on_settings_clicked(move || {
-        tracing::info!("设置面板待实现（Rust 版建设中）");
+        let _ = std::process::Command::new("pythonw")
+            .arg(r"D:\zcode-data\workspace\default\zcode-token-bar\hoverbar.py")
+            .arg("--panel")
+            .spawn();
+        tracing::info!("已请求打开设置面板（Python 桥接）");
     });
 
     if debug {
