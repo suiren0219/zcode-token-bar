@@ -6,6 +6,7 @@ import { ComboBox, CheckBox, ListView, LineEdit, Slider } from "std-widgets.slin
 
 export component SettingsWindow inherits Window {
     no-frame: true;
+    title: "zcode-token-bar-settings";
     always-on-top: true;
     default-font-family: "Microsoft YaHei UI";
     background: transparent;
@@ -62,7 +63,7 @@ export component SettingsWindow inherits Window {
 
     Rectangle {
         border-radius: 10px;
-        background: #f00e1014;
+        background: #0e1014f0;
         border-width: 1px;
         border-color: #40ffffff;
 
@@ -73,7 +74,7 @@ export component SettingsWindow inherits Window {
             Rectangle {
                 height: 40px;
                 border-radius: 9px;
-                background: #22000000;
+                background: #00000022;
                 HorizontalLayout {
                     padding-left: 16px;
                     padding-right: 10px;
@@ -87,7 +88,7 @@ export component SettingsWindow inherits Window {
                     Rectangle {
                         width: 26px; height: 22px; border-radius: 6px;
                         y: 9px;
-                        background: close.pressed ? #44ff6b6b : (close.has-hover ? #33ff8888 : transparent);
+                        background: close.pressed ? #ff6b6b44 : (close.has-hover ? #ff888833 : transparent);
                         close := TouchArea {
                             mouse-cursor: pointer;
                             clicked => { root.close-panel(); }
@@ -111,7 +112,7 @@ export component SettingsWindow inherits Window {
                     for pn[i] in root.page-names: Rectangle {
                         height: 30px;
                         border-radius: 7px;
-                        background: root.page == i ? #33ffffff : (tab.has-hover ? #22ffffff : transparent);
+                        background: root.page == i ? #ffffff33 : (tab.has-hover ? #ffffff22 : transparent);
                         tab := TouchArea {
                             mouse-cursor: pointer;
                             clicked => { root.set-page(i); }
@@ -139,7 +140,7 @@ export component SettingsWindow inherits Window {
                             for an[i] in ["左下", "下中", "右下", "左上", "上中", "右上"]: Rectangle {
                                 height: 30px;
                                 border-radius: 7px;
-                                background: root.anchor-index == (i < 3 ? i : i + 1) ? #337ddb8a : (a.has-hover ? #22ffffff : #22ffffff);
+                                background: root.anchor-index == (i < 3 ? i : i + 1) ? #7ddb8a33 : (a.has-hover ? #ffffff22 : #ffffff22);
                                 a := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => { root.anchor-set(i < 3 ? i : i + 1); }
@@ -154,7 +155,7 @@ export component SettingsWindow inherits Window {
                             for sc[i] in ["跟随 ZCode 窗口", "整块屏幕"]: Rectangle {
                                 height: 28px;
                                 border-radius: 7px;
-                                background: root.scope-index == i ? #337ddb8a : #22ffffff;
+                                background: root.scope-index == i ? #7ddb8a33 : #ffffff22;
                                 st := TouchArea { mouse-cursor: pointer; clicked => { root.scope-set(i); } }
                                 Text { text: sc; color: root.scope-index == i ? #eaffee : #a8b2bd;
                                        font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
@@ -164,7 +165,7 @@ export component SettingsWindow inherits Window {
                             spacing: 8px;
                             Rectangle {
                                 height: 30px; width: 150px; border-radius: 7px;
-                                background: rd.has-hover ? #337ddb8a : #29444b;
+                                background: rd.has-hover ? #7ddb8a33 : #29444b;
                                 rd := TouchArea { mouse-cursor: pointer; clicked => { root.restore-dock(); } }
                                 Text { text: "恢复自动贴靠"; color: #eaffee; font-size: 12px;
                                        horizontal-alignment: center; vertical-alignment: center; }
@@ -230,7 +231,7 @@ export component SettingsWindow inherits Window {
                             }
                             Rectangle {
                                 width: 92px; height: 28px; border-radius: 7px;
-                                background: db.has-hover ? #337ddb8a : #29444b;
+                                background: db.has-hover ? #7ddb8a33 : #29444b;
                                 db := TouchArea {
                                     mouse-cursor: pointer;
                                     enabled: !root.models-busy;
@@ -241,7 +242,7 @@ export component SettingsWindow inherits Window {
                             }
                             Rectangle {
                                 width: 120px; height: 28px; border-radius: 7px;
-                                background: im.has-hover ? #337ddb8a : #29444b;
+                                background: im.has-hover ? #7ddb8a33 : #29444b;
                                 im := TouchArea {
                                     mouse-cursor: pointer;
                                     enabled: !root.models-busy && root.model-ids.length > 0;
@@ -253,8 +254,8 @@ export component SettingsWindow inherits Window {
                         }
                         Rectangle {
                             border-radius: 7px;
-                            background: #22000000;
-                            border-width: 1px; border-color: #22ffffff;
+                            background: #00000022;
+                            border-width: 1px; border-color: #ffffff22;
                             VerticalLayout {
                                 padding: 4px;
                                 if root.model-ids.length == 0: Text {
@@ -278,7 +279,7 @@ export component SettingsWindow inherits Window {
                             mid := LineEdit { placeholder-text: "模型 ID（逗号/空格分隔）"; font-size: 11px; }
                             Rectangle {
                                 width: 70px; height: 26px; border-radius: 7px;
-                                background: mi.has-hover ? #337ddb8a : #29444b;
+                                background: mi.has-hover ? #7ddb8a33 : #29444b;
                                 mi := TouchArea { mouse-cursor: pointer; clicked => { root.import-id-clicked(mid.text); } }
                                 Text { text: "导入"; color: #eaffee; font-size: 11px;
                                        horizontal-alignment: center; vertical-alignment: center; }

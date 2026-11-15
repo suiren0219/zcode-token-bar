@@ -8,6 +8,7 @@ export { SettingsWindow }
 
 export component BarWindow inherits Window {
     no-frame: true;
+    title: "zcode-token-bar-bar";
     always-on-top: true;
     default-font-family: "Microsoft YaHei UI";
     background: transparent;
@@ -69,9 +70,9 @@ export component BarWindow inherits Window {
     bar := Rectangle {
         opacity: root.opacity-level;
         border-radius: self.height / 2;
-        background: #e60e1014;
+        background: #0e1014e6;
         border-width: 1px;
-        border-color: #33ffffff;
+        border-color: #ffffff33;
 
         HorizontalLayout {
             padding-left: 14px;
@@ -86,7 +87,7 @@ export component BarWindow inherits Window {
                 width: 7px;
                 border-radius: 3.5px;
                 y: (parent.height - self.height) / 2;
-                background: root.generating ? #7ddb8a : (root.active ? #7ddb8a : #668a9099);
+                background: root.generating ? #7ddb8a : (root.active ? #7ddb8a : #8a909966);
             }
             Text {
                 text: root.session-title;
@@ -114,7 +115,7 @@ export component BarWindow inherits Window {
                     height: 4px;
                     y: (parent.height - self.height) / 2;
                     border-radius: 2px;
-                    background: #22ffffff;
+                    background: #ffffff22;
                     Rectangle {
                         x: 0;
                         y: 0;
@@ -167,7 +168,7 @@ export component BarWindow inherits Window {
                 width: 22px;
                 border-radius: 6px;
                 y: (parent.height - self.height) / 2;
-                background: btn.pressed ? #33ffffff : (btn.has-hover ? #22ffffff : transparent);
+                background: btn.pressed ? #ffffff33 : (btn.has-hover ? #ffffff22 : transparent);
                 btn := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { root.settings-clicked(); }

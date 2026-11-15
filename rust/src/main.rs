@@ -24,6 +24,9 @@ slint::include_modules!();
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// 拖动状态（条面与面板共用：起点窗口坐标 + 起点光标坐标）。
+static DRAG: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+
 /// 数据根：与 Python 版共用目录（db 只读共享；日志/设置放这里）。
 pub fn data_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("ZCODE_TOKEN_BAR_DATA") {
@@ -82,7 +85,6 @@ fn main() {
     // 全局共享状态：设置（Arc<Mutex>）+ free 模式 + 拖动状态。
     let cfg: Arc<Mutex<Settings>> = Arc::new(Mutex::new(settings::load()));
     let free_mode = Arc::new(AtomicBool::new(cfg.lock().unwrap().anchor == "free"));
-    static DRAG: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 
     // ── 条面 ──
     let bar = BarWindow::new().expect("Slint 窗口创建失败");
@@ -185,7 +187,7 @@ fn main() {
         let free = free_mode.clone();
         let cfg = cfg.clone();
         bar.on_drag_start(move || {
-            let hwnd = win::own_hwnd();
+            let hwnd = win::own_hwnd("zcode-token-bar-bar");
             let (wx, wy, _, _) = win::window_rect(hwnd);
             let (cx, cy) = win::cursor_pos();
             *DRAG.lock().unwrap() = Some((wx, wy, cx, cy));
@@ -195,7 +197,7 @@ fn main() {
             let cur = g.take();
             if let Some((wx, wy, sx, sy)) = cur {
                 let (cx, cy) = win::cursor_pos();
-                let hwnd = win::own_hwnd();
+                let hwnd = win::own_hwnd("zcode-token-bar-bar");
                 unsafe { win::move_window(hwnd, wx + cx - sx, wy + cy - sy) };
                 *g = Some((wx, wy, cx, cy));
             }
@@ -203,7 +205,7 @@ fn main() {
         let free_end = free.clone();
         let cfg_end = cfg.clone();
         bar.on_drag_end(move || {
-            let hwnd = win::own_hwnd();
+            let hwnd = win::own_hwnd("zcode-token-bar-bar");
             let (l, t, _, _) = win::window_rect(hwnd);
             {
                 let mut c = cfg_end.lock().unwrap();
@@ -224,6 +226,7 @@ fn main() {
             free.store(false, Ordering::Relaxed);
         });
     }
+
 
     // ── 数据泵 ──
     let ui = bar.as_weak();
@@ -300,7 +303,7 @@ fn main() {
             if free_t.load(Ordering::Relaxed) || DRAG.lock().unwrap().is_some() {
                 return;
             }
-            let hwnd = win::own_hwnd();
+            let hwnd = win::own_hwnd("zcode-token-bar-bar");
             if hwnd == 0 {
                 return;
             }
@@ -460,6 +463,30 @@ fn bind_panel_callbacks(
             settings::save(&c);
         });
     }
+    // ── 面板拖动（标题行按住拖动；坐标同条面全走 GetCursorPos）──
+    {
+        let panel = panel.clone();
+        win.on_drag_panel_start(move || {
+            let hwnd = win::own_hwnd("zcode-token-bar-settings");
+            let (wx, wy, _, _) = win::window_rect(hwnd);
+            let (cx, cy) = win::cursor_pos();
+            *DRAG.lock().unwrap() = Some((wx, wy, cx, cy));
+        });
+        win.on_drag_panel_move(move || {
+            let mut g = DRAG.lock().unwrap();
+            let cur = g.take();
+            if let Some((wx, wy, sx, sy)) = cur {
+                let (cx, cy) = win::cursor_pos();
+                let hwnd = win::own_hwnd("zcode-token-bar-settings");
+                unsafe { win::move_window(hwnd, wx + cx - sx, wy + cy - sy) };
+                *g = Some((wx, wy, cx, cy));
+            }
+        });
+        win.on_drag_panel_end(move || {
+            DRAG.lock().unwrap().take();
+        });
+    }
+
     // ── 模型页：状态共享 ──
     let busy = Arc::new(AtomicBool::new(false));
     let provider_index = Arc::new(std::sync::atomic::AtomicI32::new(0));

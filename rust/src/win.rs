@@ -81,33 +81,36 @@ pub fn zcode_hwnd() -> isize {
     ctx.best.0
 }
 
-/// 本进程的可见顶层窗口（= Slint 刚 show 出来的条面）。
-/// Slint 在 show 时才建 Win32 窗口，且不直接暴露 HWND，就按进程枚举。
-/// 注意 winit 还有一个小的消息辅助窗口也是可见的——所以取**面积最大**
-/// 的那个，不能见一个就停。
-pub fn own_hwnd() -> isize {
-    struct Own(isize, i64); // (hwnd, 面积)
+/// 按标题精确找本进程的 Slint 窗口（条面/面板各一个标题）。
+/// 之前按「面积最大」找，面板打开后面板比条面大，贴靠定时器把面板
+/// 当成条面套了 WS_EX_NOACTIVATE 还每秒挪走——面板就此无法交互
+/// （2026-11-15 实测）。标题是 Slint Window.title 传下去的，唯一可靠。
+pub fn own_hwnd(title: &str) -> isize {
+    struct Ctx<'a>(&'a [u16], isize);
+    let wanted: Vec<u16> = title.encode_utf16().collect();
+    let mut ctx = Ctx(&wanted, 0);
     unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let out = &mut *(lparam.0 as *mut Own);
+        let ctx = &mut *(lparam.0 as *mut Ctx);
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == std::process::id() && IsWindowVisible(hwnd).as_bool() {
-            let mut r = RECT::default();
-            if GetWindowRect(hwnd, &mut r).is_ok() {
-                let area = (r.right - r.left) as i64 * (r.bottom - r.top) as i64;
-                if area > out.1 {
-                    out.0 = hwnd.0 as isize;
-                    out.1 = area;
-                }
+        if pid != std::process::id() {
+            return true.into();
+        }
+        let n = GetWindowTextLengthW(hwnd) as usize;
+        if n == ctx.0.len() {
+            let mut buf = vec![0u16; n + 1];
+            GetWindowTextW(hwnd, &mut buf);
+            if buf[..n] == *ctx.0 {
+                ctx.1 = hwnd.0 as isize;
+                return false.into();
             }
         }
         true.into()
     }
-    let mut out = Own(0, 0);
     unsafe {
-        let _ = EnumWindows(Some(cb), LPARAM(&mut out as *mut Own as isize));
+        let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
     }
-    out.0
+    ctx.1
 }
 
 // ── 窗口形态：无边框小胶囊的工具样式 ────────────────────────────────
