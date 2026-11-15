@@ -251,6 +251,21 @@ pub fn discover_provider(pid: &str) -> Result<Discovery, String> {
     } else if !key.is_empty() {
         headers.push(("Authorization".into(), format!("Bearer {key}")));
     }
+    // 转交用户自定义头（白名单同 Python 版：只认认证与组织选择，不允许改 Host 等）。
+    let allowed = ["authorization", "x-api-key", "openai-organization", "openai-project", "anthropic-version"];
+    if let Some(hs) = obj(&options, "headers").as_object() {
+        for (k, v) in hs {
+            let kl = k.to_ascii_lowercase();
+            if allowed.contains(&kl.as_str()) {
+                if let Some(val) = v.as_str() {
+                    // 白名单头不覆盖上面已设置的默认（用户显式声明优先，但同名跳过重复 push）
+                    if !headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(&kl)) {
+                        headers.push((k.clone(), val.to_string()));
+                    }
+                }
+            }
+        }
+    }
 
     let ids = match http_list_models(&url, &headers)? {
         Some(ids) => ids,

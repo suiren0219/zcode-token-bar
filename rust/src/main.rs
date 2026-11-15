@@ -401,22 +401,36 @@ fn bind_panel_callbacks(
     }
     {
         let cfg = cfg.clone();
+        let panel = panel.clone();
         win.on_scope_set(move |i| {
-            let mut c = cfg.lock().unwrap();
-            c.scope = if i == 1 { "screen".into() } else { "window".into() };
-            settings::save(&c);
+            {
+                let mut c = cfg.lock().unwrap();
+                c.scope = if i == 1 { "screen".into() } else { "window".into() };
+                settings::save(&c);
+            }
+            if let Some(w) = panel.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
+                w.set_scope_index(i);
+            }
         });
     }
     {
         let cfg = cfg.clone();
         let free = _free_mode.clone();
+        let panel2 = panel.clone();
         win.on_restore_dock(move || {
             {
                 let mut c = cfg.lock().unwrap();
                 c.anchor = "bottom-center".into();
+                c.free_x = 0;
+                c.free_y = 0;
                 settings::save(&c);
             }
             free.store(false, Ordering::Relaxed);
+            // 回显：锚点高亮切回下中、基准回到跟随窗口
+            if let Some(w) = panel2.lock().unwrap().as_ref().and_then(|w| w.upgrade()) {
+                w.set_anchor_index(1);
+                w.set_scope_index(0);
+            }
         });
     }
     {
@@ -473,6 +487,15 @@ fn bind_panel_callbacks(
             settings::save(&c);
         });
     }
+    {
+        win.on_open_python_panel(move || {
+            let _ = std::process::Command::new("pythonw")
+                .arg(r"D:\zcode-data\workspace\default\zcode-token-bar\hoverbar.py")
+                .arg("--panel")
+                .spawn();
+        });
+    }
+
     // ── 面板拖动（标题行按住拖动；坐标同条面全走 GetCursorPos）──
     {
         let panel = panel.clone();
